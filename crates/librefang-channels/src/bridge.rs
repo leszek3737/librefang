@@ -401,7 +401,11 @@ async fn send_response(
     thread_id: Option<&str>,
     output_format: OutputFormat,
 ) {
-    let formatted = formatter::format_for_channel(&text, output_format);
+    let formatted = if adapter.name() == "wecom" {
+        formatter::format_for_wecom(&text, output_format)
+    } else {
+        formatter::format_for_channel(&text, output_format)
+    };
     let content = ChannelContent::Text(formatted);
 
     let result = if let Some(tid) = thread_id {
@@ -412,6 +416,15 @@ async fn send_response(
 
     if let Err(e) = result {
         error!("Failed to send response: {e}");
+    }
+}
+
+fn default_output_format_for_channel(channel_type: &str) -> OutputFormat {
+    match channel_type {
+        "telegram" => OutputFormat::TelegramHtml,
+        "slack" => OutputFormat::SlackMrkdwn,
+        "wecom" => OutputFormat::PlainText,
+        _ => OutputFormat::Markdown,
     }
 }
 
@@ -448,11 +461,7 @@ async fn dispatch_message(
 
     // Fetch per-channel overrides (if configured)
     let overrides = handle.channel_overrides(ct_str).await;
-    let channel_default_format = match ct_str {
-        "telegram" => OutputFormat::TelegramHtml,
-        "slack" => OutputFormat::SlackMrkdwn,
-        _ => OutputFormat::Markdown,
-    };
+    let channel_default_format = default_output_format_for_channel(ct_str);
     let output_format = overrides
         .as_ref()
         .and_then(|o| o.output_format)
@@ -734,7 +743,7 @@ async fn dispatch_message(
                     send_response(
                         adapter,
                         &message.sender,
-                        "No agents available. Start the dashboard at http://127.0.0.1:4200 to create one.".to_string(),
+                        "No agents available. Start the dashboard at http://127.0.0.1:4545 to create one.".to_string(),
                         thread_id,
                         output_format,
                     ).await;
@@ -992,7 +1001,7 @@ async fn dispatch_with_blocks(
                     send_response(
                         adapter,
                         &message.sender,
-                        "No agents available. Start the dashboard at http://127.0.0.1:4200 to create one.".to_string(),
+                        "No agents available. Start the dashboard at http://127.0.0.1:4545 to create one.".to_string(),
                         thread_id,
                         output_format,
                     ).await;
@@ -1504,6 +1513,26 @@ mod tests {
         assert_eq!(
             channel_type_str(&ChannelType::Custom("irc".to_string())),
             "irc"
+        );
+    }
+
+    #[test]
+    fn test_default_output_format_for_channel() {
+        assert_eq!(
+            default_output_format_for_channel("telegram"),
+            OutputFormat::TelegramHtml
+        );
+        assert_eq!(
+            default_output_format_for_channel("slack"),
+            OutputFormat::SlackMrkdwn
+        );
+        assert_eq!(
+            default_output_format_for_channel("wecom"),
+            OutputFormat::PlainText
+        );
+        assert_eq!(
+            default_output_format_for_channel("discord"),
+            OutputFormat::Markdown
         );
     }
 

@@ -83,13 +83,13 @@ pub async fn build_router(
         // make cross-origin requests. Restrict to known origins instead.
         let mut origins: Vec<axum::http::HeaderValue> = vec![
             format!("http://{listen_addr}").parse().unwrap(),
-            "http://localhost:4200".parse().unwrap(),
-            "http://127.0.0.1:4200".parse().unwrap(),
+            "http://localhost:4545".parse().unwrap(),
+            "http://127.0.0.1:4545".parse().unwrap(),
             "http://localhost:8080".parse().unwrap(),
             "http://127.0.0.1:8080".parse().unwrap(),
         ];
         // Add the actual listen address variants
-        if listen_addr.port() != 4200 && listen_addr.port() != 8080 {
+        if listen_addr.port() != 4545 && listen_addr.port() != 8080 {
             if let Ok(v) = format!("http://localhost:{}", listen_addr.port()).parse() {
                 origins.push(v);
             }

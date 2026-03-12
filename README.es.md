@@ -1,0 +1,226 @@
+<p align="center">
+  <img src="public/assets/librefang-logo.svg" width="160" alt="LibreFang Logo" />
+</p>
+
+<h1 align="center">LibreFang</h1>
+<h3 align="center">Sistema Operativo de Agentes Mantenido por la Comunidad</h3>
+
+<p align="center">
+  Sistema operativo de agente de código abierto escrito en Rust. 137K líneas de código. 14 crates. 1767+ pruebas. Cero advertencias de clippy.<br/>
+  <strong>Bifurcado de `RightNow-AI/openfang`. Gobernanza transparente. Se mantiene la atribución. Compatible con el CLI `librefang` existente.</strong>
+</p>
+
+<p align="center">
+  <a href="https://librefang.ai/">Sitio web</a> &bull;
+  <a href="https://github.com/librefang/librefang">GitHub</a> &bull;
+  <a href="GOVERNANCE.md">Gobernanza</a> &bull;
+  <a href="CONTRIBUTING.md">Contribuciones</a> &bull;
+  <a href="SECURITY.md">Seguridad</a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/language-Rust-orange?style=flat-square" alt="Rust" />
+  <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT" />
+  <img src="https://img.shields.io/badge/community-maintained-brightgreen?style=flat-square" alt="Mantenido por la comunidad" />
+  <img src="https://img.shields.io/github/stars/librefang/librefang?style=flat-square" alt="Stars" />
+  <img src="https://img.shields.io/github/forks/librefang/librefang?style=flat-square" alt="Forks" />
+</p>
+
+---
+
+> **LibreFang es una bifurcación mantenida por la comunidad de [`RightNow-AI/openfang`](https://github.com/RightNow-AI/openfang).**
+>
+> La base de código, binarios, nombres de crates y rutas de configuración permanecen como `openfang` durante el período de transición por compatibilidad. LibreFang adopta una gobernanza de proyecto diferente: aceptamos activamente contribuciones de la comunidad, las revisamos públicamente, fusionamos el trabajo aceptado a través del flujo normal de GitHub, y mantenemos la atribución de los colaboradores cuando adaptamos código.
+
+> **Estado de la comunidad:** Se aceptan con gusto issues, PRs, revisores y mantenedores.
+
+---
+
+## ¿Qué es LibreFang?
+
+LibreFang es un **sistema operativo de agente de código abierto** — no es un marco de chatbot, no es un envoltorio de Python alrededor de LLM, no es un "orquestador multiagente". Es un sistema operativo completo para agentes autónomos, construido desde cero en Rust y mantenido públicamente.
+
+Los marcos de agentes tradicionales esperan tu entrada. LibreFang ejecuta **agentes autónomos que trabajan para ti** — se ejecutan según horario, 24/7, construyen grafos de conocimiento, monitorean objetivos, generan leads, gestionan tus redes sociales y reportan resultados a tu panel.
+
+El sitio web del proyecto ya está en vivo en [librefang.ai](https://librefang.ai/). La forma más rápida de probar LibreFang sigue siendo la instalación desde el código fuente.
+
+```bash
+cargo install --git https://github.com/librefang/librefang librefang-cli
+librefang init
+librefang start
+# Panel: http://localhost:4545
+```
+
+---
+
+## Características Principales
+
+### 🤖 Hands: Agentes que realmente hacen el trabajo
+
+*"Los agentes tradicionales esperan tu entrada. Hands trabaja para ti."*
+
+**Hands** es la innovación central de LibreFang — paquetes de capacidades autónomas pre-construidos, ejecutados independientemente, según horario, sin necesidad de que les des prompts. Esto no es un chatbot. Es un agente que se despierta a las 6 de la mañana, investiga a tus competidores, construye grafos de conocimiento, evalúa descubrimientos y te envía un informe a Telegram antes de que tomes tu café.
+
+Cada Hand incluye:
+- **HAND.toml** — Manifiesto que declara herramientas, requisitos y métricas del panel
+- **System Prompt** — Manual de operaciones multietapa (no es una sola línea — son procedimientos de más de 500 palabras de expertos)
+- **SKILL.md** — Referencia de conocimiento de dominio que se inyecta en el contexto en tiempo de ejecución
+- **Guardrails** — Puertas de aprobación para operaciones sensibles (ej. Browser Hand necesita aprobación antes de cualquier compra)
+
+Todo se compila en binarios. Sin descargas, sin pip install, sin Docker pull.
+
+### 7 Hands Incluidos
+
+| Hand | Funcionalidad |
+|------|------|
+| **Clip** | Obtiene URL de YouTube, descarga, identifica el mejor momento, recorta a video corto vertical con subtítulos y miniatura, opcionalmente agrega narración IA, publica en Telegram y WhatsApp. Pipeline de 8 etapas. FFmpeg + yt-dlp + 5 backends STT. |
+| **Lead** | Se ejecuta diariamente. Descubre prospectos que coinciden con tu ICP, enriquece con investigación web, puntúa 0-100, deduplica con base de datos existente, entrega leads calificados en CSV/JSON/Markdown. Construye perfil ICP con el tiempo. |
+| **Collector** | Inteligencia de nivel OSINT. Das un objetivo (empresa, persona, tema). Monitorea continuamente — detección de cambios, seguimiento de sentimiento, construcción de grafo de conocimiento, entrega alertas críticas cuando hay cambios importantes. |
+| **Predictor** | Motor de superpronóstico. Recopila señales de múltiples fuentes, construye cadenas de inferencia calibradas, hace predicciones con intervalos de confianza, rastrea su propia precisión con puntuación Brier. Tiene modo adversario — deliberadamente discrepa del consenso. |
+| **Researcher** | Investigador autónomo profundo. Cruza múltiples fuentes, evalúa credibilidad usando criterios CRAAP (Moneda, Relevancia, Autoridad, Exactitud, Propósito), genera informes en formato APA con citas, multilingüe. |
+| **Twitter** | Gestor autónomo de cuentas Twitter/X. Crea contenido en 7 formatos rotativos, programa publicaciones para máximo engagement, responde a menciones, rastrea métricas de rendimiento. Tiene cola de aprobación — no publica sin tu OK. |
+| **Browser** | Agente de automatización web. Navega sitios, llena formularios, hace clic en botones, maneja flujos de trabajo de múltiples pasos. Usa puente Playwright y persistencia de sesión. **Puerta de aprobación de compra forzada** — nunca gastará tu dinero sin confirmación explícita. |
+
+---
+
+## Sistema de Seguridad de 16 Capas — Defensa en Profundidad
+
+LibreFang no añade seguridad como afterthought. Cada capa es independientemente testeable y funciona sin puntos únicos de falla.
+
+| # | Sistema | Funcionalidad |
+|---|---------|------|
+| 1 | **Sandbox WASM de doble medición** | El código de herramientas se ejecuta en WebAssembly con medición de combustible + interrupción de época. Hilos watchdog matan código descontrolado. |
+| 2 | **Cadena de hash Merkle de auditoría** | Cada operación se vincula criptográficamente con la anterior. Manipular una entrada rompe toda la cadena. |
+| 3 | **Rastreo de tinte de flujo de información** | Las etiquetas se propagan durante la ejecución — rastrea secrets desde la fuente hasta el sumidero. |
+| 4 | **Manifiesto de agente firmado Ed25519** | La identidad y conjunto de capacidades de cada agente están firmados criptográficamente. |
+| 5 | **Protección SSRF** | Bloquea IPs privadas, endpoints de metadatos en la nube, ataques de DNS rebinding. |
+| 6 | **Ceroización de secrets** | `Zeroizing<String>` borra claves API de la memoria inmediatamente cuando ya no son necesarias. |
+| 7 | **Autenticación mutua OFP** | HMAC-SHA256 basado en nonce, verificación de tiempo constante para redes P2P. |
+| 8 | **Puertas de capacidades** | Control de acceso basado en roles — los agentes declaran las herramientas que necesitan, el kernel las强制执行. |
+| 9 | **Encabezados de seguridad** | CSP, X-Frame-Options, HSTS, X-Content-Type-Options en cada respuesta. |
+| 10 | **Saneamiento de endpoint de salud** | Los health checks públicos devuelven información mínima. Diagnóstico completo requiere autenticación. |
+| 11 | **Sandbox de subprocesos** | `env_clear()` + paso selectivo de variables. Aislamiento de árbol de procesos con kill multiplataforma. |
+| 12 | **Escáner de inyección de prompts** | Detenta intentos de override, patrones de exfiltración, inyección de referencias de shell en skills. |
+| 13 | **Guardia de bucles** | Detección de bucles de llamadas de herramientas basada en SHA256 con circuit breaker. Maneja patrones ping-pong. |
+| 14 | **Reparación de sesión** | Validación de historial de mensajes de 7 etapas y recuperación automática de corrupción. |
+| 15 | **Prevención de recorrido de rutas** | Normalización y prevención de escape de enlaces simbólicos. `../` no funciona aquí. |
+| 16 | **Limitador de tasa GCRA** | Limitación de tasa de token bucket con conocimiento de costos, seguimiento por IP y limpieza de antiguo. |
+
+---
+
+## Arquitectura
+
+14 crates de Rust. 137,728 líneas de código. Diseño de kernel modular.
+
+```
+librefang-kernel      Orquestación, flujos, medición, RBAC, programador, seguimiento de presupuesto
+librefang-runtime     Bucle de agente, 3 drivers LLM, 53 herramientas, sandbox WASM, MCP, A2A
+librefang-api         140+ endpoints REST/WS/SSE, API compatible con OpenAI, panel
+librefang-channels    40 adaptadores de mensajes, con limitadores de tasa
+librefang-memory      Persistencia SQLite, embeddings vectoriales, sesiones canónicas, compactación
+librefang-types      Tipos centrales, rastreo de tinte, firma de manifiestos Ed25519, catálogo de modelos
+librefang-skills     60 skills incluidos, parser de SKILL.md, mercado FangHub
+librefang-hands      7 Hands autónomos, parser de HAND.toml, gestión de ciclo de vida
+librefang-extensions 25 plantillas MCP, bóveda de credenciales AES-256-GCM, OAuth2 PKCE
+librefang-wire       Protocolo P2P OFP, con autenticación mutua HMAC-SHA256
+librefang-cli        CLI, gestión de daemon, panel TUI, modo servidor MCP
+librefang-desktop    App nativa Tauri 2.0 (bandeja del sistema, notificaciones, atajos globales)
+librefang-migrate    Motor de migración de OpenClaw, LangChain, AutoGPT
+xtask                Automatización de construcción
+```
+
+---
+
+## Inicio Rápido
+
+```bash
+# 1. Instalar
+cargo install --git https://github.com/librefang/librefang librefang-cli
+
+# 2. Inicializar — te guía a través de la configuración del proveedor
+librefang init
+
+# 3. Iniciar daemon
+librefang start
+
+# 4. Panel: http://localhost:4545
+
+# 5. Activar una Hand — comienza a trabajar para ti
+librefang hand activate researcher
+
+# 6. Chatear con el agente
+librefang chat researcher
+> "¿Cuáles son las últimas tendencias en marcos de agentes de IA?"
+
+# 7. Generar un agente preconstruido
+librefang agent spawn coder
+```
+
+---
+
+## Desarrollo
+
+```bash
+# Construir workspace
+cargo build --workspace --lib
+
+# Ejecutar todas las pruebas (1767+)
+cargo test --workspace
+
+# Lint (debe ser 0 advertencias)
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Formatear
+cargo fmt --all -- --check
+```
+
+---
+
+## Nota de Estabilidad
+
+LibreFang es pre-1.0. La arquitectura es sólida, el conjunto de pruebas es completo, el modelo de seguridad es completo. Es decir:
+
+- **Cambios rompedores** pueden ocurrir entre versiones menores hasta v1.0
+- **Algunas Hands** son más maduras que otras (Browser y Researcher están más battle-tested)
+- **Casos edge** existen — si encuentras uno, [abre un issue](https://github.com/librefang/librefang/issues)
+- En producción **haz pin a un commit específico** hasta v1.0
+
+Publicamos rápido, corregimos rápido. Objetivo: lanzar un v1.0 sólido a mediados de 2026.
+
+---
+
+## Seguridad
+
+Para reportar vulnerabilidades de seguridad, sigue el proceso de reporte privado en [SECURITY.md](SECURITY.md).
+
+---
+
+## Licencia
+
+Licencia MIT. Ver archivo LICENSE.
+
+---
+
+## Enlaces
+
+**Versiones en otros idiomas:**
+- [English](README.md)
+- [中文](README.zh.md)
+- [日本語](README.ja.md)
+- [한국어](README.ko.md)
+- [Español](README.es.md)
+- [Deutsch](README.de.md)
+
+- [GitHub](https://github.com/librefang/librefang)
+- [Sitio web](https://librefang.ai/)
+- [Documentación](https://docs.librefang.ai)
+- [Guía de contribuciones](CONTRIBUTING.md)
+- [Gobernanza](GOVERNANCE.md)
+- [Mantenedores](MAINTAINERS.md)
+- [Política de seguridad](SECURITY.md)
+
+---
+
+<p align="center">
+  <strong>Construido en Rust. 16 capas de seguridad. Agentes que realmente trabajan para ti.</strong>
+</p>

@@ -1124,7 +1124,7 @@ complex_threshold = 500
         r#"# LibreFang Agent OS configuration
 # See https://github.com/RightNow-AI/openfang for documentation
 
-api_listen = "127.0.0.1:4200"
+api_listen = "127.0.0.1:4545"
 
 [default_model]
 provider = "{provider}"

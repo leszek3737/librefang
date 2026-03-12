@@ -62,7 +62,7 @@ Welcome to the LibreFang documentation. LibreFang is the open-source Agent Opera
 ```bash
 export GROQ_API_KEY="your-key"
 librefang init && librefang start
-# Open http://127.0.0.1:4200
+# Open http://127.0.0.1:4545
 ```
 
 ### Key Numbers

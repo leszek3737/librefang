@@ -29,7 +29,7 @@ use librefang_runtime::sandbox::{SandboxConfig, WasmSandbox};
 use librefang_runtime::tool_runner::builtin_tool_definitions;
 use librefang_types::agent::*;
 use librefang_types::capability::Capability;
-use librefang_types::config::KernelConfig;
+use librefang_types::config::{KernelConfig, OutputFormat};
 use librefang_types::error::LibreFangError;
 use librefang_types::event::*;
 use librefang_types::memory::Memory;
@@ -3119,10 +3119,6 @@ impl LibreFangKernel {
             } else {
                 None
             },
-            // Redundant safety: tool_allowlist mirrors capabilities.tools above.
-            // available_tools() already filters by capabilities.tools, but this
-            // provides defense-in-depth.
-            tool_allowlist: def.tools.clone(),
             tool_blocklist: Vec::new(),
             // Custom profile avoids ToolProfile-based expansion overriding the
             // explicit tool list.
@@ -5704,7 +5700,20 @@ impl KernelHandle for LibreFangKernel {
             librefang_user: None,
         };
 
-        let content = librefang_channels::types::ChannelContent::Text(message.to_string());
+        let formatted = if channel == "wecom" {
+            let output_format = self
+                .config
+                .channels
+                .wecom
+                .as_ref()
+                .and_then(|c| c.overrides.output_format)
+                .unwrap_or(OutputFormat::PlainText);
+            librefang_channels::formatter::format_for_wecom(message, output_format)
+        } else {
+            message.to_string()
+        };
+
+        let content = librefang_channels::types::ChannelContent::Text(formatted);
 
         if let Some(tid) = thread_id {
             adapter
@@ -6153,5 +6162,39 @@ mod tests {
         assert!(!caps
             .iter()
             .any(|c| matches!(c, Capability::ToolInvoke(name) if name == "shell_exec")));
+    }
+
+    #[test]
+    fn test_hand_activation_does_not_seed_runtime_tool_filters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("librefang-kernel-hand-test");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+
+        let kernel = LibreFangKernel::boot_with_config(config).expect("Kernel should boot");
+        let instance = kernel
+            .activate_hand("browser", HashMap::new())
+            .expect("browser hand should activate");
+        let agent_id = instance.agent_id.expect("browser hand agent id");
+        let entry = kernel
+            .registry
+            .get(agent_id)
+            .expect("browser hand agent entry");
+
+        assert!(
+            entry.manifest.tool_allowlist.is_empty(),
+            "hand activation should leave the runtime tool allowlist empty so skill/MCP tools remain visible"
+        );
+        assert!(
+            entry.manifest.tool_blocklist.is_empty(),
+            "hand activation should not set a runtime blocklist by default"
+        );
+
+        kernel.shutdown();
     }
 }

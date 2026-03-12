@@ -57,7 +57,7 @@ The project website is live at [librefang.ai](https://librefang.ai/). Today, the
 cargo install --git https://github.com/librefang/librefang librefang-cli
 librefang init
 librefang start
-# Dashboard live at http://localhost:4200
+# Dashboard live at http://localhost:4545
 ```
 
 <details>
@@ -331,7 +331,7 @@ The migration engine imports your agents, conversation history, skills, and conf
 Drop-in replacement. Point your existing tools at LibreFang:
 
 ```bash
-curl -X POST localhost:4200/v1/chat/completions \
+curl -X POST localhost:4545/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "researcher",
@@ -356,7 +356,7 @@ librefang init
 # 3. Start the daemon
 librefang start
 
-# 4. Dashboard is live at http://localhost:4200
+# 4. Dashboard is live at http://localhost:4545
 
 # 5. Activate a Hand — it starts working for you
 librefang hand activate researcher
@@ -426,6 +426,14 @@ MIT License. See the LICENSE file for details.
 ---
 
 ## Links
+
+**Translations:**
+- [English](README.md)
+- [中文](README.zh.md)
+- [日本語](README.ja.md)
+- [한국어](README.ko.md)
+- [Español](README.es.md)
+- [Deutsch](README.de.md)
 
 - [GitHub](https://github.com/librefang/librefang)
 - [Website](https://librefang.ai/)

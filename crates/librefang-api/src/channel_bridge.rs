@@ -50,6 +50,7 @@ use librefang_channels::linkedin::LinkedInAdapter;
 use librefang_channels::mumble::MumbleAdapter;
 use librefang_channels::ntfy::NtfyAdapter;
 use librefang_channels::webhook::WebhookAdapter;
+use librefang_channels::wecom::WeComAdapter;
 use librefang_kernel::LibreFangKernel;
 use librefang_types::agent::AgentId;
 use std::sync::Arc;
@@ -784,6 +785,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             "gotify" => channels.gotify.as_ref().map(|c| c.overrides.clone()),
             "webhook" => channels.webhook.as_ref().map(|c| c.overrides.clone()),
             "linkedin" => channels.linkedin.as_ref().map(|c| c.overrides.clone()),
+            "wecom" => channels.wecom.as_ref().map(|c| c.overrides.clone()),
             _ => None,
         }
     }
@@ -1387,6 +1389,21 @@ pub async fn start_channel_bridge_with_config(
         if let Some(token) = read_token(&rv_config.bot_token_env, "Revolt") {
             let adapter = Arc::new(RevoltAdapter::new(token));
             adapters.push((adapter, rv_config.default_agent.clone()));
+        }
+    }
+
+    // WeCom/WeChat Work
+    if let Some(ref wc_config) = config.wecom {
+        if let Some(secret) = read_token(&wc_config.secret_env, "WeCom") {
+            let adapter = Arc::new(WeComAdapter::with_verification(
+                wc_config.corp_id.clone(),
+                wc_config.agent_id.clone(),
+                secret,
+                wc_config.webhook_port,
+                wc_config.encoding_aes_key.clone(),
+                wc_config.token.clone(),
+            ));
+            adapters.push((adapter, wc_config.default_agent.clone()));
         }
     }
 

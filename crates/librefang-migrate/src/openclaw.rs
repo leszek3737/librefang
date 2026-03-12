@@ -1194,7 +1194,7 @@ fn migrate_config_from_json(
         },
         memory: LibreFangMemorySection { decay_rate: 0.05 },
         network: LibreFangNetworkSection {
-            listen_addr: "127.0.0.1:4200".to_string(),
+            listen_addr: "127.0.0.1:4545".to_string(),
         },
         channels,
     };
@@ -2415,7 +2415,7 @@ fn migrate_legacy_config(
                 .unwrap_or(0.05),
         },
         network: LibreFangNetworkSection {
-            listen_addr: "127.0.0.1:4200".to_string(),
+            listen_addr: "127.0.0.1:4545".to_string(),
         },
         channels,
     };
