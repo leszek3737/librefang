@@ -23,5 +23,5 @@ jobs:
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           git add .
-          git commit -m "chore: sync install scripts from release ${{ github.event.release.tag_name }}" || echo "No changes"
+          git commit -m "chore: sync install scripts from release ${{ github.event.release.tag_name }}" || echo "No changes to commit"
           git push

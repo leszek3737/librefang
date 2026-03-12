@@ -6,16 +6,18 @@ set -e
 # Get version from command line
 if [ -z "$1" ]; then
     echo "Usage: $0 <version>"
-    echo "  Example: $0 0.3.48"
+    echo "  Example: $0 0.3.49"
     exit 1
 fi
 
-TAG="v$1"
+VERSION="$1"
+DATE=$(date +%Y%m%d)
+TAG="v${VERSION}-${DATE}"
 
 echo "Creating release: $TAG"
 
 # Update version in Cargo.toml
-sed -i.bak "s/^version = \".*\"/version = \"$1\"/" Cargo.toml
+sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
 rm -f Cargo.toml.bak
 git add Cargo.toml
 
