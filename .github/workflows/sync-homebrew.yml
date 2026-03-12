@@ -13,42 +13,63 @@ jobs:
           repository: librefang/homebrew-tap
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate formula
-        id: formula
+      - name: Download and calculate checksums
+        id: assets
         run: |
           TAG="${{ github.event.release.tag_name }}"
           VERSION="${TAG#v}"
 
-          # Get asset downloads and checksums
-          curl -sL "https://api.github.com/repos/librefang/librefang/releases/tags/$TAG" \
-            | jq -r '.assets[] | select(.name | endswith(".tar.gz") or endswith(".zip")) | "\(.name) \(.browser_download_url)"' \
-            > assets.txt
+          # Get asset URLs
+          curl -sL "https://api.github.com/repos/librefang/librefang/releases/tags/$TAG" > releases.json
 
-          # Generate formula.rb
-          cat > Formula/librefang.rb << 'RUBY'
+          # Get checksums
+          for url in $(cat releases.json | jq -r '.assets[] | select(.name | endswith(".tar.gz") or endswith(".zip")) | .browser_download_url'); do
+            sha=$(curl -sL "$url" | sha256sum | cut -d' ' -f1)
+            echo "$url $sha" >> checksums.txt
+          done
+
+          cat checksums.txt
+
+      - name: Generate formula
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+
+          # Read checksums
+          ARM64_DARWIN_SHA=$(grep "aarch64-apple-darwin" checksums.txt | awk '{print $2}')
+          X86_DARWIN_SHA=$(grep "x86_64-apple-darwin" checksums.txt | awk '{print $2}')
+          ARM64_LINUX_SHA=$(grep "aarch64-unknown-linux-gnu" checksums.txt | awk '{print $2}')
+          X86_LINUX_SHA=$(grep "x86_64-unknown-linux-gnu" checksums.txt | awk '{print $2}')
+
+          ARM64_DARWIN_URL=$(grep "aarch64-apple-darwin" checksums.txt | awk '{print $1}')
+          X86_DARWIN_URL=$(grep "x86_64-apple-darwin" checksums.txt | awk '{print $1}')
+          ARM64_LINUX_URL=$(grep "aarch64-unknown-linux-gnu" checksums.txt | awk '{print $1}')
+          X86_LINUX_URL=$(grep "x86_64-unknown-linux-gnu" checksums.txt | awk '{print $1}')
+
+          cat > Formula/librefang.rb <<EOF
 class Librefang < Formula
   desc "Community-Maintained Agent Operating System written in Rust"
   homepage "https://librefang.ai"
   license "MIT"
-  version "REPLACE_VERSION"
+  version "$VERSION"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "REPLACE_ARM64_DARWIN_URL"
-      sha256 "REPLACE_ARM64_DARWIN_SHA"
+      url "$ARM64_DARWIN_URL"
+      sha256 "$ARM64_DARWIN_SHA"
     else
-      url "REPLACE_X86_DARWIN_URL"
-      sha256 "REPLACE_X86_DARWIN_SHA"
+      url "$X86_DARWIN_URL"
+      sha256 "$X86_DARWIN_SHA"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "REPLACE_ARM64_LINUX_URL"
-      sha256 "REPLACE_ARM64_LINUX_SHA"
+      url "$ARM64_LINUX_URL"
+      sha256 "$ARM64_LINUX_SHA"
     else
-      url "REPLACE_X86_LINUX_URL"
-      sha256 "REPLACE_X86_LINUX_SHA"
+      url "$X86_LINUX_URL"
+      sha256 "$X86_LINUX_SHA"
     end
   end
 
@@ -60,38 +81,7 @@ class Librefang < Formula
     system "#{bin}/librefang", "--version"
   end
 end
-RUBY
-
-          # Replace version
-          sed -i "s/REPLACE_VERSION/$VERSION/" Formula/librefang.rb
-
-          # Get and calculate SHA256 for each asset
-          for asset in $(curl -sL "https://api.github.com/repos/librefang/librefang/releases/tags/$TAG" | jq -r '.assets[] | select(.name | endswith(".tar.gz") or endswith(".zip")) | @base64'); do
-            name=$(echo "$asset" | base64 -d | jq -r '.name')
-            url=$(echo "$asset" | base64 -d | jq -r '.browser_download_url')
-
-            # Download and calculate SHA256
-            sha=$(curl -sL "$url" | sha256sum | cut -d' ' -f1)
-
-            case "$name" in
-              *aarch64-apple-darwin*)
-                sed -i "s|REPLACE_ARM64_DARWIN_URL|$url|" Formula/librefang.rb
-                sed -i "s|REPLACE_ARM64_DARWIN_SHA|$sha|" Formula/librefang.rb
-                ;;
-              *x86_64-apple-darwin*)
-                sed -i "s|REPLACE_X86_DARWIN_URL|$url|" Formula/librefang.rb
-                sed -i "s|REPLACE_X86_DARWIN_SHA|$sha|" Formula/librefang.rb
-                ;;
-              *aarch64-unknown-linux-gnu*)
-                sed -i "s|REPLACE_ARM64_LINUX_URL|$url|" Formula/librefang.rb
-                sed -i "s|REPLACE_ARM64_LINUX_SHA|$sha|" Formula/librefang.rb
-                ;;
-              *x86_64-unknown-linux-gnu*)
-                sed -i "s|REPLACE_X86_LINUX_URL|$url|" Formula/librefang.rb
-                sed -i "s|REPLACE_X86_LINUX_SHA|$sha|" Formula/librefang.rb
-                ;;
-            esac
-          done
+EOF
 
           cat Formula/librefang.rb
 
