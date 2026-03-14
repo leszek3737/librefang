@@ -165,6 +165,26 @@ impl ModelCatalog {
         &self.aliases
     }
 
+    /// Add a custom alias mapping from `alias` to `model_id`.
+    ///
+    /// The alias is stored in lowercase. Returns `false` if the alias already
+    /// exists (use `remove_alias` first to overwrite).
+    pub fn add_alias(&mut self, alias: &str, model_id: &str) -> bool {
+        let lower = alias.to_lowercase();
+        if self.aliases.contains_key(&lower) {
+            return false;
+        }
+        self.aliases.insert(lower, model_id.to_string());
+        true
+    }
+
+    /// Remove a custom alias by name.
+    ///
+    /// Returns `true` if the alias was found and removed.
+    pub fn remove_alias(&mut self, alias: &str) -> bool {
+        self.aliases.remove(&alias.to_lowercase()).is_some()
+    }
+
     /// Set a custom base URL for a provider, overriding the default.
     ///
     /// Returns `true` if the provider was found and updated.
@@ -357,6 +377,7 @@ impl ModelCatalog {
     /// Returns the number of new models added.
     pub fn merge_catalog_file(&mut self, file: ModelCatalogFile) -> usize {
         // Merge provider info if present
+        let file_provider_id = file.provider.as_ref().map(|p| p.id.clone());
         if let Some(prov_toml) = file.provider {
             let provider_id = prov_toml.id.clone();
             if self.providers.iter().any(|p| p.id == provider_id) {
@@ -374,7 +395,17 @@ impl ModelCatalog {
 
         // Merge models
         let mut added = 0usize;
-        for model in file.models {
+        for mut model in file.models {
+            // Back-fill provider from the [provider] section when the model
+            // entry omits it (common in community catalog files).
+            if model.provider.is_empty() {
+                if let Some(ref pid) = file_provider_id {
+                    model.provider = pid.clone();
+                } else {
+                    // No provider info at all — skip this model
+                    continue;
+                }
+            }
             let lower_id = model.id.to_lowercase();
             let lower_provider = model.provider.to_lowercase();
             if self.models.iter().any(|m| {
@@ -825,6 +856,33 @@ mod tests {
     }
 
     #[test]
+    fn test_add_alias() {
+        let mut catalog = ModelCatalog::new();
+        assert!(catalog.add_alias("my-sonnet", "claude-sonnet-4-6"));
+        assert_eq!(
+            catalog.resolve_alias("my-sonnet").unwrap(),
+            "claude-sonnet-4-6"
+        );
+        // Duplicate should return false
+        assert!(!catalog.add_alias("my-sonnet", "gpt-4o"));
+        // Alias is case-insensitive
+        assert!(!catalog.add_alias("MY-SONNET", "gpt-4o"));
+    }
+
+    #[test]
+    fn test_remove_alias() {
+        let mut catalog = ModelCatalog::new();
+        catalog.add_alias("temp-alias", "gpt-4o");
+        assert!(catalog.remove_alias("temp-alias"));
+        assert!(catalog.resolve_alias("temp-alias").is_none());
+        // Removing non-existent alias returns false
+        assert!(!catalog.remove_alias("no-such-alias"));
+        // Case-insensitive removal
+        catalog.add_alias("upper-alias", "gpt-4o");
+        assert!(catalog.remove_alias("UPPER-ALIAS"));
+    }
+
+    #[test]
     fn test_new_providers_in_catalog() {
         let catalog = ModelCatalog::new();
         assert!(catalog.get_provider("perplexity").is_some());
@@ -1231,5 +1289,43 @@ aliases = []
                 "Expected at least 100 models, got {total_models}"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_remote_catalog_without_provider_on_models() {
+        // Remote model-catalog repo omits `provider` on each [[models]] entry
+        // because it's already in the [provider] section.
+        let toml_content = r#"
+[provider]
+id = "test-remote"
+display_name = "Test Remote"
+api_key_env = "TEST_REMOTE_KEY"
+base_url = "https://api.test-remote.example.com"
+key_required = true
+
+[[models]]
+id = "test-remote-model-1"
+display_name = "Test Remote Model 1"
+tier = "frontier"
+context_window = 200000
+max_output_tokens = 128000
+input_cost_per_m = 5.0
+output_cost_per_m = 25.0
+supports_tools = true
+supports_vision = true
+supports_streaming = true
+aliases = ["trm1"]
+"#;
+        let file: ModelCatalogFile =
+            toml::from_str(toml_content).expect("should parse without provider on models");
+        assert_eq!(file.models.len(), 1);
+        assert!(file.models[0].provider.is_empty());
+
+        let mut catalog = ModelCatalog::new();
+        let added = catalog.merge_catalog_file(file);
+        assert_eq!(added, 1);
+
+        let model = catalog.find_model("test-remote-model-1").unwrap();
+        assert_eq!(model.provider, "test-remote");
     }
 }

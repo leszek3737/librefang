@@ -15,6 +15,7 @@ use librefang_runtime::kernel_handle::KernelHandle;
 use librefang_runtime::tool_runner::builtin_tool_definitions;
 use librefang_types::agent::{AgentId, AgentIdentity, AgentManifest};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -467,11 +468,17 @@ pub async fn get_agent_session(
                                     // served back when loading session history.
                                     let file_id = uuid::Uuid::new_v4().to_string();
                                     let upload_dir = std::env::temp_dir().join("librefang_uploads");
-                                    let _ = std::fs::create_dir_all(&upload_dir);
+                                    if let Err(e) = std::fs::create_dir_all(&upload_dir) {
+                                        tracing::warn!("Failed to create upload directory: {e}");
+                                    }
                                     if let Ok(bytes) =
                                         base64::engine::general_purpose::STANDARD.decode(data)
                                     {
-                                        let _ = std::fs::write(upload_dir.join(&file_id), &bytes);
+                                        if let Err(e) =
+                                            std::fs::write(upload_dir.join(&file_id), &bytes)
+                                        {
+                                            tracing::warn!("Failed to write upload file: {e}");
+                                        }
                                         UPLOAD_REGISTRY.insert(
                                             file_id.clone(),
                                             UploadMeta {
@@ -1010,6 +1017,34 @@ pub async fn list_profiles() -> impl IntoResponse {
         .collect();
 
     Json(result)
+}
+
+/// GET /api/profiles/:name — Get a single profile by name.
+pub async fn get_profile(Path(name): Path<String>) -> impl IntoResponse {
+    use librefang_types::agent::ToolProfile;
+
+    let profiles: &[(&str, ToolProfile)] = &[
+        ("minimal", ToolProfile::Minimal),
+        ("coding", ToolProfile::Coding),
+        ("research", ToolProfile::Research),
+        ("messaging", ToolProfile::Messaging),
+        ("automation", ToolProfile::Automation),
+        ("full", ToolProfile::Full),
+    ];
+
+    match profiles.iter().find(|(n, _)| *n == name) {
+        Some((n, profile)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "name": n,
+                "tools": profile.tools(),
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Profile '{}' not found", name)})),
+        ),
+    }
 }
 
 /// PUT /api/agents/:id/mode — Change an agent's operational mode.
@@ -2312,6 +2347,13 @@ pub async fn configure_channel(
         }
 
         if let Some(env_var) = field_def.env_var {
+            // Validate env var name and value before writing
+            if let Err(msg) = validate_env_var(env_var, value) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": msg})),
+                );
+            }
             // Secret field — write to secrets.env and set in process
             if let Err(e) = write_secret_env(&secrets_path, env_var, value) {
                 return (
@@ -2402,7 +2444,9 @@ pub async fn remove_channel(
     // Remove all secret env vars for this channel
     for field_def in meta.fields {
         if let Some(env_var) = field_def.env_var {
-            let _ = remove_secret_env(&secrets_path, env_var);
+            if let Err(e) = remove_secret_env(&secrets_path, env_var) {
+                tracing::warn!("Failed to remove secret env var: {e}");
+            }
             // SAFETY: Single-threaded config operation
             unsafe {
                 std::env::remove_var(env_var);
@@ -2909,15 +2953,19 @@ pub async fn get_template(Path(name): Path<String>) -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 /// GET /api/memory/agents/:id/kv — List KV pairs for an agent.
-///
-/// Note: memory_store tool writes to a shared namespace, so we read from that
-/// same namespace regardless of which agent ID is in the URL.
 pub async fn get_agent_kv(
     State(state): State<Arc<AppState>>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id = librefang_kernel::kernel::shared_memory_agent_id();
-
+    let agent_id: AgentId = match id.parse() {
+        Ok(aid) => aid,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
     match state.kernel.memory.list_kv(agent_id) {
         Ok(pairs) => {
             let kv: Vec<serde_json::Value> = pairs
@@ -2939,10 +2987,17 @@ pub async fn get_agent_kv(
 /// GET /api/memory/agents/:id/kv/:key — Get a specific KV value.
 pub async fn get_agent_kv_key(
     State(state): State<Arc<AppState>>,
-    Path((_id, key)): Path<(String, String)>,
+    Path((id, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let agent_id = librefang_kernel::kernel::shared_memory_agent_id();
-
+    let agent_id: AgentId = match id.parse() {
+        Ok(aid) => aid,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
     match state.kernel.memory.structured_get(agent_id, &key) {
         Ok(Some(val)) => (
             StatusCode::OK,
@@ -2965,11 +3020,18 @@ pub async fn get_agent_kv_key(
 /// PUT /api/memory/agents/:id/kv/:key — Set a KV value.
 pub async fn set_agent_kv_key(
     State(state): State<Arc<AppState>>,
-    Path((_id, key)): Path<(String, String)>,
+    Path((id, key)): Path<(String, String)>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let agent_id = librefang_kernel::kernel::shared_memory_agent_id();
-
+    let agent_id: AgentId = match id.parse() {
+        Ok(aid) => aid,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
     let value = body.get("value").cloned().unwrap_or(body);
 
     match state.kernel.memory.structured_set(agent_id, &key, value) {
@@ -2990,10 +3052,17 @@ pub async fn set_agent_kv_key(
 /// DELETE /api/memory/agents/:id/kv/:key — Delete a KV value.
 pub async fn delete_agent_kv_key(
     State(state): State<Arc<AppState>>,
-    Path((_id, key)): Path<(String, String)>,
+    Path((id, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let agent_id = librefang_kernel::kernel::shared_memory_agent_id();
-
+    let agent_id: AgentId = match id.parse() {
+        Ok(aid) => aid,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
     match state.kernel.memory.structured_delete(agent_id, &key) {
         Ok(()) => (
             StatusCode::OK,
@@ -3006,6 +3075,152 @@ pub async fn delete_agent_kv_key(
                 Json(serde_json::json!({"error": "Memory operation failed"})),
             )
         }
+    }
+}
+
+/// GET /api/agents/:id/memory/export — Export all KV memory for an agent as JSON.
+pub async fn export_agent_memory(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(aid) => aid,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    // Verify agent exists
+    if state.kernel.registry.get(agent_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found"})),
+        );
+    }
+
+    match state.kernel.memory.list_kv(agent_id) {
+        Ok(pairs) => {
+            let kv_map: serde_json::Map<String, serde_json::Value> = pairs.into_iter().collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "agent_id": agent_id.0.to_string(),
+                    "version": 1,
+                    "kv": kv_map,
+                })),
+            )
+        }
+        Err(e) => {
+            tracing::warn!("Memory export failed for agent {agent_id}: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Memory export failed"})),
+            )
+        }
+    }
+}
+
+/// POST /api/agents/:id/memory/import — Import KV memory from JSON into an agent.
+///
+/// Accepts a JSON body with a `kv` object mapping string keys to JSON values.
+/// Optionally accepts `clear_existing: true` to wipe existing memory before import.
+pub async fn import_agent_memory(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(aid) => aid,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    // Verify agent exists
+    if state.kernel.registry.get(agent_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found"})),
+        );
+    }
+
+    let kv = match body.get("kv").and_then(|v| v.as_object()) {
+        Some(obj) => obj.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"error": "Missing or invalid 'kv' object in request body"}),
+                ),
+            );
+        }
+    };
+
+    let clear_existing = body
+        .get("clear_existing")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Clear existing memory if requested
+    if clear_existing {
+        match state.kernel.memory.list_kv(agent_id) {
+            Ok(existing) => {
+                for (key, _) in existing {
+                    if let Err(e) = state.kernel.memory.structured_delete(agent_id, &key) {
+                        tracing::warn!("Failed to delete key '{key}' during import clear: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to list existing KV during import clear: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Memory import failed during clear"})),
+                );
+            }
+        }
+    }
+
+    let mut imported = 0u64;
+    let mut errors = Vec::new();
+
+    for (key, value) in &kv {
+        match state
+            .kernel
+            .memory
+            .structured_set(agent_id, key, value.clone())
+        {
+            Ok(()) => imported += 1,
+            Err(e) => {
+                tracing::warn!("Memory import failed for key '{key}': {e}");
+                errors.push(key.clone());
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "imported",
+                "keys_imported": imported,
+            })),
+        )
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "partial",
+                "keys_imported": imported,
+                "failed_keys": errors,
+            })),
+        )
     }
 }
 
@@ -3152,7 +3367,9 @@ pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl Into
 pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let skills_dir = state.kernel.config.home_dir.join("skills");
     let mut registry = librefang_skills::registry::SkillRegistry::new(skills_dir);
-    let _ = registry.load_all();
+    if let Err(e) = registry.load_all() {
+        tracing::warn!("Failed to reload skill registry: {e}");
+    }
 
     let skills: Vec<serde_json::Value> = registry
         .list()
@@ -3231,7 +3448,9 @@ pub async fn uninstall_skill(
 ) -> impl IntoResponse {
     let skills_dir = state.kernel.config.home_dir.join("skills");
     let mut registry = librefang_skills::registry::SkillRegistry::new(skills_dir);
-    let _ = registry.load_all();
+    if let Err(e) = registry.load_all() {
+        tracing::warn!("Failed to reload skill registry: {e}");
+    }
 
     match registry.remove(&req.name) {
         Ok(()) => {
@@ -4577,6 +4796,299 @@ pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoRe
     }))
 }
 
+/// POST /api/mcp/servers — Add a new MCP server configuration.
+///
+/// Expects a JSON body matching `McpServerConfigEntry` (name, transport, timeout_secs, env).
+/// Persists to config.toml and triggers a config reload.
+pub async fn add_mcp_server(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Validate required fields
+    let name = match body.get("name").and_then(|v| v.as_str()) {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing or empty 'name' field"})),
+            );
+        }
+    };
+
+    if body.get("transport").is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing 'transport' field"})),
+        );
+    }
+
+    // Validate by deserializing the body into McpServerConfigEntry
+    let entry: librefang_types::config::McpServerConfigEntry = match serde_json::from_value(body) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid MCP server config: {e}")})),
+            );
+        }
+    };
+
+    // Check for duplicate name
+    if state
+        .kernel
+        .config
+        .mcp_servers
+        .iter()
+        .any(|s| s.name == name)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("MCP server '{}' already exists", name)})),
+        );
+    }
+
+    // Persist to config.toml
+    let config_path = state.kernel.config.home_dir.join("config.toml");
+    if let Err(e) = upsert_mcp_server_config(&config_path, &entry) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to write config: {e}")})),
+        );
+    }
+
+    // Trigger config reload
+    let reload_status = match state.kernel.reload_config() {
+        Ok(plan) => {
+            if plan.restart_required {
+                "applied_partial"
+            } else {
+                "applied"
+            }
+        }
+        Err(_) => "saved_reload_failed",
+    };
+
+    state.kernel.audit_log.record(
+        "system",
+        librefang_runtime::audit::AuditAction::ConfigChange,
+        format!("mcp_server added: {name}"),
+        "completed",
+    );
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "status": "added",
+            "name": name,
+            "reload": reload_status,
+        })),
+    )
+}
+
+/// PUT /api/mcp/servers/{name} — Update an existing MCP server configuration.
+///
+/// Replaces the existing entry with the provided JSON body. The `name` path
+/// parameter identifies which server to update; the body's `name` field (if
+/// present) is ignored in favour of the path parameter.
+pub async fn update_mcp_server(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(mut body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Ensure the entry exists
+    if !state
+        .kernel
+        .config
+        .mcp_servers
+        .iter()
+        .any(|s| s.name == name)
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("MCP server '{}' not found", name)})),
+        );
+    }
+
+    // Force the name in body to match the path parameter
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("name".to_string(), serde_json::json!(name));
+    }
+
+    if body.get("transport").is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing 'transport' field"})),
+        );
+    }
+
+    // Validate by deserializing
+    let entry: librefang_types::config::McpServerConfigEntry = match serde_json::from_value(body) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid MCP server config: {e}")})),
+            );
+        }
+    };
+
+    // Persist — upsert replaces an existing entry with the same name
+    let config_path = state.kernel.config.home_dir.join("config.toml");
+    if let Err(e) = upsert_mcp_server_config(&config_path, &entry) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to write config: {e}")})),
+        );
+    }
+
+    let reload_status = match state.kernel.reload_config() {
+        Ok(plan) => {
+            if plan.restart_required {
+                "applied_partial"
+            } else {
+                "applied"
+            }
+        }
+        Err(_) => "saved_reload_failed",
+    };
+
+    state.kernel.audit_log.record(
+        "system",
+        librefang_runtime::audit::AuditAction::ConfigChange,
+        format!("mcp_server updated: {name}"),
+        "completed",
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "updated",
+            "name": name,
+            "reload": reload_status,
+        })),
+    )
+}
+
+/// DELETE /api/mcp/servers/{name} — Remove an MCP server configuration.
+pub async fn delete_mcp_server(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    // Ensure the entry exists
+    if !state
+        .kernel
+        .config
+        .mcp_servers
+        .iter()
+        .any(|s| s.name == name)
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("MCP server '{}' not found", name)})),
+        );
+    }
+
+    let config_path = state.kernel.config.home_dir.join("config.toml");
+    if let Err(e) = remove_mcp_server_config(&config_path, &name) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to write config: {e}")})),
+        );
+    }
+
+    let reload_status = match state.kernel.reload_config() {
+        Ok(plan) => {
+            if plan.restart_required {
+                "applied_partial"
+            } else {
+                "applied"
+            }
+        }
+        Err(_) => "saved_reload_failed",
+    };
+
+    state.kernel.audit_log.record(
+        "system",
+        librefang_runtime::audit::AuditAction::ConfigChange,
+        format!("mcp_server removed: {name}"),
+        "completed",
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "removed",
+            "name": name,
+            "reload": reload_status,
+        })),
+    )
+}
+
+/// Upsert an MCP server entry in config.toml's `[[mcp_servers]]` array.
+///
+/// If an entry with the same name already exists it is replaced; otherwise a
+/// new entry is appended.
+fn upsert_mcp_server_config(
+    config_path: &std::path::Path,
+    entry: &librefang_types::config::McpServerConfigEntry,
+) -> Result<(), String> {
+    let mut table: toml::value::Table = if config_path.exists() {
+        let content = std::fs::read_to_string(config_path).map_err(|e| e.to_string())?;
+        toml::from_str(&content).unwrap_or_default()
+    } else {
+        toml::value::Table::new()
+    };
+
+    // Serialize the entry to a TOML value via JSON round-trip
+    let entry_json = serde_json::to_value(entry).map_err(|e| e.to_string())?;
+    let entry_toml = json_to_toml_value(&entry_json);
+
+    let servers = table
+        .entry("mcp_servers".to_string())
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+
+    if let toml::Value::Array(ref mut arr) = servers {
+        // Remove existing entry with same name (if any)
+        arr.retain(|v| {
+            v.as_table()
+                .and_then(|t| t.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|n| n != entry.name)
+                .unwrap_or(true)
+        });
+        // Append new/updated entry
+        arr.push(entry_toml);
+    }
+
+    let toml_string = toml::to_string_pretty(&table).map_err(|e| e.to_string())?;
+    std::fs::write(config_path, toml_string).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Remove an MCP server entry from config.toml's `[[mcp_servers]]` array by name.
+fn remove_mcp_server_config(config_path: &std::path::Path, name: &str) -> Result<(), String> {
+    let mut table: toml::value::Table = if config_path.exists() {
+        let content = std::fs::read_to_string(config_path).map_err(|e| e.to_string())?;
+        toml::from_str(&content).unwrap_or_default()
+    } else {
+        return Ok(());
+    };
+
+    if let Some(toml::Value::Array(ref mut arr)) = table.get_mut("mcp_servers") {
+        arr.retain(|v| {
+            v.as_table()
+                .and_then(|t| t.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|n| n != name)
+                .unwrap_or(true)
+        });
+    }
+
+    let toml_string = toml::to_string_pretty(&table).map_err(|e| e.to_string())?;
+    std::fs::write(config_path, toml_string).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Audit endpoints
 // ---------------------------------------------------------------------------
@@ -4846,6 +5358,48 @@ pub async fn list_tools(State(state): State<Arc<AppState>>) -> impl IntoResponse
     }
 
     Json(serde_json::json!({"tools": tools, "total": tools.len()}))
+}
+
+/// GET /api/tools/:name — Get a single tool definition by name.
+pub async fn get_tool(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    // Search built-in tools first
+    for t in builtin_tool_definitions() {
+        if t.name == name {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                })),
+            );
+        }
+    }
+
+    // Search MCP tools
+    if let Ok(mcp_tools) = state.kernel.mcp_tools.lock() {
+        for t in mcp_tools.iter() {
+            if t.name == name {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema,
+                        "source": "mcp",
+                    })),
+                );
+            }
+        }
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": format!("Tool '{}' not found", name)})),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -5150,7 +5704,9 @@ pub async fn update_agent_budget(
         Ok(()) => {
             // Persist updated entry
             if let Some(entry) = state.kernel.registry.get(agent_id) {
-                let _ = state.kernel.memory.save_agent(&entry);
+                if let Err(e) = state.kernel.memory.save_agent(&entry) {
+                    tracing::warn!("Failed to persist agent state: {e}");
+                }
             }
             (
                 StatusCode::OK,
@@ -5455,7 +6011,9 @@ pub async fn patch_agent(
 
     // Persist updated entry to SQLite
     if let Some(entry) = state.kernel.registry.get(agent_id) {
-        let _ = state.kernel.memory.save_agent(&entry);
+        if let Err(e) = state.kernel.memory.save_agent(&entry) {
+            tracing::warn!("Failed to persist agent state: {e}");
+        }
         (
             StatusCode::OK,
             Json(
@@ -5765,6 +6323,84 @@ pub async fn list_aliases(State(state): State<Arc<AppState>>) -> impl IntoRespon
             "aliases": entries,
             "total": entries.len(),
         })),
+    )
+}
+
+/// POST /api/models/aliases — Create a new alias mapping.
+///
+/// Body: `{ "alias": "my-alias", "model_id": "gpt-4o" }`
+pub async fn create_alias(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let alias = body
+        .get("alias")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let model_id = body
+        .get("model_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if alias.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing required field: alias"})),
+        );
+    }
+    if model_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing required field: model_id"})),
+        );
+    }
+
+    let mut catalog = state
+        .kernel
+        .model_catalog
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if !catalog.add_alias(&alias, &model_id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("Alias '{}' already exists", alias)})),
+        );
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "alias": alias.to_lowercase(),
+            "model_id": model_id,
+            "status": "created"
+        })),
+    )
+}
+
+/// DELETE /api/models/aliases/{alias} — Remove an alias mapping.
+pub async fn delete_alias(
+    State(state): State<Arc<AppState>>,
+    Path(alias): Path<String>,
+) -> impl IntoResponse {
+    let mut catalog = state
+        .kernel
+        .model_catalog
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if !catalog.remove_alias(&alias) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Alias '{}' not found", alias)})),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "removed"})),
     )
 }
 
@@ -6238,6 +6874,116 @@ pub async fn a2a_list_external_agents(State(state): State<Arc<AppState>>) -> imp
     Json(serde_json::json!({"agents": items, "total": items.len()}))
 }
 
+/// Check whether a URL is safe to fetch (not targeting internal/private networks).
+/// Returns `Ok(())` if the URL is safe, or `Err(message)` describing the problem.
+fn is_url_safe_for_ssrf(raw_url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(raw_url).map_err(|e| format!("Invalid URL: {e}"))?;
+
+    // Only allow http and https schemes
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("Unsupported URL scheme: {other}")),
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+
+    // Block localhost by hostname
+    if host.eq_ignore_ascii_case("localhost") {
+        return Err("Requests to localhost are not allowed".to_string());
+    }
+
+    // Try to parse the host as an IP address directly, or resolve the hostname
+    let addrs: Vec<IpAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![ip]
+    } else {
+        // Resolve hostname — use port 80 as a dummy for resolution
+        let socket_addr = format!("{host}:80");
+        match std::net::ToSocketAddrs::to_socket_addrs(&socket_addr.as_str()) {
+            Ok(iter) => iter.map(|sa| sa.ip()).collect(),
+            Err(_) => {
+                // If resolution fails, we still block — don't allow unresolvable hosts
+                return Err(format!("Cannot resolve host: {host}"));
+            }
+        }
+    };
+
+    for ip in &addrs {
+        if is_private_ip(ip) {
+            return Err(format!(
+                "Requests to private/internal IP addresses are not allowed ({ip})"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns true if the IP address is in a private, loopback, link-local, or
+/// otherwise internal range that should not be reachable from user-supplied URLs.
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()              // 127.0.0.0/8
+                || v4.is_private()         // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                || v4.is_link_local()      // 169.254.0.0/16 (cloud metadata)
+                || v4.is_broadcast()       // 255.255.255.255
+                || v4.is_unspecified()     // 0.0.0.0
+                || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64 // 100.64.0.0/10 (CGNAT)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()              // ::1
+                || v6.is_unspecified()     // ::
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 (unique local)
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 (link-local)
+        }
+    }
+}
+
+/// GET /api/a2a/agents/{id} — Get a specific external A2A agent by index, URL, or name.
+pub async fn a2a_get_external_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agents = state
+        .kernel
+        .a2a_external_agents
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let make_response = |(_, card): &(String, librefang_runtime::a2a::AgentCard)| {
+        serde_json::json!({
+            "name": card.name,
+            "url": card.url,
+            "description": card.description,
+            "skills": card.skills,
+            "version": card.version,
+        })
+    };
+
+    // Try by index first
+    if let Ok(idx) = id.parse::<usize>() {
+        if let Some(entry) = agents.get(idx) {
+            return (StatusCode::OK, Json(make_response(entry)));
+        }
+    }
+
+    // Try by URL match
+    if let Some(entry) = agents.iter().find(|(_, c)| c.url == id) {
+        return (StatusCode::OK, Json(make_response(entry)));
+    }
+
+    // Try by agent name
+    if let Some(entry) = agents.iter().find(|(_, c)| c.name == id) {
+        return (StatusCode::OK, Json(make_response(entry)));
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": format!("A2A agent '{}' not found", id)})),
+    )
+}
 /// POST /api/a2a/discover — Discover a new external A2A agent by URL.
 pub async fn a2a_discover_external(
     State(state): State<Arc<AppState>>,
@@ -6252,6 +6998,14 @@ pub async fn a2a_discover_external(
             )
         }
     };
+
+    // SSRF protection: validate URL before making any outbound request
+    if let Err(reason) = is_url_safe_for_ssrf(&url) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": reason})),
+        );
+    }
 
     let client = librefang_runtime::a2a::A2aClient::new();
     match client.discover(&url).await {
@@ -7085,10 +7839,13 @@ pub async fn set_provider_key(
             if let Ok(existing) = std::fs::read_to_string(&config_path) {
                 // Remove existing [default_model] section if present, then append
                 let cleaned = remove_toml_section(&existing, "default_model");
-                let _ =
-                    std::fs::write(&config_path, format!("{}\n{}", cleaned.trim(), update_toml));
-            } else {
-                let _ = std::fs::write(&config_path, update_toml);
+                if let Err(e) =
+                    std::fs::write(&config_path, format!("{}\n{}", cleaned.trim(), update_toml))
+                {
+                    tracing::warn!("Failed to write config file: {e}");
+                }
+            } else if let Err(e) = std::fs::write(&config_path, update_toml) {
+                tracing::warn!("Failed to write config file: {e}");
             }
 
             // Hot-update the in-memory default model override so resolve_driver()
@@ -7588,6 +8345,69 @@ pub async fn create_skill(
 
 // ── Helper functions for secrets.env management ────────────────────────
 
+/// Denylist of critical system environment variables that must not be overwritten.
+const DENIED_ENV_VARS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "TERM",
+    "LANG",
+    "PWD",
+];
+
+/// Maximum allowed length for an environment variable value.
+const ENV_VALUE_MAX_LEN: usize = 4096;
+
+/// Validate an environment variable name and value before setting them.
+///
+/// Rules:
+/// - Name must match `^[A-Za-z_][A-Za-z0-9_]*$`
+/// - Name must not be in the system denylist
+/// - Value length must not exceed [`ENV_VALUE_MAX_LEN`]
+fn validate_env_var(name: &str, value: &str) -> Result<(), String> {
+    // Check name format: must start with letter or underscore, then alphanumeric/underscore
+    if name.is_empty() {
+        return Err("Environment variable name must not be empty".to_string());
+    }
+    let first = name.as_bytes()[0];
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return Err(format!(
+            "Environment variable name '{}' must start with a letter or underscore",
+            name
+        ));
+    }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err(format!(
+            "Environment variable name '{}' contains invalid characters (only A-Z, a-z, 0-9, _ allowed)",
+            name
+        ));
+    }
+
+    // Check denylist
+    let upper = name.to_ascii_uppercase();
+    if DENIED_ENV_VARS.iter().any(|&d| d == upper) {
+        return Err(format!(
+            "Environment variable '{}' is a protected system variable and cannot be overwritten",
+            name
+        ));
+    }
+
+    // Check value length
+    if value.len() > ENV_VALUE_MAX_LEN {
+        return Err(format!(
+            "Environment variable value exceeds maximum length of {} bytes",
+            ENV_VALUE_MAX_LEN
+        ));
+    }
+
+    Ok(())
+}
+
 /// Write or update a key in the secrets.env file.
 /// File format: one `KEY=value` per line. Existing keys are overwritten.
 fn write_secret_env(path: &std::path::Path, key: &str, value: &str) -> Result<(), std::io::Error> {
@@ -7617,7 +8437,9 @@ fn write_secret_env(path: &std::path::Path, key: &str, value: &str) -> Result<()
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!("Failed to set file permissions: {e}");
+        }
     }
 
     Ok(())
@@ -7914,7 +8736,9 @@ pub async fn remove_integration(
     state.kernel.extension_health.unregister(&id);
 
     // Hot-disconnect the removed MCP server
-    let _ = state.kernel.reload_extension_mcps().await;
+    if let Err(e) = state.kernel.reload_extension_mcps().await {
+        tracing::warn!("Failed to reload MCP extensions: {e}");
+    }
 
     (
         StatusCode::OK,
@@ -8010,6 +8834,228 @@ pub async fn reload_integrations(State(state): State<Arc<AppState>>) -> impl Int
 }
 
 // ---------------------------------------------------------------------------
+// Extension management endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/extensions — List all installed extensions (integrations) with status.
+pub async fn list_extensions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let registry = state
+        .kernel
+        .extension_registry
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let health = &state.kernel.extension_health;
+
+    let mut extensions = Vec::new();
+    for info in registry.list_all_info() {
+        let h = health.get_health(&info.template.id);
+        let status = match &info.installed {
+            Some(inst) if !inst.enabled => "disabled",
+            Some(_) => match h.as_ref().map(|h| &h.status) {
+                Some(librefang_extensions::IntegrationStatus::Ready) => "ready",
+                Some(librefang_extensions::IntegrationStatus::Error(_)) => "error",
+                _ => "installed",
+            },
+            None => "available",
+        };
+        extensions.push(serde_json::json!({
+            "name": info.template.id,
+            "display_name": info.template.name,
+            "description": info.template.description,
+            "icon": info.template.icon,
+            "category": info.template.category.to_string(),
+            "status": status,
+            "tags": info.template.tags,
+            "installed": info.installed.is_some(),
+            "tool_count": h.as_ref().map(|h| h.tool_count).unwrap_or(0),
+            "installed_at": info.installed.as_ref().map(|i| i.installed_at.to_rfc3339()),
+        }));
+    }
+
+    Json(serde_json::json!({
+        "extensions": extensions,
+        "total": extensions.len(),
+    }))
+}
+
+/// GET /api/extensions/:name — Get details for a single extension by name.
+pub async fn get_extension(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let registry = state
+        .kernel
+        .extension_registry
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let template = match registry.get_template(&name) {
+        Some(t) => t.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Extension '{}' not found", name)})),
+            );
+        }
+    };
+
+    let installed = registry.get_installed(&name).cloned();
+    let health = state.kernel.extension_health.get_health(&name);
+
+    let status = match &installed {
+        Some(inst) if !inst.enabled => "disabled",
+        Some(_) => match health.as_ref().map(|h| &h.status) {
+            Some(librefang_extensions::IntegrationStatus::Ready) => "ready",
+            Some(librefang_extensions::IntegrationStatus::Error(_)) => "error",
+            _ => "installed",
+        },
+        None => "available",
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "name": template.id,
+            "display_name": template.name,
+            "description": template.description,
+            "icon": template.icon,
+            "category": template.category.to_string(),
+            "status": status,
+            "tags": template.tags,
+            "installed": installed.is_some(),
+            "tool_count": health.as_ref().map(|h| h.tool_count).unwrap_or(0),
+            "installed_at": installed.as_ref().map(|i| i.installed_at.to_rfc3339()),
+            "required_env": template.required_env.iter().map(|e| serde_json::json!({
+                "name": e.name,
+                "label": e.label,
+                "help": e.help,
+                "is_secret": e.is_secret,
+                "get_url": e.get_url,
+            })).collect::<Vec<_>>(),
+            "has_oauth": template.oauth.is_some(),
+            "setup_instructions": template.setup_instructions,
+            "health": health.as_ref().map(|h| serde_json::json!({
+                "last_ok": h.last_ok.map(|t| t.to_rfc3339()),
+                "last_error": h.last_error,
+                "consecutive_failures": h.consecutive_failures,
+                "reconnecting": h.reconnecting,
+            })),
+        })),
+    )
+}
+
+/// POST /api/extensions/install — Install an extension by name.
+pub async fn install_extension(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ExtensionInstallRequest>,
+) -> impl IntoResponse {
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing or empty 'name' field"})),
+        );
+    }
+
+    // Scope the write lock so it's dropped before any .await
+    let install_err = {
+        let mut registry = state
+            .kernel
+            .extension_registry
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+
+        if registry.is_installed(&name) {
+            Some((
+                StatusCode::CONFLICT,
+                format!("Extension '{}' already installed", name),
+            ))
+        } else if registry.get_template(&name).is_none() {
+            Some((
+                StatusCode::NOT_FOUND,
+                format!("Unknown extension: '{}'", name),
+            ))
+        } else {
+            let entry = librefang_extensions::InstalledIntegration {
+                id: name.clone(),
+                installed_at: chrono::Utc::now(),
+                enabled: true,
+                oauth_provider: None,
+                config: std::collections::HashMap::new(),
+            };
+            match registry.install(entry) {
+                Ok(_) => None,
+                Err(e) => Some((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+            }
+        }
+    }; // write lock dropped here
+
+    if let Some((status, error)) = install_err {
+        return (status, Json(serde_json::json!({"error": error})));
+    }
+
+    state.kernel.extension_health.register(&name);
+
+    // Hot-connect the new MCP server
+    let connected = state.kernel.reload_extension_mcps().await.unwrap_or(0);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "installed",
+            "name": name,
+            "connected": connected > 0,
+        })),
+    )
+}
+
+/// POST /api/extensions/uninstall — Uninstall an extension by name.
+pub async fn uninstall_extension(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ExtensionUninstallRequest>,
+) -> impl IntoResponse {
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing or empty 'name' field"})),
+        );
+    }
+
+    // Scope the write lock
+    let uninstall_err = {
+        let mut registry = state
+            .kernel
+            .extension_registry
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.uninstall(&name).err()
+    };
+
+    if let Some(e) = uninstall_err {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": e.to_string()})),
+        );
+    }
+
+    state.kernel.extension_health.unregister(&name);
+
+    // Hot-disconnect the removed MCP server
+    if let Err(e) = state.kernel.reload_extension_mcps().await {
+        tracing::warn!("Failed to reload MCP extensions after uninstall: {e}");
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "uninstalled",
+            "name": name,
+        })),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Scheduled Jobs (cron) endpoints
 // ---------------------------------------------------------------------------
 
@@ -8036,6 +9082,37 @@ pub async fn list_schedules(State(state): State<Arc<AppState>>) -> impl IntoResp
         Err(e) => {
             tracing::warn!("Failed to load schedules: {e}");
             Json(serde_json::json!({"schedules": [], "total": 0, "error": format!("{e}")}))
+        }
+    }
+}
+
+/// GET /api/schedules/{id} — Get a specific schedule by ID.
+pub async fn get_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id = schedule_shared_agent_id();
+    match state.kernel.memory.structured_get(agent_id, SCHEDULES_KEY) {
+        Ok(Some(serde_json::Value::Array(arr))) => {
+            if let Some(schedule) = arr.iter().find(|s| s["id"].as_str() == Some(&id)) {
+                (StatusCode::OK, Json(schedule.clone()))
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Schedule '{}' not found", id)})),
+                )
+            }
+        }
+        Ok(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Schedule '{}' not found", id)})),
+        ),
+        Err(e) => {
+            tracing::warn!("Failed to load schedules: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to load schedules: {e}")})),
+            )
         }
     }
 }
@@ -8326,11 +9403,13 @@ pub async fn run_schedule(
             break;
         }
     }
-    let _ = state.kernel.memory.structured_set(
+    if let Err(e) = state.kernel.memory.structured_set(
         shared_id,
         SCHEDULES_KEY,
         serde_json::Value::Array(schedules_updated),
-    );
+    ) {
+        tracing::warn!("Failed to save structured data: {e}");
+    }
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     match state
@@ -8429,7 +9508,9 @@ pub async fn update_agent_identity(
         Ok(()) => {
             // Persist identity to SQLite
             if let Some(entry) = state.kernel.registry.get(agent_id) {
-                let _ = state.kernel.memory.save_agent(&entry);
+                if let Err(e) = state.kernel.memory.save_agent(&entry) {
+                    tracing::warn!("Failed to persist agent state: {e}");
+                }
             }
             (
                 StatusCode::OK,
@@ -8774,7 +9855,9 @@ pub async fn clone_agent(
                     let src_file = src_can.join(fname);
                     let dst_file = dst_can.join(fname);
                     if src_file.exists() {
-                        let _ = std::fs::copy(&src_file, &dst_file);
+                        if let Err(e) = std::fs::copy(&src_file, &dst_file) {
+                            tracing::warn!("Failed to copy file: {e}");
+                        }
                     }
                 }
             }
@@ -8782,10 +9865,13 @@ pub async fn clone_agent(
     }
 
     // Copy identity from source
-    let _ = state
+    if let Err(e) = state
         .kernel
         .registry
-        .update_identity(new_id, source.identity.clone());
+        .update_identity(new_id, source.identity.clone())
+    {
+        tracing::warn!("Failed to copy agent identity: {e}");
+    }
 
     (
         StatusCode::CREATED,
@@ -9057,7 +10143,9 @@ pub async fn set_agent_file(
         );
     }
     if let Err(e) = std::fs::rename(&tmp_path, &file_path) {
-        let _ = std::fs::remove_file(&tmp_path);
+        if let Err(e) = std::fs::remove_file(&tmp_path) {
+            tracing::warn!("Failed to remove temporary file: {e}");
+        }
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Rename failed: {e}")})),
@@ -9857,10 +10945,42 @@ pub async fn delete_cron_job(
             let job_id = librefang_types::scheduler::CronJobId(uuid);
             match state.kernel.cron_scheduler.remove_job(job_id) {
                 Ok(_) => {
-                    let _ = state.kernel.cron_scheduler.persist();
+                    if let Err(e) = state.kernel.cron_scheduler.persist() {
+                        tracing::warn!("Failed to persist cron scheduler state: {e}");
+                    }
                     (
                         StatusCode::OK,
                         Json(serde_json::json!({"status": "deleted"})),
+                    )
+                }
+                Err(e) => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("{e}")})),
+                ),
+            }
+        }
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid job ID"})),
+        ),
+    }
+}
+
+/// PUT /api/cron/jobs/{id} — Update a cron job's configuration.
+pub async fn update_cron_job(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    match uuid::Uuid::parse_str(&id) {
+        Ok(uuid) => {
+            let job_id = librefang_types::scheduler::CronJobId(uuid);
+            match state.kernel.cron_scheduler.update_job(job_id, &body) {
+                Ok(job) => {
+                    let _ = state.kernel.cron_scheduler.persist();
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::to_value(&job).unwrap_or_default()),
                     )
                 }
                 Err(e) => (
@@ -9888,7 +11008,9 @@ pub async fn toggle_cron_job(
             let job_id = librefang_types::scheduler::CronJobId(uuid);
             match state.kernel.cron_scheduler.set_enabled(job_id, enabled) {
                 Ok(()) => {
-                    let _ = state.kernel.cron_scheduler.persist();
+                    if let Err(e) = state.kernel.cron_scheduler.persist() {
+                        tracing::warn!("Failed to persist cron scheduler state: {e}");
+                    }
                     (
                         StatusCode::OK,
                         Json(serde_json::json!({"id": id, "enabled": enabled})),
@@ -10975,4 +12097,108 @@ pub async fn catalog_status() -> impl IntoResponse {
     Json(serde_json::json!({
         "last_sync": last_sync,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    fn profile_router() -> Router {
+        Router::new()
+            .route("/api/profiles", get(list_profiles))
+            .route("/api/profiles/{name}", get(get_profile))
+    }
+
+    #[tokio::test]
+    async fn test_get_profile_found() {
+        let app = profile_router();
+
+        for name in &[
+            "minimal",
+            "coding",
+            "research",
+            "messaging",
+            "automation",
+            "full",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/profiles/{name}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "profile '{name}' should exist"
+            );
+
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["name"], *name);
+            assert!(
+                json["tools"].is_array(),
+                "tools should be an array for '{name}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_profile_not_found() {
+        let app = profile_router();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/profiles/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_list_profiles_returns_all() {
+        let app = profile_router();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/profiles")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 6);
+    }
 }
