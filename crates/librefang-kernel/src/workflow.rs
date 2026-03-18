@@ -91,6 +91,7 @@ pub struct WorkflowStep {
     /// The prompt template. Use `{{input}}` for previous output, `{{var_name}}` for variables.
     pub prompt_template: String,
     /// Execution mode for this step.
+    #[serde(default)]
     pub mode: StepMode,
     /// Maximum time for this step in seconds (default: 120).
     #[serde(default = "default_timeout")]
@@ -352,9 +353,9 @@ impl WorkflowEngine {
     /// Returns `true` if the workflow existed and was updated.
     pub async fn update_workflow(&self, id: WorkflowId, mut workflow: Workflow) -> bool {
         let mut workflows = self.workflows.write().await;
-        if workflows.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = workflows.entry(id) {
             workflow.id = id; // ensure ID stays the same
-            workflows.insert(id, workflow);
+            entry.insert(workflow);
             true
         } else {
             false
@@ -1688,7 +1689,7 @@ name = "agent-a"
     fn test_load_from_dir_sync_duplicate_workflow() {
         let dir = tempfile::tempdir().unwrap();
         let id = Uuid::new_v4();
-        let toml1 = format!(
+        let _toml1 = format!(
             r#"
 [id]
 # WorkflowId is a newtype over Uuid, serialised transparently

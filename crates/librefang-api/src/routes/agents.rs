@@ -600,7 +600,17 @@ pub async fn list_agents(
     let total = agents.len();
 
     // -- Sorting --
+    const VALID_SORT_FIELDS: &[&str] = &["name", "created_at", "last_active", "state"];
     let sort_field = params.sort.as_deref().unwrap_or("name");
+    if !VALID_SORT_FIELDS.contains(&sort_field) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Invalid sort field: '{}'. Valid fields: {:?}", sort_field, VALID_SORT_FIELDS)
+            })),
+        )
+            .into_response();
+    }
     let descending = params
         .order
         .as_deref()
@@ -623,8 +633,9 @@ pub async fn list_agents(
 
     // -- Pagination --
     let offset = params.offset.unwrap_or(0);
-    let agents: Vec<librefang_types::agent::AgentEntry> = if let Some(limit) = params.limit {
-        agents.into_iter().skip(offset).take(limit).collect()
+    let limit = params.limit.map(|l| l.min(100));
+    let agents: Vec<librefang_types::agent::AgentEntry> = if let Some(lim) = limit {
+        agents.into_iter().skip(offset).take(lim).collect()
     } else {
         agents.into_iter().skip(offset).collect()
     };
@@ -638,8 +649,9 @@ pub async fn list_agents(
         items,
         total,
         offset,
-        limit: params.limit,
+        limit,
     })
+    .into_response()
 }
 
 /// Resolve uploaded file attachments into ContentBlock::Image blocks.
