@@ -144,15 +144,30 @@ install() {
         echo "  LibreFang installed to $INSTALL_DIR/librefang"
     fi
 
+    # Add to PATH automatically
+    SHELL_RC=""
+    if [ -n "$ZSH_VERSION" ]; then
+        SHELL_RC="$HOME/.zshrc"
+    elif [ -n "$BASH_VERSION" ]; then
+        SHELL_RC="$HOME/.bashrc"
+    fi
+
+    if [ -n "$SHELL_RC" ]; then
+        PATH_LINE="export PATH=\"$INSTALL_DIR:\$PATH\""
+        if ! grep -q "$PATH_LINE" "$SHELL_RC" 2>/dev/null; then
+            echo "" >> "$SHELL_RC"
+            echo "# LibreFang" >> "$SHELL_RC"
+            echo "$PATH_LINE" >> "$SHELL_RC"
+            echo "  Added to PATH in $SHELL_RC"
+        fi
+    fi
+
+    # Start init
     echo ""
-    echo "  Get started:"
-    echo "    $INSTALL_DIR/librefang init"
+    echo "  Running setup wizard..."
     echo ""
-    echo "  Add to PATH:"
-    echo "    export PATH=\"$INSTALL_DIR:\$PATH\""
-    echo ""
-    echo "  The setup wizard will guide you through configuration."
-    echo ""
-}
+    # Temporarily add to PATH for init
+    export PATH="$INSTALL_DIR:$PATH"
+    exec "$INSTALL_DIR/librefang" init
 
 install
