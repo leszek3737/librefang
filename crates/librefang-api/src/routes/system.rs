@@ -9,8 +9,8 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
         // 配置文件与模板
         .route("/profiles", axum::routing::get(list_profiles))
         .route("/profiles/{name}", axum::routing::get(get_profile))
-        .route("/templates", axum::routing::get(list_templates))
-        .route("/templates/{name}", axum::routing::get(get_template))
+        .route("/templates", axum::routing::get(list_agent_templates))
+        .route("/templates/{name}", axum::routing::get(get_agent_template))
         // Agent KV 存储
         .route(
             "/memory/agents/{id}/kv",
