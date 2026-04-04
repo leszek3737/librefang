@@ -1181,7 +1181,13 @@
     "custom": "Custom",
     "delete_model": "Delete custom model",
     "model_added": "Model added successfully",
-    "model_deleted": "Model deleted"
+    "model_deleted": "Model deleted",
+    "hide_model": "Hide model",
+    "unhide_model": "Unhide model",
+    "show_hidden": "Hidden",
+    "hidden_count": "{{count}} hidden",
+    "model_hidden": "Model hidden",
+    "model_unhidden": "Model unhidden"
   },
   "auth": {
     "title": "API Key Required",

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { formatCompact, formatCost as formatCostUtil } from "../lib/format";
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { listModels, addCustomModel, removeCustomModel } from "../api";
 import { Badge } from "../components/ui/Badge";
@@ -10,8 +10,9 @@ import { PageHeader } from "../components/ui/PageHeader";
 import { ListSkeleton } from "../components/ui/Skeleton";
 import { useUIStore } from "../lib/store";
 import {
-  Cpu, Search, Check, X, Eye, Wrench, Zap, AlertCircle, Lock, Plus, Trash2, Loader2, Sparkles
+  Cpu, Search, Check, X, Eye, EyeOff, Wrench, Zap, AlertCircle, Lock, Plus, Trash2, Loader2, Sparkles
 } from "lucide-react";
+import { modelKey } from "../lib/hiddenModels";
 
 const REFRESH_MS = 60000;
 export function ModelsPage() {
@@ -24,6 +25,10 @@ export function ModelsPage() {
   const [availableOnly, setAvailableOnly] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [showHidden, setShowHidden] = useState(false);
+  const hiddenModelKeys = useUIStore((s) => s.hiddenModelKeys);
+  const hideModelAction = useUIStore((s) => s.hideModel);
+  const unhideModelAction = useUIStore((s) => s.unhideModel);
 
   // Form state
   const [formId, setFormId] = useState("");
@@ -96,6 +101,8 @@ export function ModelsPage() {
     setConfirmDeleteId(null);
     try {
       await deleteMut.mutateAsync(id);
+      const orphan = hiddenModelKeys.find(k => k.endsWith(`:${id}`));
+      if (orphan) unhideModelAction(orphan);
     } catch (err: any) { addToast(err.message || t("common.error"), "error"); }
   };
 
@@ -119,6 +126,16 @@ export function ModelsPage() {
     [allModels],
   );
 
+  const hiddenSet = useMemo(() => new Set(hiddenModelKeys), [hiddenModelKeys]);
+
+  useEffect(() => {
+    if (allModels.length === 0) return;
+    const validKeys = new Set(allModels.map(modelKey));
+    hiddenModelKeys.forEach((k) => {
+      if (!validKeys.has(k)) unhideModelAction(k);
+    });
+  }, [allModels, hiddenModelKeys, unhideModelAction]);
+
   const filtered = useMemo(
     () => allModels.filter(m => {
       const q = search.toLowerCase();
@@ -126,10 +143,12 @@ export function ModelsPage() {
       if (tierFilter !== "all" && m.tier !== tierFilter) return false;
       if (providerFilter !== "all" && m.provider !== providerFilter) return false;
       if (availableOnly && !m.available) return false;
-      return true;
+      return showHidden === hiddenSet.has(modelKey(m));
     }),
-    [allModels, search, tierFilter, providerFilter, availableOnly],
+    [allModels, search, tierFilter, providerFilter, availableOnly, showHidden, hiddenSet],
   );
+
+  const hiddenCount = useMemo(() => allModels.filter(m => hiddenSet.has(modelKey(m))).length, [allModels, hiddenSet]);
 
   const tierColor = (tier?: string) => {
     switch (tier) {
@@ -218,6 +237,17 @@ export function ModelsPage() {
           <Check className="w-3 h-3" />
           {t("models.available_only")}
         </button>
+
+        <button onClick={() => setShowHidden(!showHidden)}
+          className={`flex items-center gap-1.5 px-3 py-2.5 rounded-xl border text-xs font-bold transition-colors ${
+            showHidden ? "border-warning bg-warning/10 text-warning" : "border-border-subtle text-text-dim hover:border-brand/30"
+          }`}>
+          <EyeOff className="w-3 h-3" />
+          {t("models.show_hidden")}
+          {hiddenCount > 0 && (
+            <span className="ml-1 px-1.5 py-0.5 rounded-full bg-warning/20 text-warning text-[9px] font-bold">{hiddenCount}</span>
+          )}
+        </button>
       </div>
 
       <p className="text-xs text-text-dim">{filtered.length} {t("models.results")}</p>
@@ -232,7 +262,7 @@ export function ModelsPage() {
         </div>
       ) : (
         <div className="rounded-2xl border border-border-subtle overflow-hidden overflow-x-auto">
-          <div className="grid grid-cols-[minmax(160px,1fr)_100px_80px_80px_80px_50px_50px_50px_40px] min-w-[740px] gap-3 px-5 py-3 bg-main text-[11px] font-bold text-text-dim/60 uppercase">
+          <div className="grid grid-cols-[minmax(160px,1fr)_100px_80px_80px_80px_50px_50px_50px_80px] min-w-[780px] gap-3 px-5 py-3 bg-main text-[11px] font-bold text-text-dim/60 uppercase">
             <span>{t("models.col_model")}</span>
             <span>{t("models.col_provider")}</span>
             <span>{t("models.col_tier")}</span>
@@ -248,7 +278,7 @@ export function ModelsPage() {
             const isCustom = m.tier === "custom";
             return (
               <div key={`${m.provider}:${m.id}`}
-                className={`grid grid-cols-[minmax(160px,1fr)_100px_80px_80px_80px_50px_50px_50px_40px] min-w-[740px] gap-3 px-5 py-3 items-center border-t border-border-subtle/50 hover:bg-surface transition-colors ${
+                className={`grid grid-cols-[minmax(160px,1fr)_100px_80px_80px_80px_50px_50px_50px_80px] min-w-[780px] gap-3 px-5 py-3 items-center border-t border-border-subtle/50 hover:bg-surface transition-colors ${
                   !m.available ? "opacity-40" : ""
                 } ${i % 2 === 0 ? "" : "bg-main/30"}`}>
                 <div className="min-w-0">
@@ -278,8 +308,19 @@ export function ModelsPage() {
                 <span className="text-center">{m.supports_tools ? <Check className="w-4 h-4 text-success inline" /> : <X className="w-4 h-4 text-text-dim/15 inline" />}</span>
                 <span className="text-center">{m.supports_vision ? <Check className="w-4 h-4 text-success inline" /> : <X className="w-4 h-4 text-text-dim/15 inline" />}</span>
                 <span className="text-center">{m.supports_streaming ? <Check className="w-4 h-4 text-success inline" /> : <X className="w-4 h-4 text-text-dim/15 inline" />}</span>
-                <span className="text-center">
-                  {isCustom && (
+                <span className="flex items-center justify-center gap-1">
+                  {showHidden ? (
+                    <button onClick={() => { unhideModelAction(modelKey(m)); addToast(t("models.model_unhidden"), "success"); }}
+                      className="p-1 rounded text-text-dim/40 hover:text-success hover:bg-success/10 transition-colors" title={t("models.unhide_model")} aria-label={t("models.unhide_model")}>
+                      <Eye className="w-3.5 h-3.5" />
+                    </button>
+                  ) : (
+                    <button onClick={() => { hideModelAction(modelKey(m)); addToast(t("models.model_hidden"), "success"); }}
+                      className="p-1 rounded text-text-dim/40 hover:text-warning hover:bg-warning/10 transition-colors" title={t("models.hide_model")} aria-label={t("models.hide_model")}>
+                      <EyeOff className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                  {isCustom && !showHidden && (
                     confirmDeleteId === m.id ? (
                       <button onClick={() => handleDelete(m.id)} className="px-1.5 py-0.5 rounded bg-error text-white text-[9px] font-bold">{t("common.confirm")}</button>
                     ) : (

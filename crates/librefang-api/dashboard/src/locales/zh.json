@@ -1156,7 +1156,13 @@
     "custom": "自定义",
     "delete_model": "删除自定义模型",
     "model_added": "模型添加成功",
-    "model_deleted": "模型已删除"
+    "model_deleted": "模型已删除",
+    "hide_model": "隐藏模型",
+    "unhide_model": "取消隐藏",
+    "show_hidden": "已隐藏",
+    "hidden_count": "{{count}} 个已隐藏",
+    "model_hidden": "模型已隐藏",
+    "model_unhidden": "模型已取消隐藏"
   },
   "auth": {
     "title": "需要 API Key",

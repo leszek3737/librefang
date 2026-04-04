@@ -16,6 +16,8 @@ import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
 import { Badge } from "../components/ui/Badge";
 import { Avatar } from "../components/ui/Avatar";
+import { useUIStore } from "../lib/store";
+import { filterVisible } from "../lib/hiddenModels";
 import { Search, Users, MessageCircle, X, Cpu, Wrench, Shield, Plus, Loader2, Pause, Play, Clock, Brain, Zap, FlaskConical, GitBranch, Trash2, Check, BarChart3, Copy, RotateCcw } from "lucide-react";
 import { truncateId } from "../lib/string";
 import { getStatusVariant } from "../lib/status";
@@ -132,6 +134,14 @@ export function AgentsPage() {
   const configuredProviders = useMemo(
     () => (providersQuery.data ?? []).filter(p => isProviderAvailable(p.auth_status)),
     [providersQuery.data],
+  );
+
+  const hiddenModelKeys = useUIStore((s) => s.hiddenModelKeys);
+  const hiddenSet = useMemo(() => new Set(hiddenModelKeys), [hiddenModelKeys]);
+
+  const visibleModels = useMemo(
+    () => filterVisible(modelsQuery.data?.models ?? [], hiddenSet),
+    [modelsQuery.data?.models, hiddenSet],
   );
 
   const agents = agentsQuery.data ?? [];
@@ -328,11 +338,11 @@ export function AgentsPage() {
                           >
                             {!modelDraft.provider.trim() && <option value="">Select provider first</option>}
                             {modelDraft.provider.trim() && modelsQuery.isLoading && <option value="">Loading...</option>}
-                            {modelDraft.provider.trim() && !modelsQuery.isLoading && modelsQuery.data?.models?.length === 0 && <option value="">No models</option>}
-                            {modelDraft.model && !modelsQuery.data?.models?.some(m => m.id === modelDraft.model) && (
+                            {modelDraft.provider.trim() && !modelsQuery.isLoading && visibleModels.length === 0 && <option value="">No models</option>}
+                            {modelDraft.model && !visibleModels.some(m => m.id === modelDraft.model) && (
                               <option value={modelDraft.model}>{modelDraft.model}</option>
                             )}
-                            {modelsQuery.data?.models?.map(m => (
+                            {visibleModels.map(m => (
                               <option key={m.id} value={m.id}>{m.display_name || m.id}</option>
                             ))}
                           </select>
