@@ -2156,7 +2156,33 @@ impl LibreFangKernel {
         }
 
         // Initialize execution approval manager
-        let approval_manager = crate::approval::ApprovalManager::new(config.approval.clone());
+        let approval_manager = crate::approval::ApprovalManager::new_with_db(
+            config.approval.clone(),
+            memory.usage_conn(),
+        );
+
+        // Validate notification config — warn (not error) on unrecognized values
+        {
+            let known_events = [
+                "approval_requested",
+                "task_completed",
+                "task_failed",
+                "tool_failure",
+            ];
+            for (i, rule) in config.notification.agent_rules.iter().enumerate() {
+                for event in &rule.events {
+                    if !known_events.contains(&event.as_str()) {
+                        warn!(
+                            rule_index = i,
+                            agent_pattern = %rule.agent_pattern,
+                            event = %event,
+                            known = ?known_events,
+                            "Notification agent_rule references unknown event type"
+                        );
+                    }
+                }
+            }
+        }
 
         // Initialize binding/broadcast/auto-reply from config
         let initial_bindings = config.bindings.clone();
@@ -3227,6 +3253,21 @@ system_prompt = "You are a helpful assistant."
                     "ok",
                 );
 
+                // Push task_completed notification for autonomous (hand) agents
+                if let Some(entry) = self.registry.get(agent_id) {
+                    let is_autonomous = entry.tags.iter().any(|t| t.starts_with("hand:"))
+                        || entry.manifest.autonomous.is_some();
+                    if is_autonomous {
+                        let name = &entry.name;
+                        let msg = format!(
+                            "Agent \"{}\" completed task (in={}, out={} tokens)",
+                            name, result.total_usage.input_tokens, result.total_usage.output_tokens,
+                        );
+                        self.push_notification(&agent_id.to_string(), "task_completed", &msg)
+                            .await;
+                    }
+                }
+
                 Ok(result)
             }
             Err(e) => {
@@ -3241,6 +3282,21 @@ system_prompt = "You are a helpful assistant."
                 // Record the failure in supervisor for health reporting
                 self.supervisor.record_panic();
                 warn!(agent_id = %agent_id, error = %e, "Agent loop failed — recorded in supervisor");
+
+                // Push failure notification to alert_channels
+                let agent_name = self
+                    .registry
+                    .get(agent_id)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| agent_id.to_string());
+                let fail_msg = format!(
+                    "Agent \"{}\" loop failed: {}",
+                    agent_name,
+                    e.to_string().chars().take(200).collect::<String>()
+                );
+                self.push_notification(&agent_id.to_string(), "task_failed", &fail_msg)
+                    .await;
+
                 Err(e)
             }
         }
@@ -9363,6 +9419,113 @@ impl LibreFangKernel {
             );
         }
     }
+
+    /// Push a notification message to a single [`NotificationTarget`].
+    async fn push_to_target(
+        &self,
+        target: &librefang_types::approval::NotificationTarget,
+        message: &str,
+    ) {
+        if let Err(e) = self
+            .send_channel_message(
+                &target.channel_type,
+                &target.recipient,
+                message,
+                target.thread_id.as_deref(),
+            )
+            .await
+        {
+            warn!(
+                channel = %target.channel_type,
+                recipient = %target.recipient,
+                error = %e,
+                "Failed to push notification"
+            );
+        }
+    }
+
+    /// Push an interactive approval notification with Approve/Reject buttons.
+    async fn push_approval_interactive(
+        &self,
+        target: &librefang_types::approval::NotificationTarget,
+        message: &str,
+        request_id: &str,
+    ) {
+        let short_id = &request_id[..std::cmp::min(8, request_id.len())];
+        let interactive = librefang_channels::types::InteractiveMessage {
+            text: message.to_string(),
+            buttons: vec![vec![
+                librefang_channels::types::InteractiveButton {
+                    label: "Approve".to_string(),
+                    action: format!("/approve {short_id}"),
+                    style: Some("primary".to_string()),
+                    url: None,
+                },
+                librefang_channels::types::InteractiveButton {
+                    label: "Reject".to_string(),
+                    action: format!("/reject {short_id}"),
+                    style: Some("danger".to_string()),
+                    url: None,
+                },
+            ]],
+        };
+
+        if let Some(adapter) = self.channel_adapters.get(&target.channel_type) {
+            let user = librefang_channels::types::ChannelUser {
+                platform_id: target.recipient.clone(),
+                display_name: target.recipient.clone(),
+                librefang_user: None,
+            };
+            if let Err(e) = adapter.send_interactive(&user, &interactive).await {
+                warn!(
+                    channel = %target.channel_type,
+                    error = %e,
+                    "Failed to send interactive approval notification, falling back to text"
+                );
+                // Fallback to plain text
+                self.push_to_target(target, message).await;
+            }
+        } else {
+            // No adapter found — fall back to send_channel_message
+            self.push_to_target(target, message).await;
+        }
+    }
+
+    /// Push a notification to all configured targets, resolving routing rules.
+    /// Resolution: per-agent rules (matching event) > global channels for that event type.
+    async fn push_notification(&self, agent_id: &str, event_type: &str, message: &str) {
+        use librefang_types::capability::glob_matches;
+        let cfg = self.config.load_full();
+
+        // Check per-agent notification rules first
+        let agent_targets: Vec<librefang_types::approval::NotificationTarget> = cfg
+            .notification
+            .agent_rules
+            .iter()
+            .filter(|rule| {
+                glob_matches(&rule.agent_pattern, agent_id)
+                    && rule.events.iter().any(|e| e == event_type)
+            })
+            .flat_map(|rule| rule.channels.clone())
+            .collect();
+
+        let targets = if !agent_targets.is_empty() {
+            agent_targets
+        } else {
+            // Fallback to global channels based on event type
+            match event_type {
+                "approval_requested" => cfg.notification.approval_channels.clone(),
+                "task_completed" | "task_failed" | "tool_failure" => {
+                    cfg.notification.alert_channels.clone()
+                }
+                _ => Vec::new(),
+            }
+        };
+
+        for target in &targets {
+            self.push_to_target(target, message).await;
+        }
+    }
 }
 
 #[async_trait]
@@ -9831,7 +9994,7 @@ impl KernelHandle for LibreFangKernel {
         agent_id: &str,
         tool_name: &str,
         action_summary: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<librefang_types::approval::ApprovalDecision, String> {
         use librefang_types::approval::{ApprovalDecision, ApprovalRequest as TypedRequest};
 
         // Hand agents are curated trusted packages — auto-approve tool execution.
@@ -9840,7 +10003,7 @@ impl KernelHandle for LibreFangKernel {
             if let Some(entry) = self.registry.get(aid) {
                 if entry.tags.iter().any(|t| t.starts_with("hand:")) {
                     info!(agent_id, tool_name, "Auto-approved for hand agent");
-                    return Ok(true);
+                    return Ok(ApprovalDecision::Approved);
                 }
             }
         }
@@ -9848,8 +10011,9 @@ impl KernelHandle for LibreFangKernel {
         let policy = self.approval_manager.policy();
         let risk_level = crate::approval::ApprovalManager::classify_risk(tool_name);
         let description = format!("Agent {} requests to execute {}", agent_id, tool_name);
+        let request_id = uuid::Uuid::new_v4();
         let req = TypedRequest {
-            id: uuid::Uuid::new_v4(),
+            id: request_id,
             agent_id: agent_id.to_string(),
             tool_name: tool_name.to_string(),
             description: description.clone(),
@@ -9859,6 +10023,8 @@ impl KernelHandle for LibreFangKernel {
             timeout_secs: policy.timeout_secs,
             sender_id: None,
             channel: None,
+            route_to: Vec::new(),
+            escalation_count: 0,
         };
 
         // Publish an ApprovalRequested event so channel adapters can notify users
@@ -9870,7 +10036,7 @@ impl KernelHandle for LibreFangKernel {
                 agent_id.parse().unwrap_or_default(),
                 EventTarget::System,
                 EventPayload::ApprovalRequested(ApprovalRequestedEvent {
-                    request_id: req.id.to_string(),
+                    request_id: request_id.to_string(),
                     agent_id: agent_id.to_string(),
                     tool_name: tool_name.to_string(),
                     description: description.clone(),
@@ -9880,8 +10046,128 @@ impl KernelHandle for LibreFangKernel {
             self.event_bus.publish(event).await;
         }
 
-        let decision = self.approval_manager.request_approval(req).await;
-        Ok(decision == ApprovalDecision::Approved)
+        // Push approval notification to configured channels.
+        // Resolution order: per-request route_to > policy routing rules > per-agent rules > global defaults.
+        {
+            use librefang_types::capability::glob_matches;
+
+            let cfg = self.config.load_full();
+            let policy = self.approval_manager.policy();
+            let targets: Vec<librefang_types::approval::NotificationTarget> =
+                if !req.route_to.is_empty() {
+                    // Highest priority: explicitly routed targets on the request itself
+                    req.route_to.clone()
+                } else {
+                    // Check policy routing rules (match tool_pattern)
+                    let routed: Vec<librefang_types::approval::NotificationTarget> = policy
+                        .routing
+                        .iter()
+                        .filter(|r| glob_matches(&r.tool_pattern, tool_name))
+                        .flat_map(|r| r.route_to.clone())
+                        .collect();
+                    if !routed.is_empty() {
+                        routed
+                    } else {
+                        // Check per-agent notification rules
+                        let agent_routed: Vec<librefang_types::approval::NotificationTarget> = cfg
+                            .notification
+                            .agent_rules
+                            .iter()
+                            .filter(|rule| {
+                                glob_matches(&rule.agent_pattern, agent_id)
+                                    && rule.events.iter().any(|e| e == "approval_requested")
+                            })
+                            .flat_map(|rule| rule.channels.clone())
+                            .collect();
+                        if !agent_routed.is_empty() {
+                            agent_routed
+                        } else {
+                            // Fallback: global approval_channels
+                            cfg.notification.approval_channels.clone()
+                        }
+                    }
+                };
+
+            let msg = format!(
+                "{} Approval needed: agent \"{}\" wants to run `{}` — {}",
+                risk_level.emoji(),
+                agent_id,
+                tool_name,
+                description,
+            );
+            let req_id_str = request_id.to_string();
+            for target in &targets {
+                self.push_approval_interactive(target, &msg, &req_id_str)
+                    .await;
+            }
+        }
+
+        let mut decision = self.approval_manager.request_approval(req).await;
+
+        // Handle Escalate: atomically take escalated request, re-notify, re-wait.
+        // No TOCTOU: single `take_escalated()` call is the only decision point.
+        while decision == ApprovalDecision::TimedOut {
+            match self.approval_manager.take_escalated(request_id) {
+                Some((count, escalated_req)) => {
+                    let esc_msg = format!(
+                        "{} ESCALATION #{}: Approval still needed for \"{}\" — `{}` — {}",
+                        risk_level.emoji(),
+                        count,
+                        agent_id,
+                        tool_name,
+                        description,
+                    );
+                    // Use interactive buttons for escalation too (same as initial notification)
+                    {
+                        use librefang_types::capability::glob_matches;
+                        let cfg = self.config.load_full();
+                        let esc_targets: Vec<_> = {
+                            let agent_routed: Vec<_> = cfg
+                                .notification
+                                .agent_rules
+                                .iter()
+                                .filter(|rule| {
+                                    glob_matches(&rule.agent_pattern, agent_id)
+                                        && rule.events.iter().any(|e| e == "approval_requested")
+                                })
+                                .flat_map(|rule| rule.channels.clone())
+                                .collect();
+                            if !agent_routed.is_empty() {
+                                agent_routed
+                            } else {
+                                cfg.notification.approval_channels.clone()
+                            }
+                        };
+                        let req_id_str = request_id.to_string();
+                        for target in &esc_targets {
+                            self.push_approval_interactive(target, &esc_msg, &req_id_str)
+                                .await;
+                        }
+                    }
+                    decision = self.approval_manager.request_approval(escalated_req).await;
+                }
+                None => break, // Normal timeout, not an escalation
+            }
+        }
+
+        // Publish resolved event so channel adapters can notify outcome
+        {
+            use librefang_types::event::{ApprovalResolvedEvent, Event, EventPayload, EventTarget};
+            let event = Event::new(
+                agent_id.parse().unwrap_or_default(),
+                EventTarget::System,
+                EventPayload::ApprovalResolved(ApprovalResolvedEvent {
+                    request_id: request_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                    tool_name: tool_name.to_string(),
+                    decision: decision.as_str().to_string(),
+                    decided_by: None,
+                }),
+            );
+            self.event_bus.publish(event).await;
+        }
+
+        Ok(decision)
     }
 
     fn list_a2a_agents(&self) -> Vec<(String, String)> {
