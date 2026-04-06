@@ -1536,9 +1536,7 @@ fn prepare_llm_messages(
         &manifest.name,
         user_message,
     );
-    let user_message_index = session.messages.len().saturating_sub(1);
-    let trimmed_prefix = messages.len().saturating_sub(session.messages.len());
-    let new_messages_start = user_message_index.saturating_sub(trimmed_prefix);
+    let new_messages_start = session.messages.len().saturating_sub(1);
     strip_prior_image_data(&mut messages);
     strip_prior_image_data(&mut session.messages);
 
@@ -4496,6 +4494,79 @@ mod tests {
         } = prepare_llm_messages(&manifest, &mut session, "current turn", None);
 
         assert!(prior_len > new_messages_start);
+        let tail = &session.messages[new_messages_start..];
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].role, Role::User);
+        assert_eq!(tail[0].content.text_content(), "current turn");
+        assert_eq!(new_messages_start, session.messages.len().saturating_sub(1));
+    }
+
+    #[test]
+    fn test_prepare_llm_messages_new_messages_start_ignores_trimmed_context_injections() {
+        let mut manifest = test_manifest();
+        manifest.metadata.insert(
+            "canonical_context_msg".to_string(),
+            serde_json::json!("canonical context"),
+        );
+
+        let agent_id = librefang_types::agent::AgentId::new();
+        let mut session = librefang_memory::session::Session {
+            id: librefang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+
+        for i in 0..13 {
+            session.messages.push(Message::user(format!("q{i}")));
+            session.messages.push(Message::assistant(format!("a{i}")));
+        }
+        for i in 0..7 {
+            let tool_use_id = format!("tu-{i}");
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: tool_use_id.clone(),
+                    name: "noop".to_string(),
+                    input: serde_json::json!({}),
+                    provider_metadata: None,
+                }]),
+                pinned: false,
+            });
+            session.messages.push(Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name: "noop".to_string(),
+                    content: format!("r{i}"),
+                    is_error: false,
+                    status: librefang_types::tool::ToolExecutionStatus::default(),
+                    approval_request_id: None,
+                }]),
+                pinned: false,
+            });
+        }
+
+        session.messages.push(Message::user("current turn"));
+
+        let PreparedMessages {
+            messages,
+            new_messages_start,
+        } = prepare_llm_messages(
+            &manifest,
+            &mut session,
+            "current turn",
+            Some("memory context".to_string()),
+        );
+
+        assert!(messages.len() <= MAX_HISTORY_MESSAGES);
+        assert!(messages.iter().all(|msg| {
+            let text = msg.content.text_content();
+            text != "canonical context"
+                && text != "[System context — what you know about this person]\nmemory context"
+        }));
+
         let tail = &session.messages[new_messages_start..];
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].role, Role::User);
