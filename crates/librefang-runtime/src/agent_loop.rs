@@ -298,35 +298,6 @@ fn append_tool_result_guidance_blocks(tool_result_blocks: &mut Vec<ContentBlock>
     }
 }
 
-fn count_tool_result_outcomes(tool_result_blocks: &[ContentBlock]) -> (u32, u32) {
-    let hard_error_count = tool_result_blocks
-        .iter()
-        .filter(|b| match b {
-            ContentBlock::ToolResult {
-                status,
-                content,
-                is_error: true,
-                ..
-            } => !status.is_soft_error() && !is_soft_error_content(content),
-            _ => false,
-        })
-        .count() as u32;
-    let success_count = tool_result_blocks
-        .iter()
-        .filter(|b| {
-            matches!(
-                b,
-                ContentBlock::ToolResult {
-                    is_error: false,
-                    ..
-                }
-            )
-        })
-        .count() as u32;
-
-    (hard_error_count, success_count)
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ToolResultOutcomeSummary {
     hard_error_count: u32,
@@ -335,11 +306,27 @@ struct ToolResultOutcomeSummary {
 
 impl ToolResultOutcomeSummary {
     fn from_blocks(tool_result_blocks: &[ContentBlock]) -> Self {
-        let (hard_error_count, success_count) = count_tool_result_outcomes(tool_result_blocks);
-        Self {
-            hard_error_count,
-            success_count,
+        let mut summary = Self::default();
+        for block in tool_result_blocks {
+            match block {
+                ContentBlock::ToolResult {
+                    status,
+                    content,
+                    is_error: true,
+                    ..
+                } if !status.is_soft_error() && !is_soft_error_content(content) => {
+                    summary.hard_error_count += 1;
+                }
+                ContentBlock::ToolResult {
+                    is_error: false, ..
+                } => {
+                    summary.success_count += 1;
+                }
+                _ => {}
+            }
         }
+
+        summary
     }
 
     fn accumulate(&mut self, other: Self) {
@@ -410,66 +397,69 @@ struct ExecutedToolCall {
     final_content: String,
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn execute_single_tool_call(
-    manifest: &AgentManifest,
-    tool_call: &ToolCall,
-    loop_guard: &mut LoopGuard,
-    memory: &MemorySubstrate,
-    session: &mut Session,
-    kernel: Option<&Arc<dyn KernelHandle>>,
-    available_tool_names: &[String],
-    caller_id_str: &str,
-    skill_registry: Option<&SkillRegistry>,
-    mcp_connections: Option<&tokio::sync::Mutex<Vec<McpConnection>>>,
-    web_ctx: Option<&WebToolsContext>,
-    browser_ctx: Option<&crate::browser::BrowserManager>,
-    hand_allowed_env: &[String],
-    workspace_root: Option<&Path>,
-    media_engine: Option<&crate::media_understanding::MediaEngine>,
-    media_drivers: Option<&crate::media::MediaDriverCache>,
-    tts_engine: Option<&crate::tts::TtsEngine>,
-    docker_config: Option<&librefang_types::config::DockerSandboxConfig>,
-    hooks: Option<&crate::hooks::HookRegistry>,
-    process_manager: Option<&crate::process_manager::ProcessManager>,
-    sender_user_id: Option<&str>,
-    sender_channel: Option<&str>,
-    context_budget: &ContextBudget,
-    context_engine: Option<&dyn ContextEngine>,
+struct ToolExecutionContext<'a> {
+    manifest: &'a AgentManifest,
+    loop_guard: &'a mut LoopGuard,
+    memory: &'a MemorySubstrate,
+    session: &'a mut Session,
+    kernel: Option<&'a Arc<dyn KernelHandle>>,
+    available_tool_names: &'a [String],
+    caller_id_str: &'a str,
+    skill_registry: Option<&'a SkillRegistry>,
+    mcp_connections: Option<&'a tokio::sync::Mutex<Vec<McpConnection>>>,
+    web_ctx: Option<&'a WebToolsContext>,
+    browser_ctx: Option<&'a crate::browser::BrowserManager>,
+    hand_allowed_env: &'a [String],
+    workspace_root: Option<&'a Path>,
+    media_engine: Option<&'a crate::media_understanding::MediaEngine>,
+    media_drivers: Option<&'a crate::media::MediaDriverCache>,
+    tts_engine: Option<&'a crate::tts::TtsEngine>,
+    docker_config: Option<&'a librefang_types::config::DockerSandboxConfig>,
+    hooks: Option<&'a crate::hooks::HookRegistry>,
+    process_manager: Option<&'a crate::process_manager::ProcessManager>,
+    sender_user_id: Option<&'a str>,
+    sender_channel: Option<&'a str>,
+    context_budget: &'a ContextBudget,
+    context_engine: Option<&'a dyn ContextEngine>,
     context_window_tokens: usize,
-    on_phase: Option<&PhaseCallback>,
-    decision_traces: &mut Vec<DecisionTrace>,
-    rationale_text: &Option<String>,
+    on_phase: Option<&'a PhaseCallback>,
+    decision_traces: &'a mut Vec<DecisionTrace>,
+    rationale_text: &'a Option<String>,
     tools_recovered_from_text: bool,
     iteration: u32,
     streaming: bool,
-    agent_id_str: &str,
+    agent_id_str: &'a str,
+}
+
+async fn execute_single_tool_call(
+    ctx: &mut ToolExecutionContext<'_>,
+    tool_call: &ToolCall,
 ) -> Result<ExecutedToolCall, LibreFangError> {
-    let verdict = loop_guard.check(&tool_call.name, &tool_call.input);
+    let verdict = ctx.loop_guard.check(&tool_call.name, &tool_call.input);
     match &verdict {
         LoopGuardVerdict::CircuitBreak(msg) => {
-            if streaming {
+            if ctx.streaming {
                 warn!(tool = %tool_call.name, "Circuit breaker triggered (streaming)");
             } else {
                 warn!(tool = %tool_call.name, "Circuit breaker triggered");
             }
-            if let Err(e) = memory.save_session_async(session).await {
+            if let Err(e) = ctx.memory.save_session_async(ctx.session).await {
                 warn!("Failed to save session on circuit break: {e}");
             }
-            let ctx = crate::hooks::HookContext {
-                agent_name: &manifest.name,
-                agent_id: agent_id_str,
+            let hook_ctx = crate::hooks::HookContext {
+                agent_name: &ctx.manifest.name,
+                agent_id: ctx.agent_id_str,
                 event: librefang_types::agent::HookEvent::AgentLoopEnd,
                 data: serde_json::json!({
                     "reason": "circuit_break",
                     "error": msg.as_str(),
                 }),
             };
-            fire_hook_best_effort(hooks, &ctx);
+            fire_hook_best_effort(ctx.hooks, &hook_ctx);
             return Err(LibreFangError::Internal(msg.clone()));
         }
         LoopGuardVerdict::Block(msg) => {
-            if streaming {
+            if ctx.streaming {
                 warn!(tool = %tool_call.name, "Tool call blocked by loop guard (streaming)");
             } else {
                 warn!(tool = %tool_call.name, "Tool call blocked by loop guard");
@@ -488,13 +478,13 @@ async fn execute_single_tool_call(
         _ => {}
     }
 
-    if streaming {
+    if ctx.streaming {
         debug!(tool = %tool_call.name, id = %tool_call.id, "Executing tool (streaming)");
     } else {
         debug!(tool = %tool_call.name, id = %tool_call.id, "Executing tool");
     }
 
-    if let Some(cb) = on_phase {
+    if let Some(cb) = ctx.on_phase {
         let sanitized: String = tool_call
             .name
             .chars()
@@ -506,17 +496,17 @@ async fn execute_single_tool_call(
         });
     }
 
-    if let Some(hook_reg) = hooks {
-        let ctx = crate::hooks::HookContext {
-            agent_name: &manifest.name,
-            agent_id: caller_id_str,
+    if let Some(hook_reg) = ctx.hooks {
+        let hook_ctx = crate::hooks::HookContext {
+            agent_name: &ctx.manifest.name,
+            agent_id: ctx.caller_id_str,
             event: librefang_types::agent::HookEvent::BeforeToolCall,
             data: serde_json::json!({
                 "tool_name": &tool_call.name,
                 "input": &tool_call.input,
             }),
         };
-        if let Err(reason) = hook_reg.fire(&ctx) {
+        if let Err(reason) = hook_reg.fire(&hook_ctx) {
             let content = format!("Hook blocked tool '{}': {}", tool_call.name, reason);
             return Ok(ExecutedToolCall {
                 result: librefang_types::tool::ToolResult {
@@ -531,8 +521,9 @@ async fn execute_single_tool_call(
         }
     }
 
-    let effective_exec_policy = manifest.exec_policy.as_ref();
-    let tool_timeout = kernel
+    let effective_exec_policy = ctx.manifest.exec_policy.as_ref();
+    let tool_timeout = ctx
+        .kernel
         .as_ref()
         .map_or(TOOL_TIMEOUT_SECS, |k| k.tool_timeout_secs());
     let trace_start = Instant::now();
@@ -543,34 +534,34 @@ async fn execute_single_tool_call(
             &tool_call.id,
             &tool_call.name,
             &tool_call.input,
-            kernel,
-            Some(available_tool_names),
-            Some(caller_id_str),
-            skill_registry,
-            mcp_connections,
-            web_ctx,
-            browser_ctx,
-            if hand_allowed_env.is_empty() {
+            ctx.kernel,
+            Some(ctx.available_tool_names),
+            Some(ctx.caller_id_str),
+            ctx.skill_registry,
+            ctx.mcp_connections,
+            ctx.web_ctx,
+            ctx.browser_ctx,
+            if ctx.hand_allowed_env.is_empty() {
                 None
             } else {
-                Some(hand_allowed_env)
+                Some(ctx.hand_allowed_env)
             },
-            workspace_root,
-            media_engine,
-            media_drivers,
+            ctx.workspace_root,
+            ctx.media_engine,
+            ctx.media_drivers,
             effective_exec_policy,
-            tts_engine,
-            docker_config,
-            process_manager,
-            sender_user_id,
-            sender_channel,
+            ctx.tts_engine,
+            ctx.docker_config,
+            ctx.process_manager,
+            ctx.sender_user_id,
+            ctx.sender_channel,
         ),
     )
     .await
     {
         Ok(result) => result,
         Err(_) => {
-            if streaming {
+            if ctx.streaming {
                 warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", tool_timeout);
             } else {
                 warn!(tool = %tool_call.name, "Tool execution timed out after {}s", tool_timeout);
@@ -590,22 +581,22 @@ async fn execute_single_tool_call(
     let execution_ms = trace_start.elapsed().as_millis() as u64;
 
     let output_summary = librefang_types::truncate_str(&result.content, 200).to_string();
-    decision_traces.push(DecisionTrace {
+    ctx.decision_traces.push(DecisionTrace {
         tool_use_id: tool_call.id.clone(),
         tool_name: tool_call.name.clone(),
         input: tool_call.input.clone(),
-        rationale: rationale_text.clone(),
-        recovered_from_text: tools_recovered_from_text,
+        rationale: ctx.rationale_text.clone(),
+        recovered_from_text: ctx.tools_recovered_from_text,
         execution_ms,
         is_error: result.is_error,
         output_summary,
-        iteration,
+        iteration: ctx.iteration,
         timestamp: trace_timestamp,
     });
 
-    let ctx = crate::hooks::HookContext {
-        agent_name: &manifest.name,
-        agent_id: caller_id_str,
+    let hook_ctx = crate::hooks::HookContext {
+        agent_name: &ctx.manifest.name,
+        agent_id: ctx.caller_id_str,
         event: librefang_types::agent::HookEvent::AfterToolCall,
         data: serde_json::json!({
             "tool_name": &tool_call.name,
@@ -613,13 +604,13 @@ async fn execute_single_tool_call(
             "is_error": result.is_error,
         }),
     };
-    fire_hook_best_effort(hooks, &ctx);
+    fire_hook_best_effort(ctx.hooks, &hook_ctx);
 
     let content = sanitize_tool_result_content(
         &result.content,
-        context_budget,
-        context_engine,
-        context_window_tokens,
+        ctx.context_budget,
+        ctx.context_engine,
+        ctx.context_window_tokens,
     );
     let final_content = if let LoopGuardVerdict::Warn(ref warn_msg) = verdict {
         format!("{content}\n\n[LOOP GUARD] {warn_msg}")
@@ -1105,7 +1096,7 @@ async fn remember_interaction_best_effort(
     embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
     agent_id: librefang_types::agent::AgentId,
     interaction_text: &str,
-    remember_context: &str,
+    streaming: bool,
 ) {
     if let Some(emb) = embedding_driver {
         match emb.embed_one(interaction_text).await {
@@ -1123,7 +1114,7 @@ async fn remember_interaction_best_effort(
                 {
                     warn!(
                         error = %e,
-                        remember_context,
+                        remember_context = if streaming { "streaming" } else { "non_streaming" },
                         "Failed to persist episodic memory with embedding"
                     );
                 }
@@ -1131,7 +1122,7 @@ async fn remember_interaction_best_effort(
             Err(e) => {
                 warn!(
                     error = %e,
-                    remember_context,
+                    remember_context = if streaming { "streaming" } else { "non_streaming" },
                     "Embedding for remember failed; falling back to plain memory"
                 );
                 if let Err(e2) = memory
@@ -1146,7 +1137,7 @@ async fn remember_interaction_best_effort(
                 {
                     warn!(
                         error = %e2,
-                        remember_context,
+                        remember_context = if streaming { "streaming" } else { "non_streaming" },
                         "Failed to persist episodic memory after embedding fallback"
                     );
                 }
@@ -1164,7 +1155,7 @@ async fn remember_interaction_best_effort(
     {
         warn!(
             error = %e,
-            remember_context,
+            remember_context = if streaming { "streaming" } else { "non_streaming" },
             "Failed to persist episodic memory"
         );
     }
@@ -1244,6 +1235,35 @@ struct PromptSetupContext<'a> {
 
 struct PreparedMessages {
     messages: Vec<Message>,
+    new_messages_start: usize,
+}
+
+struct FinalizeEndTurnContext<'a> {
+    manifest: &'a AgentManifest,
+    session: &'a mut Session,
+    memory: &'a MemorySubstrate,
+    embedding_driver: Option<&'a (dyn EmbeddingDriver + Send + Sync)>,
+    context_engine: Option<&'a dyn ContextEngine>,
+    on_phase: Option<&'a PhaseCallback>,
+    proactive_memory: Option<&'a Arc<librefang_memory::ProactiveMemoryStore>>,
+    hooks: Option<&'a crate::hooks::HookRegistry>,
+    agent_id_str: &'a str,
+    user_message: &'a str,
+    messages: &'a [Message],
+    sender_user_id: Option<&'a str>,
+    streaming: bool,
+}
+
+struct FinalizeEndTurnResultData {
+    final_response: String,
+    iteration: u32,
+    total_usage: TokenUsage,
+    decision_traces: Vec<DecisionTrace>,
+    memories_saved: Vec<String>,
+    memories_used: Vec<String>,
+    memory_conflicts: Vec<librefang_types::memory::MemoryConflict>,
+    experiment_context: Option<ExperimentContext>,
+    directives: librefang_types::message::ReplyDirectives,
     new_messages_start: usize,
 }
 
@@ -1667,7 +1687,8 @@ fn finalize_end_turn_text(
             input_tokens = total_usage.input_tokens,
             output_tokens = total_usage.output_tokens,
             messages_count,
-            "{empty_response_log_message}"
+            "{}",
+            empty_response_log_message
         );
         if any_tools_executed {
             "[Task completed — the agent executed tools but did not produce a text summary.]"
@@ -1680,131 +1701,123 @@ fn finalize_end_turn_text(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn finalize_successful_end_turn(
-    manifest: &AgentManifest,
-    session: &mut Session,
-    memory: &MemorySubstrate,
-    embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
-    context_engine: Option<&dyn ContextEngine>,
-    on_phase: Option<&PhaseCallback>,
-    proactive_memory: Option<&Arc<librefang_memory::ProactiveMemoryStore>>,
-    hooks: Option<&crate::hooks::HookRegistry>,
-    agent_id_str: &str,
-    user_message: &str,
-    final_response: String,
-    messages: &[Message],
-    iteration: u32,
-    total_usage: TokenUsage,
-    decision_traces: Vec<DecisionTrace>,
-    mut memories_saved: Vec<String>,
-    memories_used: Vec<String>,
-    mut memory_conflicts: Vec<librefang_types::memory::MemoryConflict>,
-    experiment_context: Option<ExperimentContext>,
-    directives: librefang_types::message::ReplyDirectives,
-    new_messages_start: usize,
-    sender_user_id: Option<&str>,
-    completion_log_message: &str,
-    remember_context: &str,
-    proactive_memory_debug_message: &str,
-    proactive_memory_warn_message: &str,
+    ctx: FinalizeEndTurnContext<'_>,
+    mut end_turn: FinalizeEndTurnResultData,
 ) -> LibreFangResult<AgentLoopResult> {
-    session
+    ctx.session
         .messages
-        .push(Message::assistant(final_response.clone()));
+        .push(Message::assistant(end_turn.final_response.clone()));
 
-    let keep_recent = manifest
+    let keep_recent = ctx
+        .manifest
         .autonomous
         .as_ref()
         .and_then(|a| a.heartbeat_keep_recent)
         .unwrap_or(10);
-    crate::session_repair::prune_heartbeat_turns(&mut session.messages, keep_recent);
+    crate::session_repair::prune_heartbeat_turns(&mut ctx.session.messages, keep_recent);
 
-    memory
-        .save_session_async(session)
+    ctx.memory
+        .save_session_async(ctx.session)
         .await
         .map_err(|e| LibreFangError::Memory(e.to_string()))?;
 
     let interaction_text = format!(
         "User asked: {}\nI responded: {}",
-        user_message, final_response
+        ctx.user_message, end_turn.final_response
     );
     remember_interaction_best_effort(
-        memory,
-        embedding_driver,
-        session.agent_id,
+        ctx.memory,
+        ctx.embedding_driver,
+        ctx.session.agent_id,
         &interaction_text,
-        remember_context,
+        ctx.streaming,
     )
     .await;
 
-    if let Some(engine) = context_engine {
-        if let Err(e) = engine.after_turn(session.agent_id, messages).await {
+    if let Some(engine) = ctx.context_engine {
+        if let Err(e) = engine.after_turn(ctx.session.agent_id, ctx.messages).await {
             warn!("Context engine after_turn failed: {e}");
         }
     }
 
-    if let Some(cb) = on_phase {
+    if let Some(cb) = ctx.on_phase {
         cb(LoopPhase::Done);
     }
 
     info!(
-        agent = %manifest.name,
-        iterations = iteration + 1,
-        tokens = total_usage.total(),
-        "{completion_log_message}"
+        agent = %ctx.manifest.name,
+        iterations = end_turn.iteration + 1,
+        tokens = end_turn.total_usage.total(),
+        "{}",
+        if ctx.streaming {
+            "Streaming agent loop completed"
+        } else {
+            "Agent loop completed"
+        }
     );
 
-    if let Some(pm_store) = proactive_memory {
-        let user_id = session.agent_id.0.to_string();
-        let new_messages = &session.messages[new_messages_start..];
+    if let Some(pm_store) = ctx.proactive_memory {
+        let user_id = ctx.session.agent_id.0.to_string();
+        let new_messages = &ctx.session.messages[end_turn.new_messages_start..];
         let messages_json = serialize_session_messages(new_messages);
         match pm_store
-            .auto_memorize(&user_id, &messages_json, sender_user_id)
+            .auto_memorize(&user_id, &messages_json, ctx.sender_user_id)
             .await
         {
             Ok(result) if result.has_content => {
                 debug!(
                     memories = result.memories.len(),
                     relations = result.relations.len(),
-                    "{proactive_memory_debug_message}"
+                    "{}",
+                    if ctx.streaming {
+                        "Proactive memory (streaming): stored {} memories, {} relations"
+                    } else {
+                        "Proactive memory: stored {} memories, {} relations"
+                    }
                 );
-                memories_saved.extend(result.memories.iter().map(|m| m.content.clone()));
-                memory_conflicts.extend(result.conflicts);
+                end_turn
+                    .memories_saved
+                    .extend(result.memories.iter().map(|m| m.content.clone()));
+                end_turn.memory_conflicts.extend(result.conflicts);
             }
             Ok(_) => {}
             Err(e) => {
-                warn!("{proactive_memory_warn_message}: {e}");
+                if ctx.streaming {
+                    warn!("Proactive memory auto_memorize failed (streaming): {e}");
+                } else {
+                    warn!("Proactive memory auto_memorize failed: {e}");
+                }
             }
         }
     }
 
-    let ctx = crate::hooks::HookContext {
-        agent_name: &manifest.name,
-        agent_id: agent_id_str,
+    let hook_ctx = crate::hooks::HookContext {
+        agent_name: &ctx.manifest.name,
+        agent_id: ctx.agent_id_str,
         event: librefang_types::agent::HookEvent::AgentLoopEnd,
         data: serde_json::json!({
-            "iterations": iteration + 1,
-            "response_length": final_response.len(),
+            "iterations": end_turn.iteration + 1,
+            "response_length": end_turn.final_response.len(),
         }),
     };
-    fire_hook_best_effort(hooks, &ctx);
+    fire_hook_best_effort(ctx.hooks, &hook_ctx);
 
     Ok(AgentLoopResult {
-        response: final_response,
-        total_usage,
-        iterations: iteration + 1,
+        response: end_turn.final_response,
+        total_usage: end_turn.total_usage,
+        iterations: end_turn.iteration + 1,
         cost_usd: None,
         silent: false,
-        directives,
-        decision_traces,
-        memories_saved,
-        memories_used,
-        memory_conflicts,
+        directives: end_turn.directives,
+        decision_traces: end_turn.decision_traces,
+        memories_saved: end_turn.memories_saved,
+        memories_used: end_turn.memories_used,
+        memory_conflicts: end_turn.memory_conflicts,
         provider_not_configured: false,
-        experiment_context,
+        experiment_context: end_turn.experiment_context,
         latency_ms: 0,
-        new_messages_start,
+        new_messages_start: end_turn.new_messages_start,
     })
 }
 
@@ -2162,32 +2175,33 @@ pub async fn run_agent_loop(
                 final_response = text.clone();
 
                 return finalize_successful_end_turn(
-                    manifest,
-                    session,
-                    memory,
-                    embedding_driver,
-                    context_engine,
-                    on_phase,
-                    proactive_memory.as_ref(),
-                    hooks,
-                    agent_id_str.as_str(),
-                    user_message,
-                    final_response,
-                    &messages,
-                    iteration,
-                    total_usage,
-                    decision_traces,
-                    memories_saved,
-                    memories_used,
-                    memory_conflicts,
-                    experiment_context.clone(),
-                    reply_directives_from_parsed(parsed_directives),
-                    new_messages_start,
-                    sender_user_id.as_deref(),
-                    "Agent loop completed",
-                    "non_streaming",
-                    "Proactive memory: stored {} memories, {} relations",
-                    "Proactive memory auto_memorize failed",
+                    FinalizeEndTurnContext {
+                        manifest,
+                        session,
+                        memory,
+                        embedding_driver,
+                        context_engine,
+                        on_phase,
+                        proactive_memory: proactive_memory.as_ref(),
+                        hooks,
+                        agent_id_str: agent_id_str.as_str(),
+                        user_message,
+                        messages: &messages,
+                        sender_user_id: sender_user_id.as_deref(),
+                        streaming: false,
+                    },
+                    FinalizeEndTurnResultData {
+                        final_response,
+                        iteration,
+                        total_usage,
+                        decision_traces,
+                        memories_saved,
+                        memories_used,
+                        memory_conflicts,
+                        experiment_context: experiment_context.clone(),
+                        directives: reply_directives_from_parsed(parsed_directives),
+                        new_messages_start,
+                    },
                 )
                 .await;
             }
@@ -2202,20 +2216,19 @@ pub async fn run_agent_loop(
                 let mut tool_result_blocks = Vec::new();
                 let mut iteration_outcomes = ToolResultOutcomeSummary::default();
                 for tool_call in &response.tool_calls {
-                    let executed = execute_single_tool_call(
+                    let mut tool_exec_ctx = ToolExecutionContext {
                         manifest,
-                        tool_call,
-                        &mut loop_guard,
+                        loop_guard: &mut loop_guard,
                         memory,
                         session,
-                        kernel.as_ref(),
-                        &tool_use_setup.allowed_tool_names,
-                        &tool_use_setup.caller_id_str,
+                        kernel: kernel.as_ref(),
+                        available_tool_names: &tool_use_setup.allowed_tool_names,
+                        caller_id_str: &tool_use_setup.caller_id_str,
                         skill_registry,
                         mcp_connections,
                         web_ctx,
                         browser_ctx,
-                        &hand_allowed_env,
+                        hand_allowed_env: &hand_allowed_env,
                         workspace_root,
                         media_engine,
                         media_drivers,
@@ -2223,20 +2236,20 @@ pub async fn run_agent_loop(
                         docker_config,
                         hooks,
                         process_manager,
-                        sender_user_id.as_deref(),
-                        sender_channel.as_deref(),
-                        &context_budget,
+                        sender_user_id: sender_user_id.as_deref(),
+                        sender_channel: sender_channel.as_deref(),
+                        context_budget: &context_budget,
                         context_engine,
-                        ctx_window,
+                        context_window_tokens: ctx_window,
                         on_phase,
-                        &mut decision_traces,
-                        &tool_use_setup.rationale_text,
+                        decision_traces: &mut decision_traces,
+                        rationale_text: &tool_use_setup.rationale_text,
                         tools_recovered_from_text,
                         iteration,
-                        false,
-                        agent_id_str.as_str(),
-                    )
-                    .await?;
+                        streaming: false,
+                        agent_id_str: agent_id_str.as_str(),
+                    };
+                    let executed = execute_single_tool_call(&mut tool_exec_ctx, tool_call).await?;
 
                     append_tool_result_block(
                         &mut tool_result_blocks,
@@ -3047,32 +3060,33 @@ pub async fn run_agent_loop_streaming(
                 final_response = text.clone();
 
                 return finalize_successful_end_turn(
-                    manifest,
-                    session,
-                    memory,
-                    embedding_driver,
-                    context_engine,
-                    on_phase,
-                    proactive_memory.as_ref(),
-                    hooks,
-                    agent_id_str.as_str(),
-                    user_message,
-                    final_response,
-                    &messages,
-                    iteration,
-                    total_usage,
-                    decision_traces,
-                    memories_saved,
-                    memories_used,
-                    memory_conflicts,
-                    experiment_context,
-                    reply_directives_from_parsed(parsed_directives_s),
-                    new_messages_start,
-                    sender_user_id.as_deref(),
-                    "Streaming agent loop completed",
-                    "streaming",
-                    "Proactive memory (streaming): stored {} memories, {} relations",
-                    "Proactive memory auto_memorize failed (streaming)",
+                    FinalizeEndTurnContext {
+                        manifest,
+                        session,
+                        memory,
+                        embedding_driver,
+                        context_engine,
+                        on_phase,
+                        proactive_memory: proactive_memory.as_ref(),
+                        hooks,
+                        agent_id_str: agent_id_str.as_str(),
+                        user_message,
+                        messages: &messages,
+                        sender_user_id: sender_user_id.as_deref(),
+                        streaming: true,
+                    },
+                    FinalizeEndTurnResultData {
+                        final_response,
+                        iteration,
+                        total_usage,
+                        decision_traces,
+                        memories_saved,
+                        memories_used,
+                        memory_conflicts,
+                        experiment_context,
+                        directives: reply_directives_from_parsed(parsed_directives_s),
+                        new_messages_start,
+                    },
                 )
                 .await;
             }
@@ -3087,20 +3101,19 @@ pub async fn run_agent_loop_streaming(
                 let mut tool_result_blocks = Vec::new();
                 let mut iteration_outcomes = ToolResultOutcomeSummary::default();
                 for tool_call in &response.tool_calls {
-                    let executed = execute_single_tool_call(
+                    let mut tool_exec_ctx = ToolExecutionContext {
                         manifest,
-                        tool_call,
-                        &mut loop_guard,
+                        loop_guard: &mut loop_guard,
                         memory,
                         session,
-                        kernel.as_ref(),
-                        &tool_use_setup.allowed_tool_names,
-                        &tool_use_setup.caller_id_str,
+                        kernel: kernel.as_ref(),
+                        available_tool_names: &tool_use_setup.allowed_tool_names,
+                        caller_id_str: &tool_use_setup.caller_id_str,
                         skill_registry,
                         mcp_connections,
                         web_ctx,
                         browser_ctx,
-                        &hand_allowed_env,
+                        hand_allowed_env: &hand_allowed_env,
                         workspace_root,
                         media_engine,
                         media_drivers,
@@ -3108,20 +3121,20 @@ pub async fn run_agent_loop_streaming(
                         docker_config,
                         hooks,
                         process_manager,
-                        sender_user_id.as_deref(),
-                        sender_channel.as_deref(),
-                        &context_budget,
+                        sender_user_id: sender_user_id.as_deref(),
+                        sender_channel: sender_channel.as_deref(),
+                        context_budget: &context_budget,
                         context_engine,
-                        ctx_window,
+                        context_window_tokens: ctx_window,
                         on_phase,
-                        &mut decision_traces,
-                        &tool_use_setup.rationale_text,
+                        decision_traces: &mut decision_traces,
+                        rationale_text: &tool_use_setup.rationale_text,
                         tools_recovered_from_text,
                         iteration,
-                        true,
-                        agent_id_str.as_str(),
-                    )
-                    .await?;
+                        streaming: true,
+                        agent_id_str: agent_id_str.as_str(),
+                    };
+                    let executed = execute_single_tool_call(&mut tool_exec_ctx, tool_call).await?;
 
                     // Notify client of tool execution result (detect dead consumer)
                     let preview: String = executed.final_content.chars().take(300).collect();
@@ -4624,7 +4637,7 @@ mod tests {
     }
 
     #[test]
-    fn test_count_tool_result_outcomes_counts_partial_hard_failures_before_signal() {
+    fn test_tool_result_outcome_summary_counts_partial_hard_failures_before_signal() {
         let tool_result_blocks = vec![
             ContentBlock::ToolResult {
                 tool_use_id: "tool-hard-fail".to_string(),
@@ -4644,10 +4657,10 @@ mod tests {
             },
         ];
 
-        let (hard_error_count, success_count) = count_tool_result_outcomes(&tool_result_blocks);
+        let summary = ToolResultOutcomeSummary::from_blocks(&tool_result_blocks);
 
-        assert_eq!(hard_error_count, 1);
-        assert_eq!(success_count, 1);
+        assert_eq!(summary.hard_error_count, 1);
+        assert_eq!(summary.success_count, 1);
     }
 
     #[tokio::test]
