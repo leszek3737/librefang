@@ -327,11 +327,33 @@ fn count_tool_result_outcomes(tool_result_blocks: &[ContentBlock]) -> (u32, u32)
     (hard_error_count, success_count)
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ToolResultOutcomeSummary {
+    hard_error_count: u32,
+    success_count: u32,
+}
+
+impl ToolResultOutcomeSummary {
+    fn from_blocks(tool_result_blocks: &[ContentBlock]) -> Self {
+        let (hard_error_count, success_count) = count_tool_result_outcomes(tool_result_blocks);
+        Self {
+            hard_error_count,
+            success_count,
+        }
+    }
+
+    fn accumulate(&mut self, other: Self) {
+        self.hard_error_count += other.hard_error_count;
+        self.success_count += other.success_count;
+    }
+}
+
 fn update_consecutive_hard_failures(
     consecutive_all_failed: &mut u32,
-    tool_result_blocks: &[ContentBlock],
+    outcome_summary: ToolResultOutcomeSummary,
 ) -> u32 {
-    let (hard_error_count, success_count) = count_tool_result_outcomes(tool_result_blocks);
+    let hard_error_count = outcome_summary.hard_error_count;
+    let success_count = outcome_summary.success_count;
 
     if success_count == 0 && hard_error_count > 0 {
         *consecutive_all_failed += 1;
@@ -633,30 +655,23 @@ fn handle_mid_turn_signal(
     session: &mut Session,
     messages: &mut Vec<Message>,
     tool_result_blocks: &mut Vec<ContentBlock>,
-) -> bool {
+) -> Option<ToolResultOutcomeSummary> {
     let Some(pending_rx) = pending_messages else {
-        return false;
+        return None;
     };
     let Ok(mut rx) = pending_rx.try_lock() else {
-        return false;
+        return None;
     };
     let Ok(signal) = rx.try_recv() else {
-        return false;
+        return None;
     };
+
+    let flushed_outcomes = finalize_tool_use_results(session, messages, tool_result_blocks);
 
     info!(
         agent = %manifest_name,
         "Mid-turn signal injected — interrupting tool execution"
     );
-    if !tool_result_blocks.is_empty() {
-        let partial_results = Message {
-            role: Role::User,
-            content: MessageContent::Blocks(tool_result_blocks.clone()),
-            pinned: false,
-        };
-        session.messages.push(partial_results.clone());
-        messages.push(partial_results);
-    }
     let injected_text = match signal {
         AgentLoopSignal::Message { content } => content,
         AgentLoopSignal::ApprovalResolved {
@@ -686,14 +701,19 @@ fn handle_mid_turn_signal(
     session.messages.push(inject_msg.clone());
     messages.push(inject_msg);
     tool_result_blocks.clear();
-    true
+    Some(flushed_outcomes)
 }
 
 fn finalize_tool_use_results(
     session: &mut Session,
     messages: &mut Vec<Message>,
     tool_result_blocks: &mut Vec<ContentBlock>,
-) {
+) -> ToolResultOutcomeSummary {
+    if tool_result_blocks.is_empty() {
+        return ToolResultOutcomeSummary::default();
+    }
+
+    let outcome_summary = ToolResultOutcomeSummary::from_blocks(tool_result_blocks);
     append_tool_result_guidance_blocks(tool_result_blocks);
 
     let tool_results_msg = Message {
@@ -703,6 +723,8 @@ fn finalize_tool_use_results(
     };
     session.messages.push(tool_results_msg.clone());
     messages.push(tool_results_msg);
+
+    outcome_summary
 }
 
 fn max_tokens_response_text(response: &crate::llm_driver::CompletionResponse) -> String {
@@ -2171,6 +2193,7 @@ pub async fn run_agent_loop(
 
                 // Execute each tool call with loop guard, timeout, and truncation
                 let mut tool_result_blocks = Vec::new();
+                let mut iteration_outcomes = ToolResultOutcomeSummary::default();
                 for tool_call in &response.tool_calls {
                     let executed = execute_single_tool_call(
                         manifest,
@@ -2232,18 +2255,23 @@ pub async fn run_agent_loop(
                     // messages between tool calls. If one is available, flush
                     // completed tool results so far and inject the user message
                     // so the LLM can process the interrupt on the next iteration.
-                    if handle_mid_turn_signal(
+                    if let Some(flushed_outcomes) = handle_mid_turn_signal(
                         pending_messages,
                         &manifest.name,
                         session,
                         &mut messages,
                         &mut tool_result_blocks,
                     ) {
+                        iteration_outcomes.accumulate(flushed_outcomes);
                         break;
                     }
                 }
 
-                finalize_tool_use_results(session, &mut messages, &mut tool_result_blocks);
+                iteration_outcomes.accumulate(finalize_tool_use_results(
+                    session,
+                    &mut messages,
+                    &mut tool_result_blocks,
+                ));
 
                 // Interim save after tool execution to prevent data loss on crash
                 if let Err(e) = memory.save_session_async(session).await {
@@ -2255,7 +2283,7 @@ pub async fn run_agent_loop(
                 // NOTE: keep in sync with run_agent_loop_streaming.
                 let hard_error_count = update_consecutive_hard_failures(
                     &mut consecutive_all_failed,
-                    &tool_result_blocks,
+                    iteration_outcomes,
                 );
                 if consecutive_all_failed > 0 && hard_error_count > 0 {
                     if consecutive_all_failed >= MAX_CONSECUTIVE_ALL_FAILED {
@@ -3049,6 +3077,7 @@ pub async fn run_agent_loop_streaming(
 
                 // Execute each tool call with loop guard, timeout, and truncation
                 let mut tool_result_blocks = Vec::new();
+                let mut iteration_outcomes = ToolResultOutcomeSummary::default();
                 for tool_call in &response.tool_calls {
                     let executed = execute_single_tool_call(
                         manifest,
@@ -3122,18 +3151,23 @@ pub async fn run_agent_loop_streaming(
 
                     // Mid-turn message injection (#956): check for pending user
                     // messages between tool calls (streaming variant).
-                    if handle_mid_turn_signal(
+                    if let Some(flushed_outcomes) = handle_mid_turn_signal(
                         pending_messages,
                         &manifest.name,
                         session,
                         &mut messages,
                         &mut tool_result_blocks,
                     ) {
+                        iteration_outcomes.accumulate(flushed_outcomes);
                         break;
                     }
                 }
 
-                finalize_tool_use_results(session, &mut messages, &mut tool_result_blocks);
+                iteration_outcomes.accumulate(finalize_tool_use_results(
+                    session,
+                    &mut messages,
+                    &mut tool_result_blocks,
+                ));
 
                 if let Err(e) = memory.save_session_async(session).await {
                     warn!("Failed to interim-save session: {e}");
@@ -3144,7 +3178,7 @@ pub async fn run_agent_loop_streaming(
                 // NOTE: keep in sync with run_agent_loop (non-streaming).
                 let hard_error_count = update_consecutive_hard_failures(
                     &mut consecutive_all_failed,
-                    &tool_result_blocks,
+                    iteration_outcomes,
                 );
                 if consecutive_all_failed > 0 && hard_error_count > 0 {
                     if consecutive_all_failed >= MAX_CONSECUTIVE_ALL_FAILED {
@@ -4037,6 +4071,284 @@ mod tests {
         assert_eq!(MAX_HISTORY_MESSAGES, 40);
     }
 
+    #[test]
+    fn test_finalize_tool_use_results_skips_empty_message() {
+        let agent_id = librefang_types::agent::AgentId::new();
+        let mut session = librefang_memory::session::Session {
+            id: librefang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let mut messages = Vec::new();
+        let mut tool_result_blocks = Vec::new();
+
+        let outcomes =
+            finalize_tool_use_results(&mut session, &mut messages, &mut tool_result_blocks);
+
+        assert_eq!(outcomes, ToolResultOutcomeSummary::default());
+        assert!(session.messages.is_empty());
+        assert!(messages.is_empty());
+        assert!(tool_result_blocks.is_empty());
+    }
+
+    #[test]
+    fn test_handle_mid_turn_signal_injects_without_tool_results() {
+        let agent_id = librefang_types::agent::AgentId::new();
+        let mut session = librefang_memory::session::Session {
+            id: librefang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let mut messages = Vec::new();
+        let mut tool_result_blocks = Vec::new();
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(AgentLoopSignal::Message {
+            content: "interrupt".to_string(),
+        })
+        .unwrap();
+        let pending = tokio::sync::Mutex::new(rx);
+
+        let flushed_outcomes = handle_mid_turn_signal(
+            Some(&pending),
+            "test-agent",
+            &mut session,
+            &mut messages,
+            &mut tool_result_blocks,
+        )
+        .expect("expected mid-turn signal");
+
+        assert_eq!(flushed_outcomes, ToolResultOutcomeSummary::default());
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(session.messages[0].content.text_content(), "interrupt");
+    }
+
+    #[test]
+    fn test_handle_mid_turn_signal_mixed_flush_resets_consecutive_all_failed() {
+        let agent_id = librefang_types::agent::AgentId::new();
+        let mut session = librefang_memory::session::Session {
+            id: librefang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let mut messages = Vec::new();
+        let mut tool_result_blocks = vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "tool-hard-fail".to_string(),
+                tool_name: "nonexistent_tool".to_string(),
+                content: "Permission denied: unknown tool".to_string(),
+                is_error: true,
+                status: librefang_types::tool::ToolExecutionStatus::Error,
+                approval_request_id: None,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "tool-ok".to_string(),
+                tool_name: "noop".to_string(),
+                content: "ok".to_string(),
+                is_error: false,
+                status: librefang_types::tool::ToolExecutionStatus::Completed,
+                approval_request_id: None,
+            },
+        ];
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(AgentLoopSignal::Message {
+            content: "interrupt".to_string(),
+        })
+        .unwrap();
+        let pending = tokio::sync::Mutex::new(rx);
+
+        let flushed_outcomes = handle_mid_turn_signal(
+            Some(&pending),
+            "test-agent",
+            &mut session,
+            &mut messages,
+            &mut tool_result_blocks,
+        )
+        .expect("expected mid-turn signal");
+
+        assert_eq!(
+            flushed_outcomes,
+            ToolResultOutcomeSummary {
+                hard_error_count: 1,
+                success_count: 1,
+            }
+        );
+        assert!(tool_result_blocks.is_empty());
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &session.messages[0].content,
+            MessageContent::Blocks(blocks)
+                if matches!(
+                    blocks.as_slice(),
+                    [
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            is_error: true,
+                            status: librefang_types::tool::ToolExecutionStatus::Error,
+                            ..
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id: tool_use_id_ok,
+                            is_error: false,
+                            status: librefang_types::tool::ToolExecutionStatus::Completed,
+                            ..
+                        },
+                        ContentBlock::Text { .. }
+                    ] if tool_use_id == "tool-hard-fail" && tool_use_id_ok == "tool-ok"
+                )
+        ));
+        assert_eq!(session.messages[1].content.text_content(), "interrupt");
+
+        let mut consecutive_all_failed = 2;
+        let hard_error_count =
+            update_consecutive_hard_failures(&mut consecutive_all_failed, flushed_outcomes);
+        assert_eq!(hard_error_count, 1);
+        assert_eq!(consecutive_all_failed, 0);
+    }
+
+    #[test]
+    fn test_handle_mid_turn_signal_approval_resolved_updates_waiting_result_and_resets_failures() {
+        let agent_id = librefang_types::agent::AgentId::new();
+        let waiting_result = ContentBlock::ToolResult {
+            tool_use_id: "tool_waiting".to_string(),
+            tool_name: "dangerous_tool".to_string(),
+            content: "awaiting approval".to_string(),
+            is_error: true,
+            status: librefang_types::tool::ToolExecutionStatus::WaitingApproval,
+            approval_request_id: Some("approval-1".to_string()),
+        };
+        let mut session = librefang_memory::session::Session {
+            id: librefang_types::agent::SessionId::new(),
+            agent_id,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![waiting_result.clone()]),
+                pinned: false,
+            }],
+            context_window_tokens: 0,
+            label: None,
+        };
+        let mut messages = session.messages.clone();
+        let mut tool_result_blocks = vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "tool-hard-fail".to_string(),
+                tool_name: "failing_tool".to_string(),
+                content: "hard failure before approval resolution".to_string(),
+                is_error: true,
+                status: librefang_types::tool::ToolExecutionStatus::Error,
+                approval_request_id: None,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "tool-ok".to_string(),
+                tool_name: "noop".to_string(),
+                content: "completed before approval resolution".to_string(),
+                is_error: false,
+                status: librefang_types::tool::ToolExecutionStatus::Completed,
+                approval_request_id: None,
+            },
+        ];
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(AgentLoopSignal::ApprovalResolved {
+            tool_use_id: "tool_waiting".to_string(),
+            tool_name: "dangerous_tool".to_string(),
+            decision: "approved".to_string(),
+            result_content: "approved and executed".to_string(),
+            result_is_error: false,
+            result_status: librefang_types::tool::ToolExecutionStatus::Completed,
+        })
+        .unwrap();
+        let pending = tokio::sync::Mutex::new(rx);
+
+        let flushed_outcomes = handle_mid_turn_signal(
+            Some(&pending),
+            "test-agent",
+            &mut session,
+            &mut messages,
+            &mut tool_result_blocks,
+        )
+        .expect("expected approval resolution signal");
+
+        assert_eq!(
+            flushed_outcomes,
+            ToolResultOutcomeSummary {
+                hard_error_count: 1,
+                success_count: 1,
+            }
+        );
+        assert!(tool_result_blocks.is_empty());
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(messages.len(), 3);
+
+        match &session.messages[0].content {
+            MessageContent::Blocks(blocks) => match &blocks[0] {
+                ContentBlock::ToolResult {
+                    content,
+                    is_error,
+                    status,
+                    approval_request_id,
+                    ..
+                } => {
+                    assert_eq!(content, "approved and executed");
+                    assert!(!is_error);
+                    assert_eq!(
+                        *status,
+                        librefang_types::tool::ToolExecutionStatus::Completed
+                    );
+                    assert!(approval_request_id.is_none());
+                }
+                other => panic!("expected tool result block, got {other:?}"),
+            },
+            other => panic!("expected blocks message, got {other:?}"),
+        }
+
+        match &session.messages[1].content {
+            MessageContent::Blocks(blocks) => {
+                assert!(matches!(
+                    blocks.as_slice(),
+                    [
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error: true,
+                            status: librefang_types::tool::ToolExecutionStatus::Error,
+                            ..
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id: tool_use_id_ok,
+                            content: content_ok,
+                            is_error: false,
+                            status: librefang_types::tool::ToolExecutionStatus::Completed,
+                            ..
+                        },
+                        ContentBlock::Text { text, .. }
+                    ] if tool_use_id == "tool-hard-fail"
+                        && content == "hard failure before approval resolution"
+                        && tool_use_id_ok == "tool-ok"
+                        && content_ok == "completed before approval resolution"
+                        && text.contains("1 tool(s) returned errors")
+                ));
+            }
+            other => panic!("expected flushed blocks message, got {other:?}"),
+        }
+
+        let injected_text = session.messages[2].content.text_content();
+        assert!(injected_text.contains("Tool 'dangerous_tool' approval resolved (approved)"));
+        assert!(injected_text.contains("approved and executed"));
+
+        let mut consecutive_all_failed = 2;
+        let hard_error_count =
+            update_consecutive_hard_failures(&mut consecutive_all_failed, flushed_outcomes);
+        assert_eq!(hard_error_count, 1);
+        assert_eq!(consecutive_all_failed, 0);
+    }
+
     /// Regression for issue #2067: auto_memorize sliced `session.messages`
     /// with an index captured **before** `safe_trim_messages` ran, so when
     /// `find_safe_trim_point` scanned forward and trimmed deeper than
@@ -4227,6 +4539,112 @@ mod tests {
         let cleaned = sanitize_tool_result_content(raw, &budget, None, 200_000);
         assert!(!cleaned.contains("<|im_start|>"));
         assert!(cleaned.contains("[injection marker removed]"));
+    }
+
+    #[test]
+    fn test_count_tool_result_outcomes_counts_partial_hard_failures_before_signal() {
+        let tool_result_blocks = vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "tool-hard-fail".to_string(),
+                tool_name: "nonexistent_tool".to_string(),
+                content: "Permission denied: unknown tool".to_string(),
+                is_error: true,
+                status: librefang_types::tool::ToolExecutionStatus::Error,
+                approval_request_id: None,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "tool-ok".to_string(),
+                tool_name: "noop".to_string(),
+                content: "ok".to_string(),
+                is_error: false,
+                status: librefang_types::tool::ToolExecutionStatus::Completed,
+                approval_request_id: None,
+            },
+        ];
+
+        let (hard_error_count, success_count) = count_tool_result_outcomes(&tool_result_blocks);
+
+        assert_eq!(hard_error_count, 1);
+        assert_eq!(success_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_mid_turn_signal_preserves_partial_hard_failure_results_for_classification() {
+        let agent_id = librefang_types::agent::AgentId::new();
+        let mut session = librefang_memory::session::Session {
+            id: librefang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let mut messages = Vec::new();
+        let mut tool_result_blocks = vec![ContentBlock::ToolResult {
+            tool_use_id: "tool-hard-fail".to_string(),
+            tool_name: "nonexistent_tool".to_string(),
+            content: "Permission denied: unknown tool".to_string(),
+            is_error: true,
+            status: librefang_types::tool::ToolExecutionStatus::Error,
+            approval_request_id: None,
+        }];
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(AgentLoopSignal::Message {
+            content: "interrupt".to_string(),
+        })
+        .await
+        .unwrap();
+        let pending_messages = tokio::sync::Mutex::new(rx);
+
+        let interrupted = handle_mid_turn_signal(
+            Some(&pending_messages),
+            "test-agent",
+            &mut session,
+            &mut messages,
+            &mut tool_result_blocks,
+        );
+
+        let interrupted = interrupted.expect("signal should flush accumulated results");
+        assert!(tool_result_blocks.is_empty());
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(messages.len(), 2);
+        match &session.messages[0].content {
+            MessageContent::Blocks(blocks) => {
+                assert!(blocks.len() >= 1);
+                match &blocks[0] {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        tool_name,
+                        content,
+                        is_error,
+                        status,
+                        approval_request_id,
+                    } => {
+                        assert_eq!(tool_use_id, "tool-hard-fail");
+                        assert_eq!(tool_name, "nonexistent_tool");
+                        assert_eq!(content, "Permission denied: unknown tool");
+                        assert!(*is_error);
+                        assert_eq!(*status, librefang_types::tool::ToolExecutionStatus::Error);
+                        assert!(approval_request_id.is_none());
+                    }
+                    other => panic!("expected tool result block, got {other:?}"),
+                }
+            }
+            other => panic!("expected blocks message, got {other:?}"),
+        }
+        assert!(matches!(
+            &messages[0].content,
+            MessageContent::Blocks(blocks)
+                if matches!(blocks.first(), Some(ContentBlock::ToolResult { .. }))
+        ));
+        assert_eq!(session.messages[1].content.text_content(), "interrupt");
+        assert_eq!(interrupted.hard_error_count, 1);
+        assert_eq!(interrupted.success_count, 0);
+
+        let mut consecutive_all_failed = 1;
+        let hard_error_count =
+            update_consecutive_hard_failures(&mut consecutive_all_failed, interrupted);
+        assert_eq!(hard_error_count, 1);
+        assert_eq!(consecutive_all_failed, 2);
     }
 
     // --- Integration tests for empty response guards ---
