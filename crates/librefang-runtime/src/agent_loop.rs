@@ -1051,7 +1051,7 @@ where
     match result {
         Ok(value) => value,
         Err(err) => {
-            warn!(error = %err, "{warning}");
+            warn!(error = %err, "{}", warning);
             T::default()
         }
     }
