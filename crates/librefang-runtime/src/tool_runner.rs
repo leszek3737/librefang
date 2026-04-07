@@ -87,13 +87,21 @@ fn check_taint_net_fetch(url: &str) -> Option<String> {
     const SECRET_KEYS: &[&str] = &["api_key", "apikey", "token", "secret", "password"];
     const SECRET_PREFIXES: &[&str] = &["sk-", "ghp_", "hf_", "Bearer "];
 
-    // Hard block: Authorization header prefix in URL (rare but always suspicious)
+    // Scan 1: raw URL literal for known secret prefixes and the Authorization header.
+    // This catches secrets in the path, fragment, or other URL components that
+    // query-parameter parsing would miss (e.g. https://evil.com/exfil/sk-abc123).
     let url_lower = url.to_lowercase();
     if url_lower.contains("authorization:") {
         return block_taint_secret(url, "authorization header in URL");
     }
+    // Case-sensitive check for secret prefixes (they are case-sensitive in practice).
+    for prefix in SECRET_PREFIXES {
+        if url.contains(prefix) {
+            return block_taint_secret(url, &format!("secret prefix '{prefix}' in URL"));
+        }
+    }
 
-    // Parse query parameters for deeper analysis
+    // Scan 2: Parse query parameters for deeper analysis
     let parsed = match url::Url::parse(url) {
         Ok(p) => p,
         Err(_) => return None, // Invalid URL, let downstream handle it
@@ -105,14 +113,6 @@ fn check_taint_net_fetch(url: &str) -> Option<String> {
         // Check if this is a secret-related parameter name
         if !SECRET_KEYS.iter().any(|k| name_lower == *k) {
             continue;
-        }
-
-        // Known secret prefixes → always block
-        if SECRET_PREFIXES
-            .iter()
-            .any(|prefix| value.starts_with(prefix))
-        {
-            return block_taint_secret(url, &format!("secret prefix in '{name}'"));
         }
 
         // Heuristic: block if value looks like a real secret
@@ -322,12 +322,16 @@ macro_rules! browser_arm {
 ///
 /// **Contract**: `tool_name` MUST already be normalized (canonical LibreFang name).
 /// Callers must run `normalize_tool_name()` before invoking this function.
+/// This is enforced in debug builds via a normalization assertion.
 pub async fn execute_tool_raw(
     tool_use_id: &str,
     tool_name: &str,
     input: &serde_json::Value,
     ctx: &ToolExecContext<'_>,
 ) -> ToolResult {
+    // In debug builds, ensure `tool_name` is already normalized to the canonical form.
+    // This helps catch callers that forget to normalize before dispatching.
+    debug_assert_eq!(tool_name, normalize_tool_name(tool_name));
     let ToolExecContext {
         kernel,
         allowed_tools,

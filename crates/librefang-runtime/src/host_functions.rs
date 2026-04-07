@@ -416,12 +416,27 @@ fn host_shell_exec(state: &GuestState, params: &serde_json::Value) -> serde_json
                     }
                     None => {
                         // Timeout occurred; kill the child process and collect partial state.
+                        use std::io::Read;
+
+                        let mut stdout = String::new();
+                        let mut stderr = String::new();
+
+                        if let Some(mut out) = child.stdout.take() {
+                            let _ = out.read_to_string(&mut stdout);
+                        }
+                        if let Some(mut err) = child.stderr.take() {
+                            let _ = err.read_to_string(&mut stderr);
+                        }
+
                         let _ = child.kill();
                         let _ = child.wait();
+
                         json!({
                             "ok": {
+                                "exit_code": Option::<i32>::None,
+                                "stdout": stdout,
+                                "stderr": stderr,
                                 "timed_out": true,
-                                "stderr": "Process killed due to timeout (timed out)"
                             }
                         })
                     }
@@ -653,15 +668,19 @@ mod tests {
             "Expected timeout path to be taken, got: {result}"
         );
 
-        // The stderr should mention timeout or kill for visibility
-        if let Some(stderr) = ok.get("stderr").and_then(|v| v.as_str()) {
-            let lower = stderr.to_lowercase();
-            assert!(
-                lower.contains("timed") || lower.contains("killed"),
-                "Expected stderr to mention timeout or kill, got: {}",
-                stderr
-            );
-        }
+        // The result should have exit_code: null (process was killed)
+        assert!(
+            ok.get("exit_code").is_some(),
+            "Expected exit_code field in timeout result, got: {result}"
+        );
+        assert!(
+            ok.get("exit_code").unwrap().is_null(),
+            "Expected exit_code to be null for killed process, got: {result}"
+        );
+
+        // stdout and stderr fields should exist (may be empty for sleep)
+        assert!(ok.get("stdout").is_some(), "Expected stdout field");
+        assert!(ok.get("stderr").is_some(), "Expected stderr field");
     }
 
     #[tokio::test]
