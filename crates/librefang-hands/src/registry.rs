@@ -4,6 +4,7 @@ use crate::{
     HandDefinition, HandError, HandInstance, HandRequirement, HandResult, HandSettingType,
     HandStatus, RequirementType,
 };
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use librefang_types::agent::AgentId;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,37 @@ use std::path::Path;
 use std::sync::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+/// Default timestamp for serde deserialization fallback (backward compat with v3).
+fn default_now() -> DateTime<Utc> {
+    Utc::now()
+}
+
+/// Current version of the persisted hand state format.
+const PERSIST_VERSION: u32 = 4;
+
+/// Typed representation of persisted hand state.
+#[derive(Serialize, Deserialize)]
+struct PersistedState {
+    version: u32,
+    instances: Vec<PersistedInstance>,
+}
+
+/// Typed representation of a single persisted hand instance.
+#[derive(Serialize, Deserialize)]
+struct PersistedInstance {
+    hand_id: String,
+    instance_id: Uuid,
+    config: HashMap<String, serde_json::Value>,
+    agent_ids: BTreeMap<String, AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coordinator_role: Option<String>,
+    status: HandStatus,
+    #[serde(default = "default_now")]
+    activated_at: DateTime<Utc>,
+    #[serde(default = "default_now")]
+    updated_at: DateTime<Utc>,
+}
 
 /// Wrapper struct for HAND.toml files that use the documented `[hand]` section format.
 #[derive(Debug, Clone, Deserialize)]
@@ -30,7 +62,7 @@ pub fn parse_hand_toml(
 ) -> Result<HandDefinition, HandError> {
     let mut def: HandDefinition = toml::from_str::<HandDefinition>(toml_content)
         .or_else(|flat_err| {
-            tracing::warn!("Flat parse failed for hand: {flat_err}");
+            tracing::debug!("Flat parse failed for hand: {flat_err}");
             toml::from_str::<HandTomlWrapper>(toml_content).map(|w| w.hand)
         })
         .map_err(|e| HandError::TomlParse(e.to_string()))?;
@@ -40,14 +72,24 @@ pub fn parse_hand_toml(
     Ok(def)
 }
 
+/// Result of scanning a hand directory.
+struct ScannedHand {
+    id: String,
+    toml_content: String,
+    skill_content: String,
+}
+
 /// Scan `home_dir/registry/hands/` for subdirectories containing HAND.toml.
-fn scan_hands_dir(home_dir: &Path) -> Vec<(String, String, String)> {
+fn scan_hands_dir(home_dir: &Path) -> Vec<ScannedHand> {
     let mut results = Vec::new();
     let hands_dir = home_dir.join("registry").join("hands");
 
     let entries = match std::fs::read_dir(&hands_dir) {
         Ok(e) => e,
-        Err(_) => return results,
+        Err(e) => {
+            tracing::debug!(path = %hands_dir.display(), error = %e, "Failed to read hands directory");
+            return results;
+        }
     };
 
     for entry in entries.flatten() {
@@ -64,18 +106,25 @@ fn scan_hands_dir(home_dir: &Path) -> Vec<(String, String, String)> {
         if !toml_path.exists() {
             continue;
         }
-        let toml = match std::fs::read_to_string(&toml_path) {
+        let toml_content = match std::fs::read_to_string(&toml_path) {
             Ok(s) => s,
             Err(e) => {
                 warn!(path = %toml_path.display(), error = %e, "Failed to read HAND.toml");
                 continue;
             }
         };
-        let skill = std::fs::read_to_string(&skill_path).unwrap_or_default();
-        results.push((id, toml, skill));
+        let skill_content = std::fs::read_to_string(&skill_path).unwrap_or_else(|e| {
+            tracing::debug!(path = %skill_path.display(), error = %e, "Failed to read SKILL.md");
+            String::new()
+        });
+        results.push(ScannedHand {
+            id,
+            toml_content,
+            skill_content,
+        });
     }
 
-    results.sort_by(|a, b| a.0.cmp(&b.0));
+    results.sort_by(|a, b| a.id.cmp(&b.id));
     results
 }
 
@@ -90,6 +139,10 @@ pub struct HandStateEntry {
     /// The original instance UUID, used to regenerate deterministic agent IDs
     /// that match the pre-restart values.
     pub instance_id: Option<Uuid>,
+    /// When the hand was originally activated. `None` for legacy v1/v2/v3 state files.
+    pub activated_at: Option<DateTime<Utc>>,
+    /// Last status change before persist. `None` for legacy v1/v2/v3 state files.
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 // ─── Settings availability types ────────────────────────────────────────────
@@ -116,11 +169,16 @@ pub struct SettingStatus {
 }
 
 /// The Hand registry — stores definitions and tracks active instances.
+#[derive(Default)]
 pub struct HandRegistry {
     /// All known hand definitions, keyed by hand_id.
     definitions: DashMap<String, HandDefinition>,
     /// Active hand instances, keyed by instance UUID.
     instances: DashMap<Uuid, HandInstance>,
+    /// Reverse index: agent_id → instance_id for O(1) agent lookup.
+    agent_index: DashMap<String, Uuid>,
+    /// Reverse index: hand_id → active instance_id for O(1) active-instance check.
+    active_index: DashMap<String, Uuid>,
     /// Serializes activate/deactivate to prevent race conditions where two
     /// concurrent requests both pass the "already active" check.
     activate_lock: Mutex<()>,
@@ -128,12 +186,24 @@ pub struct HandRegistry {
     persist_lock: Mutex<()>,
 }
 
+// Static assertion that HandRegistry is Send + Sync (all fields are lock-free
+// DashMaps or Mutexes).
+const _: () = {
+    #[allow(dead_code)]
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn _check() {
+        assert_send_sync::<HandRegistry>()
+    }
+};
+
 impl HandRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self {
             definitions: DashMap::new(),
             instances: DashMap::new(),
+            agent_index: DashMap::new(),
+            active_index: DashMap::new(),
             activate_lock: Mutex::new(()),
             persist_lock: Mutex::new(()),
         }
@@ -145,30 +215,27 @@ impl HandRegistry {
     /// across daemon restarts. Error-state instances are also persisted so
     /// the user can see what went wrong after a restart.
     pub fn persist_state(&self, path: &std::path::Path) -> HandResult<()> {
-        let _guard = self
-            .persist_lock
-            .lock()
-            .map_err(|e| HandError::Config(format!("persist lock poisoned: {e}")))?;
-        let entries: Vec<serde_json::Value> = self
+        let _guard = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let instances: Vec<PersistedInstance> = self
             .instances
             .iter()
             .filter(|e| !matches!(e.status, HandStatus::Inactive))
-            .map(|e| {
-                serde_json::json!({
-                    "hand_id": e.hand_id,
-                    "instance_id": e.instance_id.to_string(),
-                    "config": e.config,
-                    "agent_ids": e.agent_ids,
-                    "coordinator_role": e.coordinator_role,
-                    "status": e.status,
-                })
+            .map(|e| PersistedInstance {
+                hand_id: e.hand_id.clone(),
+                instance_id: e.instance_id,
+                config: e.config.clone(),
+                agent_ids: e.agent_ids.clone(),
+                coordinator_role: e.coordinator_role.clone(),
+                status: e.status.clone(),
+                activated_at: e.activated_at,
+                updated_at: e.updated_at,
             })
             .collect();
-        let wrapper = serde_json::json!({
-            "version": 3,
-            "instances": entries,
-        });
-        let json = serde_json::to_string_pretty(&wrapper)
+        let state = PersistedState {
+            version: PERSIST_VERSION,
+            instances,
+        };
+        let json = serde_json::to_string_pretty(&state)
             .map_err(|e| HandError::Config(format!("serialize hand state: {e}")))?;
         std::fs::write(path, json)
             .map_err(|e| HandError::Config(format!("write hand state: {e}")))?;
@@ -185,7 +252,49 @@ impl HandRegistry {
             Err(_) => return Vec::new(),
         };
 
-        // Try v3/v2 format (with version field), then fall back to v1 (bare array).
+        // Try typed deserialization first (v3 format with PersistedState struct).
+        if let Ok(state) = serde_json::from_str::<PersistedState>(&data) {
+            return state
+                .instances
+                .into_iter()
+                .filter_map(|inst| {
+                    let status = inst.status;
+                    match &status {
+                        HandStatus::Active | HandStatus::Paused => {}
+                        HandStatus::Error(message) => {
+                            info!(
+                                hand = %inst.hand_id,
+                                error = %message,
+                                "Skipping errored hand from persisted state"
+                            );
+                            return None;
+                        }
+                        HandStatus::Inactive => {
+                            info!(hand = %inst.hand_id, "Skipping inactive hand from persisted state");
+                            return None;
+                        }
+                    }
+
+                    let coordinator_role = HandInstance::normalize_coordinator_role(
+                        &inst.agent_ids,
+                        inst.coordinator_role.as_deref(),
+                    );
+
+                    Some(HandStateEntry {
+                        hand_id: inst.hand_id,
+                        config: inst.config,
+                        old_agent_ids: inst.agent_ids,
+                        coordinator_role,
+                        status,
+                        instance_id: Some(inst.instance_id),
+                        activated_at: Some(inst.activated_at),
+                        updated_at: Some(inst.updated_at),
+                    })
+                })
+                .collect();
+        }
+
+        // Fallback: legacy v2/v1 format using untyped parsing.
         let entries: Vec<serde_json::Value> =
             if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&data) {
                 if wrapper.get("version").is_some() {
@@ -236,13 +345,10 @@ impl HandRegistry {
                 let config: HashMap<String, serde_json::Value> =
                     serde_json::from_value(e["config"].clone()).unwrap_or_default();
 
-                // v3: agent_ids as BTreeMap<String, AgentId>
                 // v2: agent_id as single AgentId → convert to {"main": id}
                 // v1: agent_id as single AgentId → same conversion
                 let old_agent_ids: BTreeMap<String, AgentId> =
-                    if let Some(ids_val) = e.get("agent_ids") {
-                        serde_json::from_value(ids_val.clone()).unwrap_or_default()
-                    } else if let Some(id_val) = e.get("agent_id") {
+                    if let Some(id_val) = e.get("agent_id") {
                         if let Ok(id) = serde_json::from_value::<AgentId>(id_val.clone()) {
                             let mut map = BTreeMap::new();
                             map.insert("main".to_string(), id);
@@ -270,9 +376,25 @@ impl HandRegistry {
                     coordinator_role,
                     status,
                     instance_id,
+                    activated_at: None,
+                    updated_at: None,
                 })
             })
             .collect()
+    }
+
+    /// Insert a definition into the registry, rejecting duplicates.
+    ///
+    /// Returns the stored definition (cloned from the map). This helper is the
+    /// single point of truth for the "check duplicate → insert → return" pattern
+    /// shared by all install methods.
+    fn register_definition(&self, def: HandDefinition) -> HandResult<HandDefinition> {
+        let id = def.id.clone();
+        if self.definitions.contains_key(&id) {
+            return Err(HandError::AlreadyRegistered(id));
+        }
+        self.definitions.insert(id.clone(), def);
+        Ok(self.definitions.get(&id).unwrap().value().clone())
     }
 
     /// Load hand definitions from disk. Returns (added, updated) counts.
@@ -280,15 +402,20 @@ impl HandRegistry {
         let fresh = scan_hands_dir(home_dir);
         let mut added = 0usize;
         let mut updated = 0usize;
-        for (id, toml_content, skill_content) in fresh {
+        for ScannedHand {
+            id,
+            toml_content,
+            skill_content,
+        } in fresh
+        {
             match parse_hand_toml(&toml_content, &skill_content) {
                 Ok(def) => {
-                    if self.definitions.contains_key(&def.id) {
+                    // insert returns Option<old_value>; Some means updated, None means added.
+                    if self.definitions.insert(def.id.clone(), def).is_some() {
                         updated += 1;
                     } else {
                         added += 1;
                     }
-                    self.definitions.insert(def.id.clone(), def);
                 }
                 Err(e) => {
                     warn!(hand = %id, error = %e, "Failed to parse hand during reload");
@@ -306,17 +433,18 @@ impl HandRegistry {
         let toml_content = std::fs::read_to_string(&toml_path).map_err(|e| {
             HandError::NotFound(format!("Cannot read {}: {e}", toml_path.display()))
         })?;
-        let skill_content = std::fs::read_to_string(&skill_path).unwrap_or_default();
+        let skill_content = std::fs::read_to_string(&skill_path).unwrap_or_else(|e| {
+            tracing::debug!(path = %skill_path.display(), error = %e, "Failed to read SKILL.md");
+            String::new()
+        });
 
         let def = parse_hand_toml(&toml_content, &skill_content)?;
+        let id = def.id.clone();
+        let name = def.name.clone();
+        let stored = self.register_definition(def)?;
 
-        if self.definitions.contains_key(&def.id) {
-            return Err(HandError::AlreadyRegistered(def.id.clone()));
-        }
-
-        info!(hand = %def.id, name = %def.name, path = %path.display(), "Installed hand from path");
-        self.definitions.insert(def.id.clone(), def.clone());
-        Ok(def)
+        info!(hand = %id, name = %name, path = %path.display(), "Installed hand from path");
+        Ok(stored)
     }
 
     /// Install a hand from raw TOML + skill content (for API-based installs).
@@ -326,14 +454,12 @@ impl HandRegistry {
         skill_content: &str,
     ) -> HandResult<HandDefinition> {
         let def = parse_hand_toml(toml_content, skill_content)?;
+        let id = def.id.clone();
+        let name = def.name.clone();
+        let stored = self.register_definition(def)?;
 
-        if self.definitions.contains_key(&def.id) {
-            return Err(HandError::AlreadyRegistered(def.id.clone()));
-        }
-
-        info!(hand = %def.id, name = %def.name, "Installed hand from content");
-        self.definitions.insert(def.id.clone(), def.clone());
-        Ok(def)
+        info!(hand = %id, name = %name, "Installed hand from content");
+        Ok(stored)
     }
 
     /// Install a hand from raw TOML + skill content and persist it under
@@ -345,10 +471,8 @@ impl HandRegistry {
         skill_content: &str,
     ) -> HandResult<HandDefinition> {
         let def = parse_hand_toml(toml_content, skill_content)?;
-
-        if self.definitions.contains_key(&def.id) {
-            return Err(HandError::AlreadyRegistered(def.id.clone()));
-        }
+        let id = def.id.clone();
+        let name = def.name.clone();
 
         let hand_dir = home_dir.join("workspaces").join(&def.id);
         std::fs::create_dir_all(&hand_dir)?;
@@ -357,14 +481,15 @@ impl HandRegistry {
             std::fs::write(hand_dir.join("SKILL.md"), skill_content)?;
         }
 
+        let stored = self.register_definition(def)?;
+
         info!(
-            hand = %def.id,
-            name = %def.name,
+            hand = %id,
+            name = %name,
             path = %hand_dir.display(),
             "Installed hand from content"
         );
-        self.definitions.insert(def.id.clone(), def.clone());
-        Ok(def)
+        Ok(stored)
     }
 
     /// List all known hand definitions.
@@ -393,15 +518,17 @@ impl HandRegistry {
         hand_id: &str,
         config: HashMap<String, serde_json::Value>,
     ) -> HandResult<HandInstance> {
-        self.activate_with_id(hand_id, config, None)
+        self.activate_with_id(hand_id, config, None, None)
     }
 
-    /// Like [`activate`](Self::activate) but allows specifying an existing instance UUID.
+    /// Like [`activate`](Self::activate) but allows specifying an existing instance UUID
+    /// and optional preserved timestamps (for daemon restart recovery).
     pub fn activate_with_id(
         &self,
         hand_id: &str,
         config: HashMap<String, serde_json::Value>,
         instance_id: Option<Uuid>,
+        timestamps: Option<(DateTime<Utc>, DateTime<Utc>)>,
     ) -> HandResult<HandInstance> {
         if !self.definitions.contains_key(hand_id) {
             return Err(HandError::NotFound(hand_id.to_string()));
@@ -414,12 +541,8 @@ impl HandRegistry {
         // (single-instance mode). When Some(uuid) is passed, it's an explicit
         // multi-instance request (e.g. daemon restart recovery) and should be
         // allowed through.
-        if instance_id.is_none() {
-            for entry in self.instances.iter() {
-                if entry.hand_id == hand_id && entry.status == HandStatus::Active {
-                    return Err(HandError::AlreadyActive(hand_id.to_string()));
-                }
-            }
+        if instance_id.is_none() && self.active_index.contains_key(hand_id) {
+            return Err(HandError::AlreadyActive(hand_id.to_string()));
         } else if let Some(id) = instance_id {
             if self.instances.contains_key(&id) {
                 return Err(HandError::ActivationFailed(format!(
@@ -428,9 +551,16 @@ impl HandRegistry {
             }
         }
 
-        let instance = HandInstance::new(hand_id, config, instance_id);
+        let mut instance = HandInstance::new(hand_id, config, instance_id);
+        // Restore original timestamps when recovering from persisted state.
+        if let Some((activated, updated)) = timestamps {
+            instance.activated_at = activated;
+            instance.updated_at = updated;
+        }
         let id = instance.instance_id;
         self.instances.insert(id, instance.clone());
+        // Track in active_index — newly activated instances are Active by default.
+        self.active_index.insert(hand_id.to_string(), id);
         info!(hand = %hand_id, instance = %id, "Hand activated");
         Ok(instance)
     }
@@ -441,30 +571,43 @@ impl HandRegistry {
             .instances
             .remove(&instance_id)
             .ok_or(HandError::InstanceNotFound(instance_id))?;
+        // Clean up reverse indexes.
+        self.agent_index.retain(|_, v| *v != instance_id);
+        self.active_index.remove(&instance.hand_id);
         info!(hand = %instance.hand_id, instance = %instance_id, "Hand deactivated");
         Ok(instance)
     }
 
-    /// Pause a hand instance.
-    pub fn pause(&self, instance_id: Uuid) -> HandResult<()> {
+    /// Set the status of an instance, updating timestamps and indexes.
+    fn set_status(&self, instance_id: Uuid, status: HandStatus) -> HandResult<()> {
         let mut entry = self
             .instances
             .get_mut(&instance_id)
             .ok_or(HandError::InstanceNotFound(instance_id))?;
-        entry.status = HandStatus::Paused;
+        let hand_id = entry.hand_id.clone();
+        entry.status = status.clone();
         entry.updated_at = chrono::Utc::now();
+        drop(entry); // release the DashMap write lock before touching indexes
+
+        match status {
+            HandStatus::Active => {
+                self.active_index.insert(hand_id, instance_id);
+            }
+            HandStatus::Paused | HandStatus::Error(_) | HandStatus::Inactive => {
+                self.active_index.remove(&hand_id);
+            }
+        }
         Ok(())
+    }
+
+    /// Pause a hand instance.
+    pub fn pause(&self, instance_id: Uuid) -> HandResult<()> {
+        self.set_status(instance_id, HandStatus::Paused)
     }
 
     /// Resume a paused hand instance.
     pub fn resume(&self, instance_id: Uuid) -> HandResult<()> {
-        let mut entry = self
-            .instances
-            .get_mut(&instance_id)
-            .ok_or(HandError::InstanceNotFound(instance_id))?;
-        entry.status = HandStatus::Active;
-        entry.updated_at = chrono::Utc::now();
-        Ok(())
+        self.set_status(instance_id, HandStatus::Active)
     }
 
     /// Set all agent IDs for an instance (called after kernel spawns agents).
@@ -480,26 +623,32 @@ impl HandRegistry {
             .ok_or(HandError::InstanceNotFound(instance_id))?;
         entry.coordinator_role =
             HandInstance::normalize_coordinator_role(&agent_ids, coordinator_role.as_deref());
+        // Capture old agent IDs before overwriting, for index cleanup.
+        let old_agent_ids = std::mem::take(&mut entry.agent_ids);
         entry.agent_ids = agent_ids;
         entry.updated_at = chrono::Utc::now();
+        // Update agent_index: remove old entries, add new entries.
+        for aid in old_agent_ids.values() {
+            self.agent_index.remove(&aid.to_string());
+        }
+        for aid in entry.agent_ids.values() {
+            self.agent_index.insert(aid.to_string(), instance_id);
+        }
         Ok(())
     }
 
     /// Backward-compatible: set a single agent ID under the "main" role.
     pub fn set_agent(&self, instance_id: Uuid, agent_id: AgentId) -> HandResult<()> {
         let mut map = BTreeMap::new();
-        map.insert("main".to_string(), agent_id);
-        self.set_agents(instance_id, map, Some("main".to_string()))
+        let key = "main".to_string();
+        map.insert(key.clone(), agent_id);
+        self.set_agents(instance_id, map, Some(key))
     }
 
-    /// Find the hand instance associated with an agent (checks all roles).
+    /// Find the hand instance associated with an agent (O(1) via reverse index).
     pub fn find_by_agent(&self, agent_id: AgentId) -> Option<HandInstance> {
-        for entry in self.instances.iter() {
-            if entry.agent_ids.values().any(|&id| id == agent_id) {
-                return Some(entry.clone());
-            }
-        }
-        None
+        let instance_id = self.agent_index.get(&agent_id.to_string())?;
+        self.instances.get(instance_id.value()).map(|e| e.value().clone())
     }
 
     /// List all active hand instances.
@@ -607,13 +756,7 @@ impl HandRegistry {
 
     /// Mark an instance as errored.
     pub fn set_error(&self, instance_id: Uuid, message: String) -> HandResult<()> {
-        let mut entry = self
-            .instances
-            .get_mut(&instance_id)
-            .ok_or(HandError::InstanceNotFound(instance_id))?;
-        entry.status = HandStatus::Error(message);
-        entry.updated_at = chrono::Utc::now();
-        Ok(())
+        self.set_status(instance_id, HandStatus::Error(message))
     }
 
     /// Compute readiness for a hand, cross-referencing requirements with
@@ -633,11 +776,8 @@ impl HandRegistry {
             .filter(|(req, _)| !req.optional)
             .all(|(_, ok)| *ok);
 
-        // A hand is active if at least one instance is in Active status.
-        let active = self
-            .instances
-            .iter()
-            .any(|entry| entry.hand_id == hand_id && entry.status == HandStatus::Active);
+        // A hand is active if at least one instance is in Active status (O(1) via index).
+        let active = self.active_index.contains_key(hand_id);
 
         // Degraded: active, but any requirement (including optional) is unmet.
         let degraded = active && reqs.iter().any(|(_, ok)| !ok);
@@ -662,12 +802,6 @@ pub struct HandReadiness {
     /// This means the hand is running in a degraded mode — some features
     /// may not work (e.g. browser hand without chromium).
     pub degraded: bool,
-}
-
-impl Default for HandRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// Check if a single requirement is satisfied.
@@ -712,27 +846,34 @@ fn check_requirement(req: &HandRequirement) -> bool {
     }
 }
 
+/// Cached result of Python 3 availability check.
+static PYTHON3_CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 /// Check if Python 3 is actually available by running the command and checking
 /// the version output. This avoids false negatives from Windows Store shims
 /// (python3.exe that just opens the Microsoft Store) and false positives from
 /// Python 2 installations where `python` exists but is Python 2.
+///
+/// The result is cached for the lifetime of the process using `OnceLock`.
 fn check_python3_available() -> bool {
-    // Try "python3 --version" first (Linux/macOS, some Windows installs)
-    if run_returns_python3("python3") {
-        return true;
-    }
-    // Try "python --version" (Windows commonly uses this, Docker containers too)
-    if run_returns_python3("python") {
-        return true;
-    }
-    // Fallback: try well-known absolute paths (handles cases where PATH is
-    // minimal, e.g. inside Docker containers or cron jobs on Linux).
-    for path in &["/usr/bin/python3", "/usr/local/bin/python3"] {
-        if run_returns_python3(path) {
+    *PYTHON3_CACHED.get_or_init(|| {
+        // Try "python3 --version" first (Linux/macOS, some Windows installs)
+        if run_returns_python3("python3") {
             return true;
         }
-    }
-    false
+        // Try "python --version" (Windows commonly uses this, Docker containers too)
+        if run_returns_python3("python") {
+            return true;
+        }
+        // Fallback: try well-known absolute paths (handles cases where PATH is
+        // minimal, e.g. inside Docker containers or cron jobs on Linux).
+        for path in &["/usr/bin/python3", "/usr/local/bin/python3"] {
+            if run_returns_python3(path) {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 /// Run `{cmd} --version` and return true if the output contains "Python 3".
@@ -763,22 +904,21 @@ fn run_returns_python3(cmd: &str) -> bool {
 /// treated as the current directory per POSIX convention.
 fn which_binary(name: &str) -> bool {
     let path_var = std::env::var("PATH").unwrap_or_default();
-    let separator = if cfg!(windows) { ';' } else { ':' };
     let extensions: Vec<&str> = if cfg!(windows) {
         vec!["", ".exe", ".cmd", ".bat"]
     } else {
         vec![""]
     };
 
-    for raw_dir in path_var.split(separator) {
+    for raw_dir in std::env::split_paths(&path_var) {
         // POSIX: empty PATH segment means current directory.
-        let dir = if raw_dir.is_empty() && !cfg!(windows) {
-            "."
+        let dir = if raw_dir.as_os_str().is_empty() && !cfg!(windows) {
+            std::path::PathBuf::from(".")
         } else {
             raw_dir
         };
         for ext in &extensions {
-            let candidate = std::path::Path::new(dir).join(format!("{name}{ext}"));
+            let candidate = dir.join(format!("{name}{ext}"));
             if candidate.is_file() && is_executable(&candidate) {
                 return true;
             }
@@ -804,28 +944,26 @@ fn is_executable(path: &std::path::Path) -> bool {
     }
 }
 
+/// Return alternative environment variable names for a given env var.
+/// Used to support aliases (e.g. GEMINI_API_KEY also accepts GOOGLE_API_KEY).
+fn env_aliases(env: &str) -> Vec<&str> {
+    match env {
+        "GEMINI_API_KEY" => vec![env, "GOOGLE_API_KEY"],
+        _ => vec![env],
+    }
+}
+
 /// Check if a setting option is available based on its provider_env and binary.
 ///
 /// - No provider_env and no binary → always available (e.g. "auto", "none")
-/// - provider_env set → check if env var is non-empty (special case: GEMINI_API_KEY also checks GOOGLE_API_KEY)
+/// - provider_env set → check if env var (or any alias) is non-empty
 /// - binary set → check if binary is on PATH
 fn check_option_available(provider_env: Option<&str>, binary: Option<&str>) -> bool {
     let env_ok = match provider_env {
         None => true,
-        Some(env) => {
-            let direct = std::env::var(env).map(|v| !v.is_empty()).unwrap_or(false);
-            if direct {
-                return binary.map(which_binary).unwrap_or(true);
-            }
-            // Gemini special case: also accept GOOGLE_API_KEY
-            if env == "GEMINI_API_KEY" {
-                std::env::var("GOOGLE_API_KEY")
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false)
-            } else {
-                false
-            }
-        }
+        Some(env) => env_aliases(env)
+            .iter()
+            .any(|e| std::env::var(e).map(|v| !v.is_empty()).unwrap_or(false)),
     };
 
     if !env_ok {
@@ -1064,6 +1202,7 @@ system_prompt = "Test prompt"
         let _ = has_something;
     }
 
+    #[serial_test::serial]
     #[test]
     fn env_var_requirement_check() {
         std::env::set_var("LIBREFANG_TEST_HAND_REQ", "test_value");
@@ -1328,13 +1467,13 @@ metrics = []
 
         let custom_id = Uuid::new_v4();
         let instance = reg
-            .activate_with_id("clip", HashMap::new(), Some(custom_id))
+            .activate_with_id("clip", HashMap::new(), Some(custom_id), None)
             .unwrap();
         assert_eq!(instance.instance_id, custom_id);
         assert_eq!(instance.hand_id, "clip");
 
         // Re-activate with same UUID should fail
-        let dup = reg.activate_with_id("clip", HashMap::new(), Some(custom_id));
+        let dup = reg.activate_with_id("clip", HashMap::new(), Some(custom_id), None);
         assert!(dup.is_err());
 
         reg.deactivate(custom_id).unwrap();
@@ -1393,7 +1532,7 @@ metrics = []
 
         let custom_id = Uuid::new_v4();
         let _instance = reg
-            .activate_with_id("clip", HashMap::new(), Some(custom_id))
+            .activate_with_id("clip", HashMap::new(), Some(custom_id), None)
             .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1472,6 +1611,7 @@ metrics = []
         assert_eq!(statuses_zh[0].description, "选择提供商");
     }
 
+    #[serial_test::serial]
     #[test]
     fn check_option_available_env_and_binary() {
         // No env, no binary → always available

@@ -354,7 +354,7 @@ fn test_hand_state_persistence() {
     let state_json = std::fs::read_to_string(&state_path).unwrap();
     let state: serde_json::Value = serde_json::from_str(&state_json).unwrap();
 
-    assert_eq!(state["version"], 3, "State should be version 3");
+    assert_eq!(state["version"], 4, "State should be version 4");
     let instances = state["instances"].as_array().unwrap();
     assert_eq!(instances.len(), 1);
 
