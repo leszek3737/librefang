@@ -3911,7 +3911,7 @@ system_prompt = "You are a helpful assistant."
             // Snapshot config for the duration of the agent loop call
             // (load_full returns Arc so the data stays alive across .await).
             let loop_cfg = kernel_clone.config.load_full();
-            let loop_guard_cfg: LoopGuardConfig = loop_cfg.loop_guard.clone().into();
+            let loop_guard_cfg: LoopGuardConfig = loop_cfg.loop_guard.clone();
             let result = run_agent_loop_streaming(
                 &manifest,
                 &message_owned,
@@ -4943,7 +4943,7 @@ system_prompt = "You are a helpful assistant."
         let injection_rx = self.setup_injection_channel(agent_id);
 
         let start_time = std::time::Instant::now();
-        let loop_guard_cfg: LoopGuardConfig = cfg.loop_guard.clone().into();
+        let loop_guard_cfg: LoopGuardConfig = cfg.loop_guard.clone();
         let result = run_agent_loop(
             &manifest,
             &message_with_links,

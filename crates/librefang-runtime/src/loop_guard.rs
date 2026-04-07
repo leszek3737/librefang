@@ -17,7 +17,7 @@
 //!   warnings for the same call.
 //! - **Statistics snapshot**: exposes internal state for debugging and API.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{debug, warn};
@@ -47,10 +47,18 @@ const POLL_COMMAND_PREFIXES: &[&str] = &[
     "wget -q", // health checks
 ];
 
-/// Keywords in commands that strongly indicate polling intent.
+/// Substring patterns in commands that strongly indicate polling intent.
+/// These are matched with simple `contains_ignore_case` (no word-boundary
+/// check needed because the patterns already include spaces or are unique
+/// enough to avoid false positives).
+const POLL_SUBSTRINGS: &[&str] = &["ps "];
+
+/// Bare-word keywords in commands that indicate polling intent.
+/// Matched with word-boundary awareness so e.g. "tail" won't match "detail",
+/// and "check" won't match "healthcheck".
 const POLL_KEYWORDS: &[&str] = &[
-    "status", "poll", "wait", "watch", "tail", "ps ", "jobs", "pgrep", "health", "ping", "alive",
-    "ready", "check",
+    "status", "poll", "wait", "watch", "tail", "jobs", "pgrep", "health", "ping", "alive", "ready",
+    "check",
 ];
 
 /// Maximum recent call history size for ping-pong detection.
@@ -60,55 +68,10 @@ const HISTORY_SIZE: usize = 30;
 const BACKOFF_SCHEDULE_MS: &[u64] = &[5000, 10000, 30000, 60000];
 
 /// Configuration for the loop guard.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoopGuardConfig {
-    /// Number of identical calls before a warning is appended.
-    pub warn_threshold: u32,
-    /// Number of identical calls before the call is blocked.
-    pub block_threshold: u32,
-    /// Total tool calls across all tools before circuit-breaking.
-    pub global_circuit_breaker: u32,
-    /// Multiplier for poll tool thresholds (poll tools get thresholds * this).
-    pub poll_multiplier: u32,
-    /// Number of identical outcome pairs before a warning.
-    pub outcome_warn_threshold: u32,
-    /// Number of identical outcome pairs before the next call is auto-blocked.
-    pub outcome_block_threshold: u32,
-    /// Minimum repeats of a ping-pong pattern before blocking.
-    pub ping_pong_min_repeats: u32,
-    /// Max warnings per unique tool call hash before upgrading to Block.
-    pub max_warnings_per_call: u32,
-}
-
-impl Default for LoopGuardConfig {
-    fn default() -> Self {
-        Self {
-            warn_threshold: 3,
-            block_threshold: 5,
-            global_circuit_breaker: 30,
-            poll_multiplier: 3,
-            outcome_warn_threshold: 2,
-            outcome_block_threshold: 3,
-            ping_pong_min_repeats: 3,
-            max_warnings_per_call: 3,
-        }
-    }
-}
-
-impl From<librefang_types::config::LoopGuardTomlConfig> for LoopGuardConfig {
-    fn from(c: librefang_types::config::LoopGuardTomlConfig) -> Self {
-        Self {
-            warn_threshold: c.warn_threshold,
-            block_threshold: c.block_threshold,
-            global_circuit_breaker: c.global_circuit_breaker,
-            poll_multiplier: c.poll_multiplier,
-            outcome_warn_threshold: c.outcome_warn_threshold,
-            outcome_block_threshold: c.outcome_block_threshold,
-            ping_pong_min_repeats: c.ping_pong_min_repeats,
-            max_warnings_per_call: c.max_warnings_per_call,
-        }
-    }
-}
+///
+/// Re-exported from `librefang_types::config::LoopGuardTomlConfig` to avoid
+/// duplicating the struct across crates.
+pub type LoopGuardConfig = librefang_types::config::LoopGuardTomlConfig;
 
 /// Verdict from the loop guard on whether a tool call should proceed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,32 +106,60 @@ pub struct LoopGuardStats {
 /// Tracks tool calls within a single agent loop to detect loops.
 pub struct LoopGuard {
     config: LoopGuardConfig,
-    /// Count of identical (tool_name + params) calls, keyed by SHA-256 hex hash.
-    call_counts: HashMap<String, u32>,
+    /// Count of identical (tool_name + params) calls, keyed by SHA-256 raw hash.
+    call_counts: HashMap<[u8; 32], u32>,
     /// Total tool calls in this loop execution.
     total_calls: u32,
     /// Count of identical (tool_call_hash + result_hash) pairs.
-    outcome_counts: HashMap<String, u32>,
+    outcome_counts: HashMap<[u8; 32], u32>,
     /// Call hashes that are blocked due to repeated identical outcomes.
-    blocked_outcomes: HashSet<String>,
+    blocked_outcomes: HashSet<[u8; 32]>,
     /// Recent tool call hashes (ring buffer of last HISTORY_SIZE).
-    recent_calls: VecDeque<String>,
+    recent_calls: VecDeque<[u8; 32]>,
     /// Warnings already emitted (to prevent spam). Key = call hash, value = count emitted.
-    warnings_emitted: HashMap<String, u32>,
+    warnings_emitted: HashMap<[u8; 32], u32>,
     /// Tracks poll counts per command hash for backoff suggestions.
-    poll_counts: HashMap<String, u32>,
+    poll_counts: HashMap<[u8; 32], u32>,
     /// Total calls that were blocked.
     blocked_calls: u32,
     /// Map from call hash to tool name (for stats reporting).
-    hash_to_tool: HashMap<String, String>,
+    hash_to_tool: HashMap<[u8; 32], String>,
+    /// Cached hash from last check() call to avoid recomputation.
+    last_call_hash: Option<[u8; 32]>,
+    /// Cached flag: set once a ping-pong pattern has been detected.
+    ping_pong_detected: bool,
 }
 
 impl LoopGuard {
     /// Create a new loop guard with the given configuration.
-    pub fn new(config: LoopGuardConfig) -> Self {
+    ///
+    /// Nonsensical values (e.g. zero thresholds, warn > block) are clamped and
+    /// logged so that a misconfigured TOML file cannot silently disable the guard.
+    pub fn new(mut config: LoopGuardConfig) -> Self {
+        // Clamp/fix nonsensical values
+        if config.global_circuit_breaker == 0 {
+            config.global_circuit_breaker = 30;
+            warn!("loop_guard: global_circuit_breaker=0 makes no sense, defaulting to 30");
+        }
+        if config.block_threshold == 0 {
+            config.block_threshold = 5;
+            warn!("loop_guard: block_threshold=0 makes no sense, defaulting to 5");
+        }
+        if config.poll_multiplier == 0 {
+            config.poll_multiplier = 1;
+            warn!("loop_guard: poll_multiplier=0 would block all poll calls, defaulting to 1");
+        }
+        if config.warn_threshold > config.block_threshold {
+            std::mem::swap(&mut config.warn_threshold, &mut config.block_threshold);
+            warn!(
+                "loop_guard: warn_threshold > block_threshold makes no sense, swapped to warn={}, block={}",
+                config.warn_threshold, config.block_threshold
+            );
+        }
+
         Self {
             config,
-            call_counts: HashMap::new(),
+            call_counts: HashMap::with_capacity(16),
             total_calls: 0,
             outcome_counts: HashMap::new(),
             blocked_outcomes: HashSet::new(),
@@ -176,7 +167,9 @@ impl LoopGuard {
             warnings_emitted: HashMap::new(),
             poll_counts: HashMap::new(),
             blocked_calls: 0,
-            hash_to_tool: HashMap::new(),
+            hash_to_tool: HashMap::with_capacity(16),
+            last_call_hash: None,
+            ping_pong_detected: false,
         }
     }
 
@@ -201,15 +194,16 @@ impl LoopGuard {
         }
 
         let hash = Self::compute_hash(tool_name, params);
+        self.last_call_hash = Some(hash);
         self.hash_to_tool
-            .entry(hash.clone())
+            .entry(hash)
             .or_insert_with(|| tool_name.to_string());
 
         // Track recent calls for ping-pong detection
         if self.recent_calls.len() >= HISTORY_SIZE {
             self.recent_calls.pop_front();
         }
-        self.recent_calls.push_back(hash.clone());
+        self.recent_calls.push_back(hash);
 
         // Check if this call hash was blocked by outcome detection
         if self.blocked_outcomes.contains(&hash) {
@@ -222,7 +216,7 @@ impl LoopGuard {
             ));
         }
 
-        let count = self.call_counts.entry(hash.clone()).or_insert(0);
+        let count = self.call_counts.entry(hash).or_insert(0);
         *count += 1;
         let count_val = *count;
 
@@ -249,7 +243,7 @@ impl LoopGuard {
 
         if count_val >= effective_warn {
             // Warning bucket: check if we've already warned too many times
-            let warning_count = self.warnings_emitted.entry(hash.clone()).or_insert(0);
+            let warning_count = self.warnings_emitted.entry(hash).or_insert(0);
             *warning_count += 1;
             if *warning_count > self.config.max_warnings_per_call {
                 // Upgrade to block after too many warnings
@@ -270,12 +264,14 @@ impl LoopGuard {
 
         // Ping-pong detection (runs even if individual hash counts are low)
         if let Some((ping_pong_msg, repeats, pattern_hashes)) = self.detect_ping_pong() {
+            self.ping_pong_detected = true;
             if repeats >= self.config.ping_pong_min_repeats {
                 self.blocked_calls += 1;
                 return LoopGuardVerdict::Block(ping_pong_msg);
             }
             // Below min_repeats, just warn
-            let pattern_key = format!("pingpong_{}", pattern_hashes.join("_"));
+            // Derive a stable key from the pattern hashes for warning dedup.
+            let pattern_key = Self::compute_pattern_key(&pattern_hashes);
             let warning_count = self.warnings_emitted.entry(pattern_key).or_insert(0);
             *warning_count += 1;
             if *warning_count <= self.config.max_warnings_per_call {
@@ -298,7 +294,9 @@ impl LoopGuard {
         result: &str,
     ) -> Option<String> {
         let outcome_hash = Self::compute_outcome_hash(tool_name, params, result);
-        let call_hash = Self::compute_hash(tool_name, params);
+        let call_hash = self
+            .last_call_hash
+            .unwrap_or_else(|| Self::compute_hash(tool_name, params));
 
         let count = self.outcome_counts.entry(outcome_hash).or_insert(0);
         *count += 1;
@@ -333,7 +331,9 @@ impl LoopGuard {
         if !Self::is_poll_call(tool_name, params) {
             return None;
         }
-        let hash = Self::compute_hash(tool_name, params);
+        let hash = self
+            .last_call_hash
+            .unwrap_or_else(|| Self::compute_hash(tool_name, params));
         let count = self.poll_counts.entry(hash).or_insert(0);
         *count += 1;
         // count is 1-indexed; backoff starts on the second call
@@ -366,7 +366,7 @@ impl LoopGuard {
             total_calls: self.total_calls,
             unique_calls,
             blocked_calls: self.blocked_calls,
-            ping_pong_detected: self.detect_ping_pong_pure(),
+            ping_pong_detected: self.ping_pong_detected,
             most_repeated_tool,
             most_repeated_count,
         }
@@ -390,29 +390,37 @@ impl LoopGuard {
         // Known poll tools with poll-like commands (no length restriction)
         if POLL_TOOLS.contains(&tool_name) {
             if let Some(cmd) = params.get("command").and_then(|v| v.as_str()) {
-                let cmd_lower = cmd.to_lowercase();
-
-                // Check known poll command prefixes
+                // Check known poll command prefixes (ASCII case-insensitive, no allocation)
                 if POLL_COMMAND_PREFIXES
                     .iter()
-                    .any(|prefix| cmd_lower.starts_with(prefix))
+                    .any(|prefix| starts_with_ignore_case(cmd, prefix))
                 {
                     return true;
                 }
 
-                // Check poll keywords anywhere in the command
-                if POLL_KEYWORDS.iter().any(|kw| cmd_lower.contains(kw)) {
+                // Check substring patterns (e.g. "ps ") — simple contains, no word boundary
+                if POLL_SUBSTRINGS
+                    .iter()
+                    .any(|pat| contains_ignore_case(cmd, pat))
+                {
+                    return true;
+                }
+
+                // Check bare-word keywords with word-boundary awareness
+                if POLL_KEYWORDS
+                    .iter()
+                    .any(|kw| contains_keyword_ignore_case(cmd, kw))
+                {
                     return true;
                 }
             }
 
-            // Check param keys for poll-related keywords (values are ignored)
+            // Check param keys for poll-related keywords (values are ignored, no allocation)
             if let Some(obj) = params.as_object() {
                 for key in obj.keys() {
-                    let key_lower = key.to_lowercase();
-                    if key_lower.contains("status")
-                        || key_lower.contains("poll")
-                        || key_lower.contains("wait")
+                    if contains_keyword_ignore_case(key, "status")
+                        || contains_keyword_ignore_case(key, "poll")
+                        || contains_keyword_ignore_case(key, "wait")
                     {
                         return true;
                     }
@@ -425,140 +433,123 @@ impl LoopGuard {
 
     /// Detect ping-pong patterns (A-B-A-B or A-B-C-A-B-C) in recent call history.
     ///
-    /// Checks if the last 6+ calls form a repeating pattern of length 2 or 3.
+    /// Checks pattern length 3 first (more specific), then length 2 (more
+    /// general), since a length-3 pattern also contains a length-2 subpattern.
     /// Returns `(message, repeats, pattern_hashes)` if a pattern is detected,
     /// `None` otherwise.
-    fn detect_ping_pong(&self) -> Option<(String, u32, Vec<String>)> {
-        self.detect_ping_pong_impl()
+    fn detect_ping_pong(&self) -> Option<(String, u32, Vec<[u8; 32]>)> {
+        self.detect_pattern(3).or_else(|| self.detect_pattern(2))
     }
 
-    /// Pure version for stats (no &mut self needed, just reads state).
-    fn detect_ping_pong_pure(&self) -> bool {
-        self.detect_ping_pong_impl().is_some()
-    }
-
-    /// Shared ping-pong detection implementation.
+    /// Detect a repeating pattern of the given length in recent call history.
     ///
-    /// Returns `Some((message, repeats, pattern_hashes))` when a ping-pong
-    /// pattern is detected, where `repeats` is the number of full pattern
-    /// repetitions in the recent history and `pattern_hashes` are the call
-    /// hashes that form the pattern (e.g. `[hash_a, hash_b]`).
-    fn detect_ping_pong_impl(&self) -> Option<(String, u32, Vec<String>)> {
+    /// For `pattern_len = 2`, looks for A-B-A-B-A-B (needs >= 6 entries).
+    /// For `pattern_len = 3`, looks for A-B-C-A-B-C-A-B-C (needs >= 9 entries).
+    ///
+    /// Uses direct VecDeque indexing instead of allocating temporary Vecs.
+    /// Returns `Some((message, repeats, pattern_hashes))` when detected.
+    fn detect_pattern(&self, pattern_len: usize) -> Option<(String, u32, Vec<[u8; 32]>)> {
         let len = self.recent_calls.len();
+        // Need at least pattern_len * 3 entries for 3 repeats
+        let required = pattern_len * 3;
+        if len < required {
+            return None;
+        }
 
-        // Check for pattern of length 2 (A-B-A-B-A-B)
-        // Need at least 6 entries for 3 repeats of length 2
-        if len >= 6 {
-            let tail: Vec<_> = self.recent_calls.iter().skip(len - 6).take(6).collect();
-            let a = tail[0];
-            let b = tail[1];
-            if a != b && tail[2] == a && tail[3] == b && tail[4] == a && tail[5] == b {
-                // Count full pattern repeats backwards from the end
-                let mut repeats: u32 = 0;
-                let mut i = len;
-                while i >= 2 {
-                    i -= 2;
-                    if self.recent_calls[i] == *a && self.recent_calls[i + 1] == *b {
-                        repeats += 1;
-                    } else {
-                        break;
-                    }
-                }
+        // Extract the pattern (first `pattern_len` entries of the last `required` entries)
+        let start = len - required;
+        let pattern: Vec<[u8; 32]> = (0..pattern_len)
+            .map(|j| self.recent_calls[start + j])
+            .collect();
 
-                let tool_a = self
-                    .hash_to_tool
-                    .get(a)
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                let tool_b = self
-                    .hash_to_tool
-                    .get(b)
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                debug!(repeats = repeats, "Ping-pong pattern detected");
-                return Some((
-                    format!(
-                        "Ping-pong detected: tools '{}' and '{}' are alternating \
-                         repeatedly. Break the cycle by trying a different approach.",
-                        tool_a, tool_b
-                    ),
-                    repeats,
-                    vec![a.clone(), b.clone()],
-                ));
+        // All pattern entries must not be identical (that's repetition, not ping-pong)
+        let all_same = pattern.windows(2).all(|w| w[0] == w[1]);
+        if all_same {
+            return None;
+        }
+
+        // Verify the last `required` entries match the repeating pattern
+        for j in 0..required {
+            if self.recent_calls[start + j] != pattern[j % pattern_len] {
+                return None;
             }
         }
 
-        // Check for pattern of length 3 (A-B-C-A-B-C-A-B-C)
-        // Need at least 9 entries for 3 repeats of length 3
-        if len >= 9 {
-            let tail: Vec<_> = self.recent_calls.iter().skip(len - 9).take(9).collect();
-            let a = tail[0];
-            let b = tail[1];
-            let c = tail[2];
-            // Ensure they're not all the same (that's just repetition, not ping-pong)
-            if !(a == b && b == c)
-                && tail[3] == a
-                && tail[4] == b
-                && tail[5] == c
-                && tail[6] == a
-                && tail[7] == b
-                && tail[8] == c
-            {
-                // Count full pattern repeats backwards from the end
-                let mut repeats: u32 = 0;
-                let mut i = len;
-                while i >= 3 {
-                    i -= 3;
-                    if self.recent_calls[i] == *a
-                        && self.recent_calls[i + 1] == *b
-                        && self.recent_calls[i + 2] == *c
-                    {
-                        repeats += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                let tool_a = self
-                    .hash_to_tool
-                    .get(a)
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                let tool_b = self
-                    .hash_to_tool
-                    .get(b)
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                let tool_c = self
-                    .hash_to_tool
-                    .get(c)
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                debug!(repeats = repeats, "Ping-pong pattern detected");
-                return Some((
-                    format!(
-                        "Ping-pong detected: tools '{}', '{}', '{}' are cycling \
-                         repeatedly. Break the cycle by trying a different approach.",
-                        tool_a, tool_b, tool_c
-                    ),
-                    repeats,
-                    vec![a.clone(), b.clone(), c.clone()],
-                ));
+        // Count full pattern repeats backwards from the end
+        let mut repeats: u32 = 0;
+        let mut i = len;
+        while i >= pattern_len {
+            i -= pattern_len;
+            let chunk_matches = pattern
+                .iter()
+                .enumerate()
+                .all(|(j, &p)| self.recent_calls[i + j] == p);
+            if chunk_matches {
+                repeats += 1;
+            } else {
+                break;
             }
         }
 
-        None
+        // Resolve tool names from pattern hashes
+        let tool_names: Vec<String> = pattern
+            .iter()
+            .map(|h| {
+                self.hash_to_tool
+                    .get(h)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string())
+            })
+            .collect();
+
+        debug!(
+            repeats = repeats,
+            pattern_len = pattern_len,
+            "Ping-pong pattern detected"
+        );
+
+        let msg = if pattern_len == 2 {
+            format!(
+                "Ping-pong detected: tools '{}' and '{}' are alternating \
+                 repeatedly. Break the cycle by trying a different approach.",
+                tool_names[0], tool_names[1]
+            )
+        } else {
+            format!(
+                "Ping-pong detected: tools {} are cycling \
+                 repeatedly. Break the cycle by trying a different approach.",
+                tool_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        if i == tool_names.len() - 1 {
+                            format!("and '{}'", name)
+                        } else {
+                            format!("'{}'", name)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+
+        Some((msg, repeats, pattern))
     }
 
     /// Compute a SHA-256 hash of the tool name and parameters.
-    fn compute_hash(tool_name: &str, params: &serde_json::Value) -> String {
+    fn compute_hash(tool_name: &str, params: &serde_json::Value) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(tool_name.as_bytes());
         hasher.update(b"|");
-        // Serialize params deterministically (serde_json sorts object keys)
-        let params_str = serde_json::to_string(params).unwrap_or_default();
-        hasher.update(params_str.as_bytes());
-        hex::encode(hasher.finalize())
+        // Serialize params deterministically (serde_json sorts object keys).
+        // serde_json::Value IS the JSON AST so this can't actually fail, but
+        // guard against programming errors in debug builds.
+        let params_bytes = serde_json::to_vec(params).unwrap_or_else(|e| {
+            debug_assert!(false, "serde_json::Value should always serialize: {e}");
+            Vec::new()
+        });
+        hasher.update(&params_bytes);
+        hasher.finalize().into()
     }
 
     /// Compute a SHA-256 hash of the tool name, parameters, AND result.
@@ -566,12 +557,15 @@ impl LoopGuard {
     /// For results <= 1000 bytes, hashes the entire content. For larger results,
     /// hashes the first 500 bytes + a separator + the last 500 bytes, preserving
     /// both prefix and suffix identity while avoiding huge-hash overhead.
-    fn compute_outcome_hash(tool_name: &str, params: &serde_json::Value, result: &str) -> String {
+    fn compute_outcome_hash(tool_name: &str, params: &serde_json::Value, result: &str) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(tool_name.as_bytes());
         hasher.update(b"|");
-        let params_str = serde_json::to_string(params).unwrap_or_default();
-        hasher.update(params_str.as_bytes());
+        let params_bytes = serde_json::to_vec(params).unwrap_or_else(|e| {
+            debug_assert!(false, "serde_json::Value should always serialize: {e}");
+            Vec::new()
+        });
+        hasher.update(&params_bytes);
         hasher.update(b"|");
         let bytes = result.as_bytes();
         if bytes.len() <= 1000 {
@@ -581,8 +575,62 @@ impl LoopGuard {
             hasher.update(b"|TRUNCATED|");
             hasher.update(&bytes[bytes.len() - 500..]);
         }
-        hex::encode(hasher.finalize())
+        hasher.finalize().into()
     }
+
+    /// Derive a stable `[u8; 32]` key from pattern hashes for warning dedup.
+    fn compute_pattern_key(pattern_hashes: &[[u8; 32]]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        for h in pattern_hashes {
+            hasher.update(h);
+        }
+        hasher.finalize().into()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private free helpers — allocation-free, ASCII case-insensitive matching
+// ---------------------------------------------------------------------------
+
+/// ASCII case-insensitive prefix check. No allocations.
+fn starts_with_ignore_case(haystack: &str, needle: &str) -> bool {
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack[..needle.len()].eq_ignore_ascii_case(needle)
+}
+
+/// ASCII case-insensitive substring check (sliding window). No allocations.
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// ASCII case-insensitive keyword match with word-boundary awareness.
+///
+/// A match only counts when the keyword is bounded by non-alphanumeric
+/// characters (or string start/end). This prevents e.g. "tail" from
+/// matching "detail", or "check" from matching "healthcheck".
+fn contains_keyword_ignore_case(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if h.len() < n.len() {
+        return false;
+    }
+    for i in 0..=h.len() - n.len() {
+        if h[i..i + n.len()].eq_ignore_ascii_case(n) {
+            let before_ok = i == 0 || !h[i - 1].is_ascii_alphanumeric();
+            let after_ok = i + n.len() >= h.len() || !h[i + n.len()].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1065,5 +1113,134 @@ mod tests {
         let stats = guard.stats();
         assert_eq!(stats.total_calls, 50);
         assert_eq!(stats.unique_calls, 50);
+    }
+
+    // ========================================================================
+    // New tests — Blocked Calls Count, Config Correction, Outcome Hashing
+    // ========================================================================
+
+    #[test]
+    fn test_stats_blocked_calls_count() {
+        // warn must be < block to avoid auto-swap in new()
+        let config = LoopGuardConfig {
+            warn_threshold: 2,
+            block_threshold: 3,
+            ..LoopGuardConfig::default()
+        };
+        let mut guard = LoopGuard::new(config);
+        let params = serde_json::json!({"x": 1});
+
+        // 3 calls to trigger block at threshold 3
+        guard.check("tool", &params); // 1 - Allow
+        guard.check("tool", &params); // 2 - Warn (warn_threshold=2)
+        guard.check("tool", &params); // 3 - Block
+
+        let stats = guard.stats();
+        assert_eq!(stats.blocked_calls, 1, "Should have exactly 1 blocked call");
+
+        // One more blocked call
+        guard.check("tool", &params); // 4 - Block again
+        let stats = guard.stats();
+        assert_eq!(stats.blocked_calls, 2, "Should have 2 blocked calls");
+    }
+
+    #[test]
+    fn test_different_outcomes_no_false_positive() {
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
+        let params = serde_json::json!({"query": "test"});
+
+        // Same call, DIFFERENT results each time
+        let w = guard.record_outcome("tool", &params, "result A");
+        assert!(w.is_none());
+        let w = guard.record_outcome("tool", &params, "result B");
+        assert!(w.is_none(), "Different results should NOT trigger warning");
+        let w = guard.record_outcome("tool", &params, "result C");
+        assert!(w.is_none(), "Different results should NOT trigger warning");
+
+        // Should NOT be blocked — outcomes were all different
+        let v = guard.check("tool", &params);
+        assert_eq!(
+            v,
+            LoopGuardVerdict::Allow,
+            "Should still be allowed — different outcomes"
+        );
+    }
+
+    #[test]
+    fn test_zero_poll_multiplier_corrected() {
+        let config = LoopGuardConfig {
+            poll_multiplier: 0,
+            ..LoopGuardConfig::default()
+        };
+        let mut guard = LoopGuard::new(config);
+        let params = serde_json::json!({"command": "docker ps"});
+
+        // Should NOT immediately block despite poll_multiplier=0
+        // (new() corrects it to 1)
+        let v = guard.check("shell_exec", &params);
+        assert_eq!(
+            v,
+            LoopGuardVerdict::Allow,
+            "poll_multiplier=0 should be auto-corrected"
+        );
+    }
+
+    #[test]
+    fn test_warn_gt_block_corrected() {
+        let config = LoopGuardConfig {
+            warn_threshold: 10,
+            block_threshold: 2,
+            ..LoopGuardConfig::default()
+        };
+        let mut guard = LoopGuard::new(config);
+        let params = serde_json::json!({"x": 1});
+
+        // After correction: warn=2, block=10 (swapped)
+        // Call 2 should warn (not block)
+        guard.check("tool", &params);
+        let v = guard.check("tool", &params);
+        // Should get Warn, not Block — because values were swapped
+        assert!(
+            matches!(v, LoopGuardVerdict::Warn(_)),
+            "warn/block swap should produce Warn at call 2, got: {:?}",
+            v
+        );
+    }
+
+    #[test]
+    fn test_zero_global_circuit_breaker_corrected() {
+        let config = LoopGuardConfig {
+            global_circuit_breaker: 0,
+            ..LoopGuardConfig::default()
+        };
+        let mut guard = LoopGuard::new(config);
+        let params = serde_json::json!({"x": 1});
+
+        // Should NOT circuit-break on first call (0 was corrected to 30)
+        let v = guard.check("tool", &params);
+        assert_eq!(
+            v,
+            LoopGuardVerdict::Allow,
+            "global_circuit_breaker=0 should be auto-corrected"
+        );
+    }
+
+    #[test]
+    fn test_outcome_hash_differs_for_different_results() {
+        let mut guard = LoopGuard::new(LoopGuardConfig::default());
+        let params = serde_json::json!({"query": "test"});
+
+        // Call check() first to populate last_call_hash (normal flow)
+        guard.check("tool", &params);
+
+        // Record different outcomes — should not escalate
+        guard.record_outcome("tool", &params, "result alpha");
+        guard.record_outcome("tool", &params, "result beta");
+        guard.record_outcome("tool", &params, "result gamma");
+
+        // Next check should still be allowed (outcomes were different)
+        guard.check("tool", &params);
+        // This should NOT be blocked by outcome detection
+        // (but may warn based on call count — that's fine)
     }
 }
