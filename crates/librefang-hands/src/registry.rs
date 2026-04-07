@@ -1203,4 +1203,292 @@ system_prompt = "Test prompt"
         };
         assert!(!req.optional);
     }
+
+    #[test]
+    fn parse_hand_toml_wrapped_format() {
+        let wrapped_toml = r#"
+[hand]
+id = "wrapped-test"
+name = "Wrapped Test"
+description = "Test with [hand] wrapper"
+category = "content"
+
+[hand.agent]
+name = "wrapped-agent"
+description = "Test"
+system_prompt = "Test."
+
+[hand.dashboard]
+metrics = []
+"#;
+        let def = parse_hand_toml(wrapped_toml, "skill content").unwrap();
+        assert_eq!(def.id, "wrapped-test");
+        assert_eq!(def.name, "Wrapped Test");
+        assert_eq!(def.skill_content.as_deref(), Some("skill content"));
+    }
+
+    #[test]
+    fn parse_hand_toml_flat_format_with_skill() {
+        let flat_toml = r#"
+id = "flat-test"
+name = "Flat Test"
+description = "Flat format"
+category = "data"
+
+[agent]
+name = "flat-agent"
+description = "Test"
+system_prompt = "Test."
+
+[dashboard]
+metrics = []
+"#;
+        let def = parse_hand_toml(flat_toml, "").unwrap();
+        assert_eq!(def.id, "flat-test");
+        assert!(def.skill_content.is_none());
+    }
+
+    #[test]
+    fn parse_hand_toml_invalid_toml() {
+        let result = parse_hand_toml("this is not valid toml [[[[", "");
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), HandError::TomlParse(_)));
+    }
+
+    #[test]
+    fn install_from_content_in_memory() {
+        let reg = HandRegistry::new();
+        let toml_content = r#"
+id = "memory-hand"
+name = "Memory Hand"
+description = "In-memory install"
+category = "data"
+
+[agent]
+name = "mem-agent"
+description = "Test"
+system_prompt = "Test."
+
+[dashboard]
+metrics = []
+"#;
+        let def = reg.install_from_content(toml_content, "").unwrap();
+        assert_eq!(def.id, "memory-hand");
+        assert!(reg.get_definition("memory-hand").is_some());
+
+        // Duplicate should fail
+        let dup = reg.install_from_content(toml_content, "");
+        assert!(dup.is_err());
+        assert!(matches!(dup.unwrap_err(), HandError::AlreadyRegistered(_)));
+    }
+
+    #[test]
+    fn install_from_path_from_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hand_toml = r#"
+id = "path-hand"
+name = "Path Hand"
+description = "Installed from dir"
+category = "productivity"
+
+[agent]
+name = "path-agent"
+description = "Test"
+system_prompt = "Test."
+
+[dashboard]
+metrics = []
+"#;
+        std::fs::write(tmp.path().join("HAND.toml"), hand_toml).unwrap();
+        std::fs::write(tmp.path().join("SKILL.md"), "# Skill content").unwrap();
+
+        let reg = HandRegistry::new();
+        let def = reg.install_from_path(tmp.path()).unwrap();
+        assert_eq!(def.id, "path-hand");
+        assert_eq!(def.skill_content.as_deref(), Some("# Skill content"));
+        assert!(reg.get_definition("path-hand").is_some());
+
+        // Duplicate from path should fail
+        let dup = reg.install_from_path(tmp.path());
+        assert!(dup.is_err());
+    }
+
+    #[test]
+    fn install_from_path_missing_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = HandRegistry::new();
+        let result = reg.install_from_path(tmp.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn activate_with_explicit_instance_id() {
+        let reg = HandRegistry::new();
+        reg.reload_from_disk(&ensure_test_home());
+
+        let custom_id = Uuid::new_v4();
+        let instance = reg
+            .activate_with_id("clip", HashMap::new(), Some(custom_id))
+            .unwrap();
+        assert_eq!(instance.instance_id, custom_id);
+        assert_eq!(instance.hand_id, "clip");
+
+        // Re-activate with same UUID should fail
+        let dup = reg.activate_with_id("clip", HashMap::new(), Some(custom_id));
+        assert!(dup.is_err());
+
+        reg.deactivate(custom_id).unwrap();
+    }
+
+    #[test]
+    fn update_config_replaces_and_refreshes() {
+        let reg = HandRegistry::new();
+        reg.reload_from_disk(&ensure_test_home());
+
+        let instance = reg.activate("clip", HashMap::new()).unwrap();
+        let id = instance.instance_id;
+        let before = reg.get_instance(id).unwrap().updated_at;
+
+        let mut new_config = HashMap::new();
+        new_config.insert("key".to_string(), serde_json::json!("value"));
+        reg.update_config(id, new_config).unwrap();
+
+        let updated = reg.get_instance(id).unwrap();
+        assert_eq!(updated.config["key"], serde_json::json!("value"));
+        assert!(updated.updated_at >= before);
+
+        // Nonexistent instance
+        assert!(reg.update_config(Uuid::new_v4(), HashMap::new()).is_err());
+
+        reg.deactivate(id).unwrap();
+    }
+
+    #[test]
+    fn load_state_v1_bare_array_format() {
+        let path = std::env::temp_dir().join(format!("hand-state-v1-{}.json", Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            serde_json::json!([{
+                "hand_id": "lead",
+                "config": {},
+                "agent_id": serde_json::Value::Null,
+                "status": "Active",
+            }])
+            .to_string(),
+        )
+        .unwrap();
+
+        let restored = HandRegistry::load_state(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].hand_id, "lead");
+        assert!(matches!(restored[0].status, HandStatus::Active));
+    }
+
+    #[test]
+    fn load_state_v3_instance_id_roundtrip() {
+        let reg = HandRegistry::new();
+        reg.reload_from_disk(&ensure_test_home());
+
+        let custom_id = Uuid::new_v4();
+        let _instance = reg
+            .activate_with_id("clip", HashMap::new(), Some(custom_id))
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state_path = tmp.path().join("hand_state.json");
+        reg.persist_state(&state_path).unwrap();
+
+        let saved = HandRegistry::load_state(&state_path);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].instance_id, Some(custom_id));
+        assert_eq!(saved[0].hand_id, "clip");
+
+        reg.deactivate(custom_id).unwrap();
+    }
+
+    #[test]
+    fn check_settings_availability_basic() {
+        let reg = HandRegistry::new();
+        reg.reload_from_disk(&ensure_test_home());
+
+        // Clip hand has settings
+        let result = reg.check_settings_availability("clip", None);
+        assert!(result.is_ok());
+        let statuses = result.unwrap();
+        // Check structure — each SettingStatus has key, label, options
+        for s in &statuses {
+            assert!(!s.key.is_empty());
+            assert!(!s.label.is_empty());
+            // options don't have to be non-empty (toggle/text don't have options)
+        }
+    }
+
+    #[test]
+    fn check_settings_availability_with_i18n() {
+        let reg = HandRegistry::new();
+        let toml_content = r#"
+id = "i18n-hand"
+name = "I18n Hand"
+description = "Test"
+category = "content"
+
+[[settings]]
+key = "provider"
+label = "Provider"
+description = "Choose provider"
+setting_type = "select"
+default = "auto"
+
+[[settings.options]]
+value = "auto"
+label = "Auto"
+
+[i18n.zh]
+name = "国际化测试"
+
+[i18n.zh.settings.provider]
+label = "提供商"
+description = "选择提供商"
+
+[agent]
+name = "test-agent"
+description = "Test"
+system_prompt = "Test."
+
+[dashboard]
+metrics = []
+"#;
+        reg.install_from_content(toml_content, "").unwrap();
+
+        let statuses_en = reg.check_settings_availability("i18n-hand", None).unwrap();
+        assert_eq!(statuses_en[0].label, "Provider");
+
+        let statuses_zh = reg
+            .check_settings_availability("i18n-hand", Some("zh"))
+            .unwrap();
+        assert_eq!(statuses_zh[0].label, "提供商");
+        assert_eq!(statuses_zh[0].description, "选择提供商");
+    }
+
+    #[test]
+    fn check_option_available_env_and_binary() {
+        // No env, no binary → always available
+        assert!(check_option_available(None, None));
+
+        // Env var set
+        std::env::set_var("LIBREFANG_TEST_OPT_ENV", "yes");
+        assert!(check_option_available(Some("LIBREFANG_TEST_OPT_ENV"), None));
+        assert!(!check_option_available(
+            Some("LIBREFANG_NONEXISTENT_ENV_99999"),
+            None
+        ));
+        std::env::remove_var("LIBREFANG_TEST_OPT_ENV");
+
+        // Gemini fallback: GEMINI_API_KEY also checks GOOGLE_API_KEY
+        std::env::set_var("GOOGLE_API_KEY", "test-key");
+        assert!(check_option_available(Some("GEMINI_API_KEY"), None));
+        std::env::remove_var("GOOGLE_API_KEY");
+    }
 }

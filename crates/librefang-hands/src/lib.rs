@@ -1323,4 +1323,181 @@ metrics = []
         assert!(install.macos.is_none());
         assert!(install.windows.is_none());
     }
+
+    #[test]
+    fn hand_i18n_parsing() {
+        let toml_str = r#"
+id = "i18n-test"
+name = "Lead Generator"
+description = "Autonomous lead generation"
+category = "content"
+tools = []
+
+[[settings]]
+key = "target_industry"
+label = "Target Industry"
+description = "Industry to focus on"
+setting_type = "select"
+default = "tech"
+
+[[settings.options]]
+value = "tech"
+label = "Technology"
+
+[i18n.zh]
+name = "线索生成"
+description = "自主线索生成"
+
+[i18n.zh.agents.main]
+name = "主协调器"
+description = "协调各个子智能体完成任务"
+
+[i18n.zh.settings.target_industry]
+label = "目标行业"
+description = "聚焦的行业领域"
+
+[agent]
+name = "lead-agent"
+description = "Lead generation agent"
+system_prompt = "You generate leads."
+
+[dashboard]
+metrics = []
+"#;
+        let def: HandDefinition = toml::from_str(toml_str).unwrap();
+        assert!(def.i18n.contains_key("zh"));
+        assert_eq!(def.i18n["zh"].name, Some("线索生成".to_string()));
+        assert_eq!(def.i18n["zh"].description, Some("自主线索生成".to_string()));
+        assert_eq!(
+            def.i18n["zh"].agents["main"].name,
+            Some("主协调器".to_string())
+        );
+        assert_eq!(
+            def.i18n["zh"].settings["target_industry"].label,
+            Some("目标行业".to_string())
+        );
+    }
+
+    #[test]
+    fn hand_setting_i18n_defaults() {
+        let si = HandSettingI18n::default();
+        assert!(si.label.is_none());
+        assert!(si.description.is_none());
+
+        let ai = HandAgentI18n::default();
+        assert!(ai.name.is_none());
+        assert!(ai.description.is_none());
+
+        let hi = HandI18n::default();
+        assert!(hi.name.is_none());
+        assert!(hi.agents.is_empty());
+        assert!(hi.settings.is_empty());
+    }
+
+    #[test]
+    fn hand_instance_agent_id_backward_compat() {
+        let mut instance = HandInstance::new("clip", HashMap::new(), None);
+        // Brak agent_ids → agent_id() zwraca None
+        assert!(instance.agent_id().is_none());
+
+        let agent_id = AgentId::new();
+        instance.agent_ids.insert("main".to_string(), agent_id);
+        // Teraz agent_id() powinno zwrócić tego agenta
+        assert_eq!(instance.agent_id(), Some(agent_id));
+    }
+
+    #[test]
+    fn hand_metric_default_format() {
+        let toml_str = r#"
+id = "metric-test"
+name = "Metric Test"
+description = "Test"
+category = "data"
+tools = []
+
+[[dashboard.metrics]]
+label = "Items processed"
+memory_key = "items_count"
+
+[agent]
+name = "test-agent"
+description = "Test"
+system_prompt = "Test."
+"#;
+        let def: HandDefinition = toml::from_str(toml_str).unwrap();
+        assert_eq!(def.dashboard.metrics.len(), 1);
+        assert_eq!(def.dashboard.metrics[0].format, "number");
+        assert_eq!(def.dashboard.metrics[0].label, "Items processed");
+        assert_eq!(def.dashboard.metrics[0].memory_key, "items_count");
+    }
+
+    #[test]
+    fn hand_metadata_parsing() {
+        let toml_str = r#"
+id = "meta-test"
+name = "Meta Test"
+description = "Test"
+category = "productivity"
+tools = []
+
+[metadata]
+frequency = "periodic"
+token_consumption = "medium"
+default_active = true
+activation_warning = "This hand uses paid API calls"
+
+[agent]
+name = "test-agent"
+description = "Test"
+system_prompt = "Test."
+
+[dashboard]
+metrics = []
+"#;
+        let def: HandDefinition = toml::from_str(toml_str).unwrap();
+        let meta = def.metadata.as_ref().expect("metadata should be present");
+        assert_eq!(meta.frequency, "periodic");
+        assert_eq!(meta.token_consumption, "medium");
+        assert!(meta.default_active);
+        assert_eq!(meta.activation_warning, "This hand uses paid API calls");
+    }
+
+    #[test]
+    fn hand_routing_aliases() {
+        let toml_str = r#"
+id = "routing-test"
+name = "Routing Test"
+description = "Test"
+category = "content"
+tools = []
+
+[routing]
+aliases = ["video editor", "clip maker"]
+weak_aliases = ["cut video", "trim"]
+
+[agent]
+name = "test-agent"
+description = "Test"
+system_prompt = "Test."
+
+[dashboard]
+metrics = []
+"#;
+        let def: HandDefinition = toml::from_str(toml_str).unwrap();
+        assert_eq!(def.routing.aliases, vec!["video editor", "clip maker"]);
+        assert_eq!(def.routing.weak_aliases, vec!["cut video", "trim"]);
+    }
+
+    #[test]
+    fn activate_hand_request_deserialization() {
+        // With config
+        let req: ActivateHandRequest =
+            serde_json::from_str(r#"{"config": {"key": "value"}}"#).unwrap();
+        assert_eq!(req.config.len(), 1);
+        assert_eq!(req.config["key"], serde_json::json!("value"));
+
+        // Without config
+        let req: ActivateHandRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(req.config.is_empty());
+    }
 }
