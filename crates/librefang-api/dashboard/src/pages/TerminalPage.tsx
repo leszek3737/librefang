@@ -97,15 +97,25 @@ export function TerminalPage() {
     };
 
     ws.onerror = () => {
-      setError("WebSocket connection error");
+      setError(t("terminal.websocket_error"));
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event: CloseEvent) => {
       setIsConnected(false);
+
       if (intentionalDisconnectRef.current) {
         intentionalDisconnectRef.current = false;
         return;
       }
+
+      // Non-transient close codes: stop reconnecting
+      const isAppError = event.code >= 4000 && event.code <= 4999;
+      const isNonTransient = event.code === 1008 || event.code === 1011 || isAppError;
+      if (isNonTransient) {
+        setError(event.reason || t("terminal.connection_closed_non_recoverable"));
+        return;
+      }
+
       reconnectTimeoutRef.current = setTimeout(() => {
         if (
           wsRef.current === null ||
