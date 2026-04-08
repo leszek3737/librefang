@@ -1160,7 +1160,7 @@ after_turn = "hooks/{after_file}"
 
     info!(
         plugin = name,
-        runtime = %runtime_tag,
+        runtime = runtime_tag.as_ref(),
         "Scaffolded new plugin"
     );
     Ok(plugin_dir)
