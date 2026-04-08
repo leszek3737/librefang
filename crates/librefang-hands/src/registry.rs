@@ -48,6 +48,17 @@ struct HandTomlWrapper {
     hand: HandDefinition,
 }
 
+/// Resolve the agents registry directory from a home directory.
+/// Returns `Some(path)` if `{home_dir}/registry/agents/` exists and is a directory.
+fn resolve_agents_dir(home_dir: &Path) -> Option<std::path::PathBuf> {
+    let dir = home_dir.join("registry").join("agents");
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
 /// Parse a HAND.toml into a HandDefinition with its skill content attached.
 ///
 /// Accepts both formats:
@@ -56,72 +67,129 @@ struct HandTomlWrapper {
 pub fn parse_hand_toml(
     toml_content: &str,
     skill_content: &str,
+    agent_skill_content: HashMap<String, String>,
 ) -> Result<HandDefinition, HandError> {
-    let mut def: HandDefinition = toml::from_str::<HandDefinition>(toml_content)
-        .or_else(|flat_err| {
-            tracing::debug!("Flat parse failed for hand: {flat_err}");
-            toml::from_str::<HandTomlWrapper>(toml_content).map(|w| w.hand)
-        })
-        .map_err(|e| HandError::TomlParse(e.to_string()))?;
+    parse_hand_toml_with_agents_dir(toml_content, skill_content, agent_skill_content, None)
+}
+
+/// Parse HAND.toml with optional agent template resolution.
+///
+/// When `agents_dir` is provided, agents with a `base` field are resolved:
+/// the base agent template is loaded from `{agents_dir}/{base}/agent.toml`,
+/// and the hand's inline fields are deep-merged on top (hand wins).
+pub fn parse_hand_toml_with_agents_dir(
+    toml_content: &str,
+    skill_content: &str,
+    agent_skill_content: HashMap<String, String>,
+    agents_dir: Option<&std::path::Path>,
+) -> Result<HandDefinition, HandError> {
+    let mut def: HandDefinition = if agents_dir.is_some() {
+        // Use the filesystem-aware parser so `base` template references are
+        // resolved during agent construction (before AgentManifest parsing).
+        crate::parse_hand_definition(toml_content, agents_dir)
+            .or_else(|flat_err| {
+                tracing::warn!("Flat parse failed for hand: {flat_err}");
+                // Try wrapped format: fields under [hand] section.
+                // Extract the [hand] sub-table and re-serialize so that
+                // parse_hand_definition can resolve `base` templates with agents_dir.
+                let top: toml::Value = toml::from_str(toml_content)
+                    .map_err(|e| format!("Wrapped parse also failed: {e}"))?;
+                let hand_value = top
+                    .get("hand")
+                    .ok_or_else(|| "Wrapped parse also failed: no [hand] section".to_string())?;
+                let hand_toml = toml::to_string(hand_value)
+                    .map_err(|e| format!("Failed to re-serialize [hand] section: {e}"))?;
+                crate::parse_hand_definition(&hand_toml, agents_dir)
+                    .map_err(|e| format!("Wrapped parse also failed: {e}"))
+            })
+            .map_err(|e: String| HandError::TomlParse(e))?
+    } else {
+        // No agents_dir — use standard serde path (no base resolution).
+        toml::from_str::<HandDefinition>(toml_content)
+            .or_else(|flat_err| {
+                tracing::warn!("Flat parse failed for hand: {flat_err}");
+                toml::from_str::<HandTomlWrapper>(toml_content).map(|w| w.hand)
+            })
+            .map_err(|e| HandError::TomlParse(e.to_string()))?
+    };
     if !skill_content.is_empty() {
         def.skill_content = Some(skill_content.to_string());
+    }
+    if !agent_skill_content.is_empty() {
+        def.agent_skill_content = agent_skill_content;
     }
     Ok(def)
 }
 
-/// Result of scanning a hand directory.
-struct ScannedHand {
-    id: String,
-    toml_content: String,
-    skill_content: String,
+/// Scan a directory for per-agent skill files matching `SKILL-{role}.md`.
+///
+/// Returns a map from lowercase role name to file content.
+fn scan_agent_skill_files(dir: &Path) -> HashMap<String, String> {
+    let mut skills = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_str().unwrap_or_default().to_string();
+            if let Some(role) = file_name
+                .strip_prefix("SKILL-")
+                .and_then(|rest| rest.strip_suffix(".md"))
+            {
+                if !role.is_empty() {
+                    if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                        if !content.is_empty() {
+                            skills.insert(role.to_lowercase(), content);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    skills
 }
 
 /// Scan `home_dir/registry/hands/` for subdirectories containing HAND.toml.
-fn scan_hands_dir(home_dir: &Path) -> Vec<ScannedHand> {
+///
+/// Returns `(hand_id, toml_content, shared_skill_content, per_agent_skill_content)`.
+/// Per-agent skill files follow the pattern `SKILL-{role}.md` (e.g. `SKILL-pm.md`).
+fn scan_hands_dir(home_dir: &Path) -> Vec<(String, String, String, HashMap<String, String>)> {
+    let mut seen = std::collections::HashSet::new();
     let mut results = Vec::new();
-    let hands_dir = home_dir.join("registry").join("hands");
 
-    let entries = match std::fs::read_dir(&hands_dir) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::debug!(path = %hands_dir.display(), error = %e, "Failed to read hands directory");
-            return results;
-        }
-    };
+    let dirs = [home_dir.join("registry").join("hands")];
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let id = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-        let toml_path = path.join("HAND.toml");
-        let skill_path = path.join("SKILL.md");
-        if !toml_path.exists() {
-            continue;
-        }
-        let toml_content = match std::fs::read_to_string(&toml_path) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(path = %toml_path.display(), error = %e, "Failed to read HAND.toml");
-                continue;
+    for hands_dir in &dirs {
+        if let Ok(entries) = std::fs::read_dir(hands_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let id = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let toml_path = path.join("HAND.toml");
+                let skill_path = path.join("SKILL.md");
+                if !toml_path.exists() {
+                    continue;
+                }
+                let toml = match std::fs::read_to_string(&toml_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(path = %toml_path.display(), error = %e, "Failed to read HAND.toml");
+                        continue;
+                    }
+                };
+                let skill = std::fs::read_to_string(&skill_path).unwrap_or_default();
+                let agent_skills = scan_agent_skill_files(&path);
+
+                results.push((id, toml, skill, agent_skills));
             }
-        };
-        let skill_content = std::fs::read_to_string(&skill_path).unwrap_or_else(|e| {
-            tracing::debug!(path = %skill_path.display(), error = %e, "Failed to read SKILL.md");
-            String::new()
-        });
-        results.push(ScannedHand {
-            id,
-            toml_content,
-            skill_content,
-        });
+        }
     }
 
-    results.sort_by(|a, b| a.id.cmp(&b.id));
     results
 }
 
@@ -400,15 +468,17 @@ impl HandRegistry {
     /// Load hand definitions from disk. Returns (added, updated) counts.
     pub fn reload_from_disk(&self, home_dir: &std::path::Path) -> (usize, usize) {
         let fresh = scan_hands_dir(home_dir);
+        let agents_dir = resolve_agents_dir(home_dir);
+        let agents_dir_opt = agents_dir.as_deref();
         let mut added = 0usize;
         let mut updated = 0usize;
-        for ScannedHand {
-            id,
-            toml_content,
-            skill_content,
-        } in fresh
-        {
-            match parse_hand_toml(&toml_content, &skill_content) {
+        for (id, toml_content, skill_content, agent_skill_content) in fresh {
+            match parse_hand_toml_with_agents_dir(
+                &toml_content,
+                &skill_content,
+                agent_skill_content,
+                agents_dir_opt,
+            ) {
                 Ok(def) => {
                     // insert returns Option<old_value>; Some means updated, None means added.
                     if self.definitions.insert(def.id.clone(), def).is_some() {
@@ -425,8 +495,12 @@ impl HandRegistry {
         (added, updated)
     }
 
-    /// Install a hand from a directory containing HAND.toml (and optional SKILL.md).
-    pub fn install_from_path(&self, path: &std::path::Path) -> HandResult<HandDefinition> {
+    /// Install a hand from a directory containing HAND.toml (and optional SKILL.md / SKILL-{role}.md).
+    pub fn install_from_path(
+        &self,
+        path: &std::path::Path,
+        home_dir: &std::path::Path,
+    ) -> HandResult<HandDefinition> {
         let toml_path = path.join("HAND.toml");
         let skill_path = path.join("SKILL.md");
 
@@ -438,7 +512,15 @@ impl HandRegistry {
             String::new()
         });
 
-        let def = parse_hand_toml(&toml_content, &skill_content)?;
+        let agent_skill_content = scan_agent_skill_files(path);
+
+        let agents_dir = resolve_agents_dir(home_dir);
+        let def = parse_hand_toml_with_agents_dir(
+            &toml_content,
+            &skill_content,
+            agent_skill_content,
+            agents_dir.as_deref(),
+        )?;
         let id = def.id.clone();
         let name = def.name.clone();
         let stored = self.register_definition(def)?;
@@ -448,12 +530,36 @@ impl HandRegistry {
     }
 
     /// Install a hand from raw TOML + skill content (for API-based installs).
+    ///
+    /// Hands that use `base` template references in agent entries will be
+    /// **rejected** because this path has no access to the agents registry
+    /// directory. Use `install_from_path` or `install_from_content_persisted`
+    /// when base template resolution is needed.
     pub fn install_from_content(
         &self,
         toml_content: &str,
         skill_content: &str,
     ) -> HandResult<HandDefinition> {
-        let def = parse_hand_toml(toml_content, skill_content)?;
+        // Reject hands that use `base` template references — they cannot be
+        // resolved without the agents registry directory.
+        if let Ok(raw) = toml::from_str::<toml::Value>(toml_content) {
+            let agents_table = raw
+                .get("agents")
+                .or_else(|| raw.get("hand").and_then(|h| h.get("agents")));
+            if let Some(toml::Value::Table(agents)) = agents_table {
+                for (role, entry) in agents {
+                    if entry.get("base").and_then(|v| v.as_str()).is_some() {
+                        return Err(HandError::Config(format!(
+                            "Agent '{role}' uses `base` template reference which cannot be \
+                             resolved via content install. Use install_from_path or \
+                             install_from_content_persisted instead."
+                        )));
+                    }
+                }
+            }
+        }
+
+        let def = parse_hand_toml(toml_content, skill_content, HashMap::new())?;
         let id = def.id.clone();
         let name = def.name.clone();
         let stored = self.register_definition(def)?;
@@ -470,9 +576,22 @@ impl HandRegistry {
         toml_content: &str,
         skill_content: &str,
     ) -> HandResult<HandDefinition> {
-        let def = parse_hand_toml(toml_content, skill_content)?;
+        let agents_dir = resolve_agents_dir(home_dir);
+        let def = parse_hand_toml_with_agents_dir(
+            toml_content,
+            skill_content,
+            HashMap::new(),
+            agents_dir.as_deref(),
+        )?;
         let id = def.id.clone();
         let name = def.name.clone();
+
+        if self.definitions.contains_key(&def.id) {
+            return Err(HandError::AlreadyActive(format!(
+                "Hand '{}' already registered",
+                def.id
+            )));
+        }
 
         let hand_dir = home_dir.join("workspaces").join(&def.id);
         std::fs::create_dir_all(&hand_dir)?;
@@ -1393,7 +1512,7 @@ system_prompt = "Test."
 [hand.dashboard]
 metrics = []
 "#;
-        let def = parse_hand_toml(wrapped_toml, "skill content").unwrap();
+        let def = parse_hand_toml(wrapped_toml, "skill content", HashMap::new()).unwrap();
         assert_eq!(def.id, "wrapped-test");
         assert_eq!(def.name, "Wrapped Test");
         assert_eq!(def.skill_content.as_deref(), Some("skill content"));
@@ -1415,14 +1534,14 @@ system_prompt = "Test."
 [dashboard]
 metrics = []
 "#;
-        let def = parse_hand_toml(flat_toml, "").unwrap();
+        let def = parse_hand_toml(flat_toml, "", HashMap::new()).unwrap();
         assert_eq!(def.id, "flat-test");
         assert!(def.skill_content.is_none());
     }
 
     #[test]
     fn parse_hand_toml_invalid_toml() {
-        let result = parse_hand_toml("this is not valid toml [[[[", "");
+        let result = parse_hand_toml("this is not valid toml [[[[", "", HashMap::new());
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), HandError::TomlParse(_)));
     }
@@ -1475,13 +1594,15 @@ metrics = []
         std::fs::write(tmp.path().join("SKILL.md"), "# Skill content").unwrap();
 
         let reg = HandRegistry::new();
-        let def = reg.install_from_path(tmp.path()).unwrap();
+        let def = reg
+            .install_from_path(tmp.path(), &ensure_test_home())
+            .unwrap();
         assert_eq!(def.id, "path-hand");
         assert_eq!(def.skill_content.as_deref(), Some("# Skill content"));
         assert!(reg.get_definition("path-hand").is_some());
 
         // Duplicate from path should fail
-        let dup = reg.install_from_path(tmp.path());
+        let dup = reg.install_from_path(tmp.path(), &ensure_test_home());
         assert!(dup.is_err());
     }
 
@@ -1489,7 +1610,7 @@ metrics = []
     fn install_from_path_missing_toml() {
         let tmp = tempfile::tempdir().unwrap();
         let reg = HandRegistry::new();
-        let result = reg.install_from_path(tmp.path());
+        let result = reg.install_from_path(tmp.path(), &ensure_test_home());
         assert!(result.is_err());
     }
 
@@ -1663,5 +1784,261 @@ metrics = []
         std::env::set_var("GOOGLE_API_KEY", "test-key");
         assert!(check_option_available(Some("GEMINI_API_KEY"), None));
         std::env::remove_var("GOOGLE_API_KEY");
+    }
+
+    #[test]
+    fn parse_hand_toml_with_agent_skill_content() {
+        let toml_content = r#"
+id = "multi-test"
+name = "Multi Test"
+description = "Test per-agent skills"
+category = "development"
+
+[agents.pm]
+name = "pm-agent"
+description = "PM agent"
+system_prompt = "You are a PM."
+
+[agents.qa]
+name = "qa-agent"
+description = "QA agent"
+system_prompt = "You are a QA."
+"#;
+        let shared_skill = "Shared knowledge";
+        let mut agent_skills = HashMap::new();
+        agent_skills.insert("pm".to_string(), "PM-specific knowledge".to_string());
+
+        let def = parse_hand_toml(toml_content, shared_skill, agent_skills).unwrap();
+
+        // Shared skill is set
+        assert_eq!(def.skill_content.as_deref(), Some("Shared knowledge"));
+        // Per-agent skill for PM
+        assert_eq!(
+            def.agent_skill_content.get("pm").map(|s| s.as_str()),
+            Some("PM-specific knowledge")
+        );
+        // QA has no per-agent skill — should fall back to shared
+        assert!(!def.agent_skill_content.contains_key("qa"));
+    }
+
+    #[test]
+    fn parse_hand_toml_empty_agent_skills_is_backward_compatible() {
+        let toml_content = r#"
+id = "compat-test"
+name = "Compat Test"
+description = "Backward compat test"
+category = "content"
+
+[agent]
+name = "main-agent"
+description = "Main agent"
+system_prompt = "You are helpful."
+"#;
+        let def = parse_hand_toml(toml_content, "Shared skill", HashMap::new()).unwrap();
+
+        assert_eq!(def.skill_content.as_deref(), Some("Shared skill"));
+        assert!(def.agent_skill_content.is_empty());
+    }
+
+    #[test]
+    fn scan_hands_dir_picks_up_per_agent_skill_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hand_dir = tmp.path().join("registry").join("hands").join("test-hand");
+        std::fs::create_dir_all(&hand_dir).unwrap();
+
+        // HAND.toml
+        std::fs::write(
+            hand_dir.join("HAND.toml"),
+            r#"
+id = "test-hand"
+name = "Test Hand"
+description = "Test"
+category = "development"
+
+[agents.dev]
+name = "dev-agent"
+description = "Dev"
+system_prompt = "Dev prompt"
+
+[agents.review]
+name = "review-agent"
+description = "Review"
+system_prompt = "Review prompt"
+"#,
+        )
+        .unwrap();
+
+        // Shared skill
+        std::fs::write(hand_dir.join("SKILL.md"), "Shared skill content").unwrap();
+        // Per-agent skill for dev role
+        std::fs::write(hand_dir.join("SKILL-dev.md"), "Dev-specific skill").unwrap();
+        // Per-agent skill for review role
+        std::fs::write(hand_dir.join("SKILL-review.md"), "Review-specific skill").unwrap();
+
+        let results = scan_hands_dir(tmp.path());
+        assert_eq!(results.len(), 1);
+        let (id, _toml, skill, agent_skills) = &results[0];
+        assert_eq!(id, "test-hand");
+        assert_eq!(skill, "Shared skill content");
+        assert_eq!(
+            agent_skills.get("dev").map(|s| s.as_str()),
+            Some("Dev-specific skill")
+        );
+        assert_eq!(
+            agent_skills.get("review").map(|s| s.as_str()),
+            Some("Review-specific skill")
+        );
+    }
+
+    #[test]
+    fn scan_hands_dir_no_agent_skills_backward_compat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hand_dir = tmp
+            .path()
+            .join("registry")
+            .join("hands")
+            .join("simple-hand");
+        std::fs::create_dir_all(&hand_dir).unwrap();
+
+        std::fs::write(
+            hand_dir.join("HAND.toml"),
+            r#"
+id = "simple-hand"
+name = "Simple Hand"
+description = "Simple"
+category = "content"
+
+[agent]
+name = "main-agent"
+description = "Main"
+system_prompt = "Prompt"
+"#,
+        )
+        .unwrap();
+        std::fs::write(hand_dir.join("SKILL.md"), "Shared only").unwrap();
+
+        let results = scan_hands_dir(tmp.path());
+        assert_eq!(results.len(), 1);
+        let (_id, _toml, skill, agent_skills) = &results[0];
+        assert_eq!(skill, "Shared only");
+        assert!(agent_skills.is_empty());
+    }
+
+    #[test]
+    fn scan_hands_dir_ignores_empty_agent_skill_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hand_dir = tmp
+            .path()
+            .join("registry")
+            .join("hands")
+            .join("empty-skill");
+        std::fs::create_dir_all(&hand_dir).unwrap();
+
+        std::fs::write(
+            hand_dir.join("HAND.toml"),
+            r#"
+id = "empty-skill"
+name = "Empty Skill"
+description = "Test"
+category = "content"
+
+[agent]
+name = "main-agent"
+description = "Main"
+system_prompt = "Prompt"
+"#,
+        )
+        .unwrap();
+        // Empty per-agent skill file should be ignored
+        std::fs::write(hand_dir.join("SKILL-dev.md"), "").unwrap();
+
+        let results = scan_hands_dir(tmp.path());
+        assert_eq!(results.len(), 1);
+        let (_id, _toml, _skill, agent_skills) = &results[0];
+        assert!(agent_skills.is_empty());
+    }
+
+    #[test]
+    fn scan_hands_dir_lowercases_role_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hand_dir = tmp.path().join("registry").join("hands").join("case-test");
+        std::fs::create_dir_all(&hand_dir).unwrap();
+
+        std::fs::write(
+            hand_dir.join("HAND.toml"),
+            r#"
+id = "case-test"
+name = "Case Test"
+description = "Test"
+category = "content"
+
+[agent]
+name = "main-agent"
+description = "Main"
+system_prompt = "Prompt"
+"#,
+        )
+        .unwrap();
+        // Mixed-case role name should be lowercased
+        std::fs::write(hand_dir.join("SKILL-PM.md"), "PM skill content").unwrap();
+
+        let results = scan_hands_dir(tmp.path());
+        assert_eq!(results.len(), 1);
+        let (_id, _toml, _skill, agent_skills) = &results[0];
+        assert_eq!(
+            agent_skills.get("pm").map(|s| s.as_str()),
+            Some("PM skill content")
+        );
+        // Original case should NOT exist
+        assert!(agent_skills.get("PM").is_none());
+    }
+
+    #[test]
+    fn install_from_content_rejects_base_template() {
+        let registry = HandRegistry::new();
+        let toml_content = r#"
+id = "base-ref-hand"
+name = "Base Ref Hand"
+description = "Uses base template"
+category = "development"
+tools = []
+
+[agents.main]
+coordinator = true
+base = "some-template"
+
+[dashboard]
+metrics = []
+"#;
+        let result = registry.install_from_content(toml_content, "");
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("base"),
+            "Error should mention base template: {err}"
+        );
+    }
+
+    #[test]
+    fn install_from_content_accepts_hand_without_base() {
+        let registry = HandRegistry::new();
+        let toml_content = r#"
+id = "no-base-hand"
+name = "No Base Hand"
+description = "No base used"
+category = "content"
+tools = []
+
+[agents.main]
+coordinator = true
+name = "main-agent"
+description = "A plain agent"
+system_prompt = "Hello"
+
+[dashboard]
+metrics = []
+"#;
+        let result = registry.install_from_content(toml_content, "");
+        assert!(result.is_ok());
     }
 }
