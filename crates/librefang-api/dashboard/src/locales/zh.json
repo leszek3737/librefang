@@ -1420,6 +1420,8 @@
     "disconnect": "断开",
     "started": "[终端已启动: {{shell}} (PID: {{pid}})]",
     "exited": "[进程已退出，代码 {{code}}]",
-    "error_unknown": "未知错误"
+    "error_unknown": "未知错误",
+    "websocket_error": "WebSocket 连接错误",
+    "connection_closed_non_recoverable": "由于不可恢复的错误，连接已关闭"
   }
 }
