@@ -1125,12 +1125,12 @@ impl ScriptableContextEngine {
                             let schemas_c = hook_schemas.clone();
                             let state_c = shared_state_path.clone();
                             let store_c = trace_store.clone();
-                            let rt = runtime.clone();
+                            let rt_c = runtime.clone();
                             tokio::spawn(async move {
                                 let _ = ScriptableContextEngine::run_hook(
                                     "on_event",
                                     &script,
-                                    rt,
+                                    rt_c,
                                     input,
                                     hook_timeout_secs,
                                     &effective_env,
