@@ -96,6 +96,20 @@ fn is_soft_error_content(content: &str) -> bool {
     content.contains(ERR_PATH_TRAVERSAL)
         || content.contains(ERR_SANDBOX_ESCAPE)
         || content.contains("arguments were truncated")
+        || is_parameter_error_content(content)
+}
+
+/// Detect tool errors that are caused by the LLM sending wrong/missing parameters.
+/// These are soft errors because the LLM can self-correct by retrying with different
+/// input — they should NOT count toward the consecutive-failure abort threshold.
+fn is_parameter_error_content(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("missing '") || // "Missing 'path' parameter"
+    lower.contains("missing parameter") ||
+    lower.contains("required parameter") ||
+    lower.contains("invalid parameter") ||
+    lower.contains("parameter is required") ||
+    lower.contains("argument is required")
 }
 
 /// Safely trim message history to `MAX_HISTORY_MESSAGES`, cutting at
@@ -187,50 +201,6 @@ fn strip_processed_image_data(messages: &mut [Message]) {
     }
 }
 
-fn completion_timeout_override(
-    manifest: &AgentManifest,
-    available_tools: &[ToolDefinition],
-) -> Option<u64> {
-    manifest
-        .metadata
-        .get("timeout_secs")
-        .and_then(|v| v.as_u64())
-        .or_else(|| {
-            if available_tools
-                .iter()
-                .any(|t| t.name.starts_with("browser_") || t.name.starts_with("playwright_"))
-            {
-                Some(600)
-            } else {
-                None
-            }
-        })
-}
-
-fn build_completion_request(
-    manifest: &AgentManifest,
-    system_prompt: &str,
-    messages: &[Message],
-    available_tools: &[ToolDefinition],
-) -> CompletionRequest {
-    CompletionRequest {
-        model: strip_provider_prefix(&manifest.model.model, &manifest.model.provider),
-        messages: messages.to_vec(),
-        tools: available_tools.to_vec(),
-        max_tokens: manifest.model.max_tokens,
-        temperature: manifest.model.temperature,
-        system: Some(system_prompt.to_string()),
-        thinking: manifest.thinking.clone(),
-        prompt_caching: manifest
-            .metadata
-            .get("prompt_caching")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
-        response_format: manifest.response_format.clone(),
-        timeout_secs: completion_timeout_override(manifest, available_tools),
-    }
-}
-
 fn accumulate_token_usage(total_usage: &mut TokenUsage, usage: &TokenUsage) {
     total_usage.input_tokens += usage.input_tokens;
     total_usage.output_tokens += usage.output_tokens;
@@ -294,14 +264,39 @@ fn append_tool_result_guidance_blocks(tool_result_blocks: &mut Vec<ContentBlock>
         .filter(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. }))
         .count();
     let non_denial_errors = error_count.saturating_sub(denial_count);
-    if non_denial_errors > 0 {
+    // Separate parameter errors (LLM can self-correct by retrying with valid args)
+    // from execution errors (network/IO/permission failures the LLM cannot fix).
+    let param_error_count = tool_result_blocks
+        .iter()
+        .filter(|b| match b {
+            ContentBlock::ToolResult {
+                is_error: true,
+                content,
+                ..
+            } => is_parameter_error_content(content),
+            _ => false,
+        })
+        .count();
+    let non_param_errors = non_denial_errors.saturating_sub(param_error_count);
+    if param_error_count > 0 {
+        tool_result_blocks.push(ContentBlock::Text {
+            text: format!(
+                "[System: {} tool call(s) failed due to missing or invalid parameters. \
+                 Read the error message, correct your tool call arguments, and retry \
+                 immediately. Do NOT ask the user for help — fix the parameters yourself.]",
+                param_error_count
+            ),
+            provider_metadata: None,
+        });
+    }
+    if non_param_errors > 0 {
         tool_result_blocks.push(ContentBlock::Text {
             text: format!(
                 "[System: {} tool(s) returned errors. Report the error honestly \
                  to the user. Do NOT fabricate results or pretend the tool succeeded. \
                  If a search or fetch failed, tell the user it failed and suggest \
                  alternatives instead of making up data.]",
-                non_denial_errors
+                non_param_errors
             ),
             provider_metadata: None,
         });
@@ -2046,8 +2041,47 @@ pub async fn run_agent_loop(
             apply_context_guard(&mut messages, &context_budget, available_tools);
         }
 
-        let request =
-            build_completion_request(manifest, &system_prompt, &messages, available_tools);
+        // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
+        let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+
+        let prompt_caching = manifest
+            .metadata
+            .get("prompt_caching")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let timeout_override = manifest
+            .metadata
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                if available_tools
+                    .iter()
+                    .any(|t| t.name.starts_with("browser_") || t.name.starts_with("playwright_"))
+                {
+                    Some(600)
+                } else {
+                    None
+                }
+            });
+
+        let request = CompletionRequest {
+            model: api_model,
+            messages: messages.clone(),
+            tools: available_tools.to_vec(),
+            max_tokens: manifest.model.max_tokens,
+            temperature: manifest.model.temperature,
+            system: Some(system_prompt.clone()),
+            thinking: manifest.thinking.clone(),
+            prompt_caching,
+            response_format: manifest.response_format.clone(),
+            timeout_secs: timeout_override,
+            extra_body: if manifest.model.extra_params.is_empty() {
+                None
+            } else {
+                Some(manifest.model.extra_params.clone())
+            },
+        };
 
         // Notify phase: Thinking
         if let Some(cb) = on_phase {
@@ -2894,8 +2928,50 @@ pub async fn run_agent_loop_streaming(
             }
         }
 
-        let request =
-            build_completion_request(manifest, &system_prompt, &messages, available_tools);
+        // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
+        let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+
+        let prompt_caching = manifest
+            .metadata
+            .get("prompt_caching")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        // Per-request timeout: manifest metadata takes priority, then browser
+        // heuristic, then driver default (None = use driver's configured value).
+        let timeout_override = manifest
+            .metadata
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                // Auto-extend for agents with browser tools
+                if available_tools
+                    .iter()
+                    .any(|t| t.name.starts_with("browser_") || t.name.starts_with("playwright_"))
+                {
+                    Some(600) // 10 minutes for browser tasks
+                } else {
+                    None
+                }
+            });
+
+        let request = CompletionRequest {
+            model: api_model,
+            messages: messages.clone(),
+            tools: available_tools.to_vec(),
+            max_tokens: manifest.model.max_tokens,
+            temperature: manifest.model.temperature,
+            system: Some(system_prompt.clone()),
+            thinking: manifest.thinking.clone(),
+            prompt_caching,
+            response_format: manifest.response_format.clone(),
+            timeout_secs: timeout_override,
+            extra_body: if manifest.model.extra_params.is_empty() {
+                None
+            } else {
+                Some(manifest.model.extra_params.clone())
+            },
+        };
 
         // Notify phase: on first iteration emit Streaming; on subsequent
         // iterations (after tool execution) emit Thinking so the UI shows

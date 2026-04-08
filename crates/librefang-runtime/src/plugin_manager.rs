@@ -3912,14 +3912,13 @@ after_turn = "hooks/after_turn.py"
         let manifest = PluginManifest {
             name: "test".to_string(),
             version: "0.1.0".to_string(),
-            description: None,
-            author: None,
             hooks: librefang_types::config::ContextEngineHooks {
                 ingest: Some("hooks/ingest.py".to_string()),
                 after_turn: Some("hooks/after_turn.py".to_string()), // missing
-                runtime: None,
                 ..Default::default()
             },
+            description: None,
+            author: None,
             requirements: None,
             env: std::collections::HashMap::new(),
             librefang_min_version: None,
@@ -3937,14 +3936,12 @@ after_turn = "hooks/after_turn.py"
         let manifest_escape = PluginManifest {
             name: "test".to_string(),
             version: "0.1.0".to_string(),
-            description: None,
-            author: None,
             hooks: librefang_types::config::ContextEngineHooks {
                 ingest: Some("../../etc/passwd".to_string()),
-                after_turn: None,
-                runtime: None,
                 ..Default::default()
             },
+            description: None,
+            author: None,
             requirements: None,
             env: std::collections::HashMap::new(),
             librefang_min_version: None,
