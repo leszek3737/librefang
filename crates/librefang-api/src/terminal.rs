@@ -7,14 +7,17 @@ use tracing::info;
 
 pub struct PtySession {
     _master: Box<dyn portable_pty::MasterPty + Send>,
-    _child: Box<dyn portable_pty::Child + Send>,
+    child: Box<dyn portable_pty::Child + Send>,
     pub writer: Box<dyn Write + Send>,
     pub pid: u32,
     pub shell: String,
 }
 
 impl PtySession {
-    pub fn spawn() -> std::io::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
+    pub fn spawn(
+        cols: Option<u16>,
+        rows: Option<u16>,
+    ) -> std::io::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         let pty_system = native_pty_system();
 
         let (shell, _flag) = shell_for_current_os();
@@ -22,8 +25,8 @@ impl PtySession {
 
         let pair = pty_system
             .openpty(PtySize {
-                rows: 40,
-                cols: 120,
+                rows: rows.unwrap_or(40),
+                cols: cols.unwrap_or(120),
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -69,7 +72,7 @@ impl PtySession {
         Ok((
             Self {
                 _master: pair.master,
-                _child: child,
+                child,
                 writer,
                 pid,
                 shell: shell.clone(),
@@ -86,6 +89,8 @@ impl PtySession {
 
     #[cfg(windows)]
     pub fn resize(&mut self, _cols: u16, _rows: u16) -> std::io::Result<()> {
+        // Windows ConPTY resize is not yet implemented via portable-pty on this platform.
+        // TODO: investigate ConPTY resize support.
         Ok(())
     }
 
@@ -100,15 +105,23 @@ impl PtySession {
             })
             .map_err(std::io::Error::other)
     }
+
+    /// Wait for the child process to exit and return (exit_code, optional_signal).
+    pub fn wait_exit(&mut self) -> std::io::Result<(u32, Option<String>)> {
+        let status = self.child.wait().map_err(std::io::Error::other)?;
+        Ok((status.exit_code(), status.signal().map(|s| s.to_string())))
+    }
 }
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        let _ = self._child.kill();
+        let _ = self.child.kill();
     }
 }
 
 pub fn shell_for_current_os() -> (String, &'static str) {
+    // The flag (e.g., "-c" on Unix, "/C" on Windows) is the "execute command" flag,
+    // unused here since we spawn an interactive shell without command arguments.
     #[cfg(windows)]
     {
         let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());

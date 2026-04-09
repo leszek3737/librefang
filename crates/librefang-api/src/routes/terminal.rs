@@ -54,7 +54,6 @@ pub enum ServerMessage {
     Started {
         shell: String,
         pid: u32,
-        cwd: Option<String>,
     },
     #[serde(rename = "output")]
     Output { data: String, binary: Option<bool> },
@@ -94,12 +93,8 @@ impl ClientMessage {
 impl fmt::Display for ServerMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ServerMessage::Started { shell, pid, cwd } => {
-                write!(f, "started(shell={shell}, pid={pid}")?;
-                if let Some(cwd) = cwd {
-                    write!(f, ", cwd={cwd}")?;
-                }
-                write!(f, ")")
+            ServerMessage::Started { shell, pid } => {
+                write!(f, "started(shell={shell}, pid={pid})")
             }
             ServerMessage::Output { data, binary } => {
                 let preview = if data.len() > 32 {
@@ -136,6 +131,7 @@ pub async fn terminal_ws(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
 ) -> impl IntoResponse {
     let valid_tokens = crate::server::valid_api_tokens(state.kernel.as_ref());
     if valid_tokens.is_empty() {
@@ -155,10 +151,16 @@ pub async fn terminal_ws(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
+    let query_token = uri
+        .query()
+        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")));
+
     let header_auth = header_token.map(&matches_any).unwrap_or(false);
+    let query_auth = query_token.map(&matches_any).unwrap_or(false);
 
     let mut session_auth = false;
-    if let Some(token_str) = header_token {
+    let provided_token = header_token.or(query_token);
+    if let Some(token_str) = provided_token {
         let mut sessions = state.active_sessions.write().await;
         sessions.retain(|_, st| {
             !crate::password_hash::is_token_expired(
@@ -170,7 +172,7 @@ pub async fn terminal_ws(
         drop(sessions);
     }
 
-    if !header_auth && !session_auth {
+    if !header_auth && !query_auth && !session_auth {
         warn!("Terminal WebSocket upgrade rejected: invalid auth");
         return axum::http::StatusCode::UNAUTHORIZED.into_response();
     }
@@ -202,7 +204,7 @@ async fn handle_terminal_ws(
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(Mutex::new(sender));
 
-    let (mut pty, mut pty_rx) = match PtySession::spawn() {
+    let (mut pty, mut pty_rx) = match PtySession::spawn(None, None) {
         Ok((pty, rx)) => (pty, rx),
         Err(e) => {
             let _ = send_json(
@@ -220,14 +222,12 @@ async fn handle_terminal_ws(
     let shell_path = pty.shell.clone();
     let pid = pty.pid;
 
-    let cwd = dirs::home_dir().map(|p| p.display().to_string());
     let _ = send_json(
         &sender,
         &serde_json::json!({
             "type": "started",
             "shell": shell_path,
-            "pid": pid,
-            "cwd": cwd
+            "pid": pid
         }),
     )
     .await;
@@ -266,6 +266,9 @@ async fn handle_terminal_ws(
     let max_input_per_min: usize = rl_cfg.ws_messages_per_minute as usize;
     let mut input_times: Vec<std::time::Instant> = Vec::new();
     let input_window: Duration = Duration::from_secs(60);
+
+    enum ExitReason { ClientClose, Timeout, ProcessExited }
+    let exit_reason: ExitReason;
 
     loop {
         tokio::select! {
@@ -363,6 +366,7 @@ async fn handle_terminal_ws(
                                             "code": 0,
                                             "signal": null
                                         })).await;
+                                        exit_reason = ExitReason::ClientClose;
                                         break;
                                     }
                                 }
@@ -373,6 +377,7 @@ async fn handle_terminal_ws(
                                     "code": 0,
                                     "signal": null
                                 })).await;
+                                exit_reason = ExitReason::ClientClose;
                                 break;
                             }
                             Message::Ping(data) => {
@@ -387,9 +392,13 @@ async fn handle_terminal_ws(
                     }
                     Some(Err(e)) => {
                         tracing::debug!(error = %e, "WebSocket receive error");
+                        exit_reason = ExitReason::ClientClose;
                         break;
                     }
-                    None => break,
+                    None => {
+                        exit_reason = ExitReason::ClientClose;
+                        break;
+                    }
                 }
             }
             _ = tokio::time::sleep(ws_idle_timeout.saturating_sub(last_activity_shared.lock().map(|la| la.elapsed()).unwrap_or(Duration::ZERO))) => {
@@ -398,21 +407,37 @@ async fn handle_terminal_ws(
                     "code": 124,
                     "signal": null
                 })).await;
+                exit_reason = ExitReason::Timeout;
                 break;
             }
             _ = &mut pty_read_handle => {
                 if let Ok(mut la) = last_activity_shared.lock() {
                     *la = std::time::Instant::now();
                 }
-                // PTY reader ended = child process exited
-                let _ = send_json(&sender, &serde_json::json!({
-                    "type": "exit",
-                    "code": 0,
-                    "signal": null
-                })).await;
+                // PTY reader ended = child process exited; get real exit code below
+                exit_reason = ExitReason::ProcessExited;
                 break;
             }
         }
+    }
+
+    // Determine the real exit code from the child process, but only
+    // when the loop exited because the PTY reader ended (child exited).
+    // When the client closed the connection or we timed out, the exit
+    // message has already been sent inside the loop.
+    if matches!(exit_reason, ExitReason::ProcessExited) {
+        let (code, signal) = match pty.wait_exit() {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(error = %e, "Failed to wait for child exit");
+                (1, None)
+            }
+        };
+        let _ = send_json(&sender, &serde_json::json!({
+            "type": "exit",
+            "code": code,
+            "signal": signal
+        })).await;
     }
 
     pty_read_handle.abort();
@@ -509,7 +534,6 @@ mod tests {
         let msg = ServerMessage::Started {
             shell: "/bin/bash".to_string(),
             pid: 12345,
-            cwd: Some("/home/user".to_string()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"started""#));

@@ -5,7 +5,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { useTranslation } from "react-i18next";
 import { Terminal as TerminalIcon } from "lucide-react";
-import { buildAuthenticatedWebSocketUrl, buildTerminalAuthMessage } from "../api";
+import { buildAuthenticatedWebSocketUrl } from "../api";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -51,7 +51,6 @@ export function TerminalPage() {
     wsRef.current = ws;
 
     ws.onopen = () => {
-      ws.send(buildTerminalAuthMessage());
       setIsConnecting(false);
       setIsConnected(true);
       attemptRef.current = 0;
