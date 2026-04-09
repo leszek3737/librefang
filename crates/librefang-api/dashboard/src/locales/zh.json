@@ -1422,6 +1422,7 @@
     "exited": "[进程已退出，代码 {{code}}]",
     "error_unknown": "未知错误",
     "websocket_error": "WebSocket 连接错误",
-    "connection_closed_non_recoverable": "由于不可恢复的错误，连接已关闭"
+    "connection_closed_non_recoverable": "由于不可恢复的错误，连接已关闭",
+    "max_reconnect_exceeded": "已达到最大重连次数，请手动连接。"
   }
 }

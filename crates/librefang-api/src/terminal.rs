@@ -27,7 +27,7 @@ impl PtySession {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         let cmd = CommandBuilder::new(shell.clone());
         // No args — spawn an interactive shell
@@ -35,13 +35,13 @@ impl PtySession {
         let child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         let pid = child.process_id().unwrap_or(0);
 
         let reader = pair
             .master
             .try_clone_reader()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         let (tx, rx) = mpsc::channel(1024);
 
         std::thread::spawn(move || {
@@ -64,10 +64,7 @@ impl PtySession {
             }
         });
 
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let writer = pair.master.take_writer().map_err(std::io::Error::other)?;
 
         Ok((
             Self {
@@ -101,7 +98,13 @@ impl PtySession {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .map_err(std::io::Error::other)
+    }
+}
+
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        let _ = self._child.kill();
     }
 }
 

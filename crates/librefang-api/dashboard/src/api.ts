@@ -591,12 +591,12 @@ function buildHeaders(headers?: HeadersInit): Headers {
 
 export function buildAuthenticatedWebSocketUrl(path: string): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const url = new URL(`${proto}//${window.location.host}${path}`);
+  return `${proto}//${window.location.host}${path}`;
+}
+
+export function buildTerminalAuthMessage(): string {
   const token = getStoredApiKey();
-  if (token) {
-    url.searchParams.set("token", token);
-  }
-  return url.toString();
+  return JSON.stringify({ type: "auth", token });
 }
 
 async function parseError(response: Response): Promise<Error> {

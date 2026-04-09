@@ -145,6 +145,9 @@ jsonwebtoken = "10"
 # Rate limiting
 governor = "0.10.4"
 
+# PTY
+portable-pty = "0.9"
+
 # Interactive CLI
 ratatui = "0.30"
 colored = "3"

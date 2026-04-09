@@ -5,7 +5,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { useTranslation } from "react-i18next";
 import { Terminal as TerminalIcon } from "lucide-react";
-import { buildAuthenticatedWebSocketUrl } from "../api";
+import { buildAuthenticatedWebSocketUrl, buildTerminalAuthMessage } from "../api";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -22,6 +22,7 @@ interface ServerMessage {
 }
 
 const RECONNECT_DELAY_MS = 2000;
+const MAX_RECONNECT_ATTEMPTS = 10;
 
 export function TerminalPage() {
   const { t } = useTranslation();
@@ -32,8 +33,10 @@ export function TerminalPage() {
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const intentionalDisconnectRef = useRef(false);
   const connectRef = useRef<() => void>(() => {});
+  const attemptRef = useRef(0);
 
   const [isConnected, setIsConnected] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const connect = useCallback(() => {
@@ -42,12 +45,16 @@ export function TerminalPage() {
     }
 
     setError(null);
+    setIsConnecting(true);
     const url = buildAuthenticatedWebSocketUrl("/api/terminal/ws");
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
     ws.onopen = () => {
+      ws.send(buildTerminalAuthMessage());
+      setIsConnecting(false);
       setIsConnected(true);
+      attemptRef.current = 0;
       setError(null);
       if (terminalRef.current && fitAddonRef.current) {
         const { cols, rows } = terminalRef.current;
@@ -89,19 +96,21 @@ export function TerminalPage() {
           );
           break;
         case "error":
-          setError(typeof msg.content === "string" && msg.content 
-            ? msg.content 
+          setError(typeof msg.content === "string" && msg.content
+            ? msg.content
             : t("terminal.error_unknown"));
           break;
       }
     };
 
     ws.onerror = () => {
+      setIsConnecting(false);
       setError(t("terminal.websocket_error"));
     };
 
     ws.onclose = (event: CloseEvent) => {
       setIsConnected(false);
+      setIsConnecting(false);
 
       if (intentionalDisconnectRef.current) {
         intentionalDisconnectRef.current = false;
@@ -116,6 +125,12 @@ export function TerminalPage() {
         return;
       }
 
+      if (attemptRef.current >= MAX_RECONNECT_ATTEMPTS) {
+        setError(t("terminal.max_reconnect_exceeded"));
+        return;
+      }
+      const delay = Math.min(RECONNECT_DELAY_MS * 2 ** attemptRef.current, 30_000) + Math.random() * 1000;
+      attemptRef.current += 1;
       reconnectTimeoutRef.current = setTimeout(() => {
         if (
           wsRef.current === null ||
@@ -123,7 +138,7 @@ export function TerminalPage() {
         ) {
           connect();
         }
-      }, RECONNECT_DELAY_MS);
+      }, delay);
     };
   }, [t]);
 
@@ -142,6 +157,7 @@ export function TerminalPage() {
       wsRef.current = null;
     }
     setIsConnected(false);
+    setIsConnecting(false);
   }, []);
 
   useEffect(() => {
@@ -195,6 +211,7 @@ export function TerminalPage() {
         wsRef.current = null;
       }
       setIsConnected(false);
+      setIsConnecting(false);
       term.dispose();
     };
   }, []);
@@ -214,7 +231,7 @@ export function TerminalPage() {
         icon={<TerminalIcon className="h-4 w-4" />}
         actions={
           <>
-            <Button onClick={connect} disabled={isConnected}>
+            <Button onClick={connect} disabled={isConnected || isConnecting}>
               {isConnected
                 ? t("terminal.subtitle_connected")
                 : t("terminal.connect")}

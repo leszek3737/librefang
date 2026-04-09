@@ -1415,6 +1415,7 @@
     "exited": "[Process exited with code {{code}}]",
     "error_unknown": "Unknown error",
     "websocket_error": "WebSocket connection error",
-    "connection_closed_non_recoverable": "Connection closed due to a non-recoverable error"
+    "connection_closed_non_recoverable": "Connection closed due to a non-recoverable error",
+    "max_reconnect_exceeded": "Max reconnection attempts reached. Please connect manually."
   }
 }

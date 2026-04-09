@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use super::AppState;
 use crate::terminal::PtySession;
 use crate::ws::send_json;
-use crate::ws::WsConnectionGuard;
+use crate::ws::TerminalWsGuard;
 
 pub const MAX_WS_MSG_SIZE: usize = 64 * 1024;
 
@@ -40,10 +40,7 @@ pub fn router() -> axum::Router<Arc<AppState>> {
 #[serde(tag = "type")]
 pub enum ClientMessage {
     #[serde(rename = "input")]
-    Input {
-        data: String,
-        timestamp: Option<u64>,
-    },
+    Input { data: String },
     #[serde(rename = "resize")]
     Resize { cols: u16, rows: u16 },
     #[serde(rename = "close")]
@@ -79,7 +76,7 @@ impl ClientMessage {
                 }
                 Ok(())
             }
-            ClientMessage::Input { data, .. } => {
+            ClientMessage::Input { data } => {
                 const MAX_INPUT_SIZE: usize = 64 * 1024;
                 if data.len() > MAX_INPUT_SIZE {
                     return Err(format!(
@@ -98,7 +95,7 @@ impl fmt::Display for ServerMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ServerMessage::Started { shell, pid, cwd } => {
-                write!(f, "started(shell={shell}, pid={pid})")?;
+                write!(f, "started(shell={shell}, pid={pid}")?;
                 if let Some(cwd) = cwd {
                     write!(f, ", cwd={cwd}")?;
                 }
@@ -139,7 +136,6 @@ pub async fn terminal_ws(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
-    uri: axum::http::Uri,
 ) -> impl IntoResponse {
     let valid_tokens = crate::server::valid_api_tokens(state.kernel.as_ref());
     if !valid_tokens.is_empty() {
@@ -155,15 +151,10 @@ pub async fn terminal_ws(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
 
-        let query_token = uri
-            .query()
-            .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")));
-
         let header_auth = header_token.map(&matches_any).unwrap_or(false);
-        let query_auth = query_token.map(&matches_any).unwrap_or(false);
 
         let mut session_auth = false;
-        let provided_token = header_token.or(query_token);
+        let provided_token = header_token;
         if let Some(token_str) = provided_token {
             let mut sessions = state.active_sessions.write().await;
             sessions.retain(|_, st| {
@@ -176,16 +167,18 @@ pub async fn terminal_ws(
             drop(sessions);
         }
 
-        if !header_auth && !query_auth && !session_auth {
+        if !header_auth && !session_auth {
             warn!("Terminal WebSocket upgrade rejected: invalid auth");
             return axum::http::StatusCode::UNAUTHORIZED.into_response();
         }
+    } else {
+        warn!("Terminal WebSocket accessible without authentication — no API token configured");
     }
 
     let ip = addr.ip();
     let max_ws_per_ip = state.kernel.config_ref().rate_limit.max_ws_per_ip;
 
-    let _guard = match crate::ws::try_acquire_ws_slot(ip, max_ws_per_ip) {
+    let _terminal_guard = match crate::ws::try_acquire_terminal_ws_slot(ip, max_ws_per_ip) {
         Some(g) => g,
         None => {
             warn!(ip = %ip, max_ws_per_ip, "Terminal WebSocket rejected: too many connections from IP");
@@ -194,7 +187,7 @@ pub async fn terminal_ws(
     };
 
     ws.on_upgrade(move |socket| {
-        let guard = _guard;
+        let guard = _terminal_guard;
         handle_terminal_ws(socket, state, ip, guard)
     })
     .into_response()
@@ -204,7 +197,7 @@ async fn handle_terminal_ws(
     socket: WebSocket,
     state: Arc<AppState>,
     _client_ip: IpAddr,
-    _guard: WsConnectionGuard,
+    _guard: TerminalWsGuard,
 ) {
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(Mutex::new(sender));
@@ -227,9 +220,7 @@ async fn handle_terminal_ws(
     let shell_path = pty.shell.clone();
     let pid = pty.pid;
 
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string());
+    let cwd = dirs::home_dir().map(|p| p.display().to_string());
     let _ = send_json(
         &sender,
         &serde_json::json!({
@@ -241,7 +232,10 @@ async fn handle_terminal_ws(
     )
     .await;
 
+    let last_activity_shared = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+
     let sender_clone = Arc::clone(&sender);
+    let la = Arc::clone(&last_activity_shared);
     let mut pty_read_handle = tokio::spawn(async move {
         while let Some(data) = pty_rx.recv().await {
             let output_msg = match String::from_utf8(data.clone()) {
@@ -261,12 +255,17 @@ async fn handle_terminal_ws(
             if send_json(&sender_clone, &output_msg).await.is_err() {
                 break;
             }
+            if let Ok(mut la) = la.lock() {
+                *la = std::time::Instant::now();
+            }
         }
     });
 
     let rl_cfg = state.kernel.config_ref().rate_limit.clone();
     let ws_idle_timeout = Duration::from_secs(rl_cfg.ws_idle_timeout_secs);
-    let mut last_activity = std::time::Instant::now();
+    let max_input_per_min: usize = rl_cfg.ws_messages_per_minute as usize;
+    let mut input_times: Vec<std::time::Instant> = Vec::new();
+    let input_window: Duration = Duration::from_secs(60);
 
     loop {
         tokio::select! {
@@ -275,7 +274,9 @@ async fn handle_terminal_ws(
                     Some(Ok(msg)) => {
                         match msg {
                             Message::Text(text) => {
-                                last_activity = std::time::Instant::now();
+                                if let Ok(mut la) = last_activity_shared.lock() {
+                                    *la = std::time::Instant::now();
+                                }
 
                                 if text.len() > MAX_WS_MSG_SIZE {
                                     let _ = send_json(
@@ -317,7 +318,22 @@ async fn handle_terminal_ws(
                                 }
 
                                 match &client_msg {
-                                    ClientMessage::Input { data, .. } => {
+                                    ClientMessage::Input { data } => {
+                                        let now = std::time::Instant::now();
+                                        input_times.retain(|t| now.duration_since(*t) < input_window);
+                                        if input_times.len() >= max_input_per_min {
+                                            let _ = send_json(
+                                                &sender,
+                                                &serde_json::json!({
+                                                    "type": "error",
+                                                    "content": format!("Rate limit exceeded. Max {max_input_per_min} inputs per minute.")
+                                                }),
+                                            )
+                                            .await;
+                                            continue;
+                                        }
+                                        input_times.push(now);
+
                                         if let Err(e) = pty.write(data.as_bytes()) {
                                             let _ = send_json(
                                                 &sender,
@@ -360,7 +376,9 @@ async fn handle_terminal_ws(
                                 break;
                             }
                             Message::Ping(data) => {
-                                last_activity = std::time::Instant::now();
+                                if let Ok(mut la) = last_activity_shared.lock() {
+                                    *la = std::time::Instant::now();
+                                }
                                 let mut s = sender.lock().await;
                                 let _ = s.send(Message::Pong(data)).await;
                             }
@@ -374,7 +392,7 @@ async fn handle_terminal_ws(
                     None => break,
                 }
             }
-            _ = tokio::time::sleep(ws_idle_timeout.saturating_sub(last_activity.elapsed())) => {
+            _ = tokio::time::sleep(ws_idle_timeout.saturating_sub(last_activity_shared.lock().map(|la| la.elapsed()).unwrap_or(Duration::ZERO))) => {
                 let _ = send_json(&sender, &serde_json::json!({
                     "type": "exit",
                     "code": 124,
@@ -383,6 +401,9 @@ async fn handle_terminal_ws(
                 break;
             }
             _ = &mut pty_read_handle => {
+                if let Ok(mut la) = last_activity_shared.lock() {
+                    *la = std::time::Instant::now();
+                }
                 // PTY reader ended = child process exited
                 let _ = send_json(&sender, &serde_json::json!({
                     "type": "exit",
@@ -448,17 +469,11 @@ mod tests {
     #[test]
     fn test_input_size_limit() {
         let too_large = "x".repeat(65 * 1024);
-        let msg = ClientMessage::Input {
-            data: too_large,
-            timestamp: None,
-        };
+        let msg = ClientMessage::Input { data: too_large };
         assert!(msg.validate().is_err());
 
         let ok = "x".repeat(64 * 1024);
-        let msg = ClientMessage::Input {
-            data: ok,
-            timestamp: None,
-        };
+        let msg = ClientMessage::Input { data: ok };
         assert!(msg.validate().is_ok());
     }
 
@@ -467,7 +482,7 @@ mod tests {
         let input = r#"{"type":"input","data":"hello"}"#;
         let msg: ClientMessage = serde_json::from_str(input).unwrap();
         match msg {
-            ClientMessage::Input { data, .. } => assert_eq!(data, "hello"),
+            ClientMessage::Input { data } => assert_eq!(data, "hello"),
             _ => panic!("expected Input"),
         }
 
