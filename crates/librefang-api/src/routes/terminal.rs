@@ -130,19 +130,7 @@ pub async fn terminal_ws(
     headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
 ) -> impl IntoResponse {
-    let valid_tokens = crate::server::valid_api_tokens(state.kernel.as_ref());
-    if valid_tokens.is_empty() {
-        warn!("Terminal WebSocket rejected — no API token configured");
-        return axum::http::StatusCode::FORBIDDEN.into_response();
-    }
-
-    use subtle::ConstantTimeEq;
-    let matches_any = |token: &str| -> bool {
-        valid_tokens
-            .iter()
-            .any(|key| token.len() == key.len() && token.as_bytes().ct_eq(key.as_bytes()).into())
-    };
-
+    // Extract token from header or query string.
     let header_token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -152,12 +140,29 @@ pub async fn terminal_ws(
         .query()
         .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")));
 
-    let header_auth = header_token.map(&matches_any).unwrap_or(false);
-    let query_auth = query_token.map(&matches_any).unwrap_or(false);
-
-    let mut session_auth = false;
     let provided_token = header_token.or(query_token);
-    if let Some(token_str) = provided_token {
+
+    // No token at all → immediate reject.
+    let token_str = match provided_token {
+        Some(t) => t,
+        None => {
+            warn!("Terminal WebSocket rejected — no auth token provided");
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
+    };
+
+    // 1. Check against configured API tokens (constant-time compare).
+    let valid_tokens = crate::server::valid_api_tokens(state.kernel.as_ref());
+    let api_auth = {
+        use subtle::ConstantTimeEq;
+        valid_tokens.iter().any(|key| {
+            token_str.len() == key.len() && token_str.as_bytes().ct_eq(key.as_bytes()).into()
+        })
+    };
+
+    // 2. Check against active dashboard sessions (handles the case where
+    //    no api_key is configured but the user logged in via dashboard).
+    let session_auth = {
         let mut sessions = state.active_sessions.write().await;
         sessions.retain(|_, st| {
             !crate::password_hash::is_token_expired(
@@ -165,11 +170,10 @@ pub async fn terminal_ws(
                 crate::password_hash::DEFAULT_SESSION_TTL_SECS,
             )
         });
-        session_auth = sessions.contains_key(token_str);
-        drop(sessions);
-    }
+        sessions.contains_key(token_str)
+    };
 
-    if !header_auth && !query_auth && !session_auth {
+    if !api_auth && !session_auth {
         warn!("Terminal WebSocket upgrade rejected: invalid auth");
         return axum::http::StatusCode::UNAUTHORIZED.into_response();
     }
