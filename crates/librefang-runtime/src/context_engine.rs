@@ -1189,7 +1189,7 @@ impl ScriptableContextEngine {
                                 let _ = ScriptableContextEngine::run_hook(
                                     "on_event",
                                     &script,
-                                    runtime,
+                                    rt_c,
                                     input,
                                     hook_timeout_secs,
                                     &effective_env,
