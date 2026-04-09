@@ -317,6 +317,7 @@ function DetailsModal({ channel, onClose, onConfigure, onTest, t }: {
 // Config Dialog — standard form with controlled inputs
 function ConfigDialog({ channel, onClose, t }: { channel: Channel; onClose: () => void; t: (key: string) => string }) {
   const queryClient = useQueryClient();
+  const addToast = useUIStore((s) => s.addToast);
   const fields = useMemo(() => (channel.fields ?? []).filter(f => !f.advanced), [channel.fields]);
 
   // Build initial form values: non-secret fields use saved value, secrets start empty
@@ -362,8 +363,10 @@ function ConfigDialog({ channel, onClose, t }: { channel: Channel; onClose: () =
     mutationFn: (payload: Record<string, string>) => configureChannel(channel.name, payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["channels", "list"] });
+      addToast(t("channels.config_success") || `${channel.display_name || channel.name} configured`, "success");
       onClose();
-    }
+    },
+    onError: (err: any) => addToast(err.message || t("channels.config_failed") || "Failed to configure channel", "error"),
   });
 
   return (
