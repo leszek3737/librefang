@@ -5,7 +5,7 @@
 //! ## Protocol
 //!
 //! Client → Server: `{"type":"input","data":"..."}`, `{"type":"resize","cols":N,"rows":N}`, `{"type":"close"}`
-//! Server → Client: `{"type":"started","shell":"...","pid":N}`, `{"type":"output","data":"..."}`, `{"type":"exit","code":N}`, `{"type":"error","content":"..."}`
+//! Server → Client: `{"type":"started","shell":"...","pid":N,"isRoot":bool}`, `{"type":"output","data":"..."}`, `{"type":"exit","code":N}`, `{"type":"error","content":"..."}`
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
@@ -22,7 +22,10 @@ use tracing::{info, warn};
 
 use super::AppState;
 use crate::terminal::PtySession;
-use crate::ws::{send_json, try_acquire_ws_slot, ws_auth_token, ws_query_param, WsConnectionGuard};
+use crate::ws::{
+    detect_connection_locality, send_json, try_acquire_ws_slot, validate_ws_origin, ws_auth_token,
+    ws_query_param, WsConnectionGuard,
+};
 
 pub const MAX_WS_MSG_SIZE: usize = 64 * 1024;
 
@@ -50,7 +53,12 @@ pub enum ClientMessage {
 #[serde(tag = "type")]
 pub enum ServerMessage {
     #[serde(rename = "started")]
-    Started { shell: String, pid: u32 },
+    Started {
+        shell: String,
+        pid: u32,
+        #[serde(rename = "isRoot")]
+        is_root: bool,
+    },
     #[serde(rename = "output")]
     Output { data: String, binary: Option<bool> },
     #[serde(rename = "exit")]
@@ -89,8 +97,12 @@ impl ClientMessage {
 impl fmt::Display for ServerMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ServerMessage::Started { shell, pid } => {
-                write!(f, "started(shell={shell}, pid={pid})")
+            ServerMessage::Started {
+                shell,
+                pid,
+                is_root,
+            } => {
+                write!(f, "started(shell={shell}, pid={pid}, is_root={is_root})")
             }
             ServerMessage::Output { data, binary } => {
                 let preview = if data.len() > 32 {
@@ -129,50 +141,129 @@ pub async fn terminal_ws(
     headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
 ) -> impl IntoResponse {
-    let provided_token = ws_auth_token(&headers, &uri);
+    let cfg = state.kernel.config_ref();
+    let locality = detect_connection_locality(&addr, &headers);
 
-    // No token at all → immediate reject.
-    let token_str = match provided_token.as_deref() {
-        Some(t) => t,
-        None => {
-            warn!("Terminal WebSocket rejected — no auth token provided");
-            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    if !cfg.terminal.enabled {
+        warn!(
+            ip = %locality.source_ip,
+            proxied = locality.is_proxied,
+            reason = "disabled",
+            "Terminal WebSocket rejected — terminal is disabled"
+        );
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
+
+    let listen_port = state
+        .kernel
+        .config_ref()
+        .api_listen
+        .parse::<std::net::SocketAddr>()
+        .map(|addr| addr.port())
+        .unwrap_or(4545);
+    if let Err(reason) = validate_ws_origin(&headers, listen_port, &cfg.terminal.allowed_origins) {
+        if !cfg.terminal.allow_remote {
+            warn!(
+                ip = %locality.source_ip,
+                proxied = locality.is_proxied,
+                reason = "origin_mismatch",
+                origin = %reason,
+                "Terminal WebSocket rejected — origin validation failed"
+            );
+            return axum::http::StatusCode::FORBIDDEN.into_response();
         }
-    };
+    }
 
-    // 1. Check against configured API tokens (constant-time compare).
     let valid_tokens = crate::server::valid_api_tokens(state.kernel.as_ref());
     let user_api_keys = crate::server::configured_user_api_keys(state.kernel.as_ref());
-    let api_auth = {
-        use subtle::ConstantTimeEq;
-        valid_tokens.iter().any(|key| {
-            token_str.len() == key.len() && token_str.as_bytes().ct_eq(key.as_bytes()).into()
-        })
-    };
+    let dashboard_auth = crate::server::has_dashboard_credentials(state.kernel.as_ref());
+    let auth_configured = !valid_tokens.is_empty() || !user_api_keys.is_empty() || dashboard_auth;
 
-    // 2. Check against active dashboard sessions (handles the case where
-    //    no api_key is configured but the user logged in via dashboard).
-    let session_auth = {
-        let mut sessions = state.active_sessions.write().await;
-        sessions.retain(|_, st| {
-            !crate::password_hash::is_token_expired(
-                st,
-                crate::password_hash::DEFAULT_SESSION_TTL_SECS,
-            )
-        });
-        sessions.contains_key(token_str)
-    };
-    let mut user_key_auth = false;
-    if !session_auth {
-        user_key_auth = user_api_keys
-            .iter()
-            .any(|user| crate::password_hash::verify_password(token_str, &user.api_key_hash));
-    }
+    let auth_method: &'static str;
+    let provided_token = ws_auth_token(&headers, &uri);
 
-    if !api_auth && !session_auth && !user_key_auth {
-        warn!("Terminal WebSocket upgrade rejected: invalid auth");
+    if let Some(token_str) = provided_token.as_deref() {
+        let api_auth = {
+            use subtle::ConstantTimeEq;
+            valid_tokens.iter().any(|key| {
+                token_str.len() == key.len() && token_str.as_bytes().ct_eq(key.as_bytes()).into()
+            })
+        };
+
+        let session_auth = {
+            let mut sessions = state.active_sessions.write().await;
+            sessions.retain(|_, st| {
+                !crate::password_hash::is_token_expired(
+                    st,
+                    crate::password_hash::DEFAULT_SESSION_TTL_SECS,
+                )
+            });
+            sessions.contains_key(token_str)
+        };
+
+        let mut user_key_auth = false;
+        if !session_auth {
+            user_key_auth = user_api_keys
+                .iter()
+                .any(|user| crate::password_hash::verify_password(token_str, &user.api_key_hash));
+        }
+
+        if api_auth || session_auth || user_key_auth {
+            auth_method = if api_auth {
+                "api_key"
+            } else if session_auth {
+                "session"
+            } else {
+                "user_key"
+            };
+        } else if auth_configured || cfg.terminal.allow_remote {
+            warn!(
+                ip = %locality.source_ip,
+                proxied = locality.is_proxied,
+                reason = "invalid_token",
+                "Terminal WebSocket rejected — invalid auth token"
+            );
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        } else if locality.is_local() {
+            auth_method = "local_bypass";
+        } else {
+            warn!(
+                ip = %locality.source_ip,
+                proxied = locality.is_proxied,
+                reason = "remote_no_auth",
+                "Terminal WebSocket rejected — remote connection denied without auth"
+            );
+            return axum::http::StatusCode::FORBIDDEN.into_response();
+        }
+    } else if auth_configured {
+        warn!(
+            ip = %locality.source_ip,
+            proxied = locality.is_proxied,
+            reason = "missing_token",
+            "Terminal WebSocket rejected — no auth token provided"
+        );
         return axum::http::StatusCode::UNAUTHORIZED.into_response();
-    }
+    } else if locality.is_local() {
+        auth_method = "local_bypass";
+    } else if cfg.terminal.allow_remote {
+        auth_method = "remote_open";
+    } else {
+        warn!(
+            ip = %locality.source_ip,
+            proxied = locality.is_proxied,
+            reason = "remote_no_auth",
+            "Terminal WebSocket rejected — remote connection denied without auth"
+        );
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    };
+
+    info!(
+        ip = %locality.source_ip,
+        local = locality.is_local(),
+        proxied = locality.is_proxied,
+        auth = %auth_method,
+        "Terminal WebSocket connected"
+    );
 
     let ip = addr.ip();
     let max_ws_per_ip = state.kernel.config_ref().rate_limit.max_ws_per_ip;
@@ -236,11 +327,12 @@ async fn handle_terminal_ws(
 
     let _ = send_json(
         &sender,
-        &serde_json::json!({
-            "type": "started",
-            "shell": shell_name,
-            "pid": pty.pid
-        }),
+        &serde_json::to_value(&ServerMessage::Started {
+            shell: shell_name,
+            pid: pty.pid,
+            is_root: crate::terminal::is_running_as_root(),
+        })
+        .unwrap(),
     )
     .await;
 
@@ -559,6 +651,7 @@ mod tests {
         let msg = ServerMessage::Started {
             shell: "/bin/bash".to_string(),
             pid: 12345,
+            is_root: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"started""#));
@@ -577,4 +670,13 @@ mod tests {
     fn test_terminal_router_creation() {
         let _app = router();
     }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket auth policy unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod terminal_ws_auth_tests {
+    // WebSocket auth policy helpers are tested in crate::ws tests.
 }

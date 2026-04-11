@@ -4,8 +4,9 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { useTranslation } from "react-i18next";
+import { useNavigate } from "@tanstack/react-router";
 import { Terminal as TerminalIcon } from "lucide-react";
-import { buildAuthenticatedWebSocketUrl } from "../api";
+import { buildAuthenticatedWebSocketUrl, getStatus } from "../api";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -19,6 +20,7 @@ interface ServerMessage {
   code?: number;
   signal?: string;
   content?: string;
+  isRoot?: boolean;
 }
 
 const RECONNECT_DELAY_MS = 2000;
@@ -26,6 +28,7 @@ const MAX_RECONNECT_ATTEMPTS = 10;
 
 export function TerminalPage() {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -38,6 +41,15 @@ export function TerminalPage() {
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isRoot, setIsRoot] = useState(false);
+
+  useEffect(() => {
+    getStatus().then((s) => {
+      if (s.terminal_enabled === false) {
+        void navigate({ to: "/overview" });
+      }
+    }).catch(() => {});
+  }, [navigate]);
 
   const sendCloseMessage = useCallback((ws: WebSocket | null) => {
     if (ws?.readyState === WebSocket.OPEN) {
@@ -52,6 +64,7 @@ export function TerminalPage() {
 
     setError(null);
     setIsConnecting(true);
+    setIsRoot(false);
     const url = new URL(buildAuthenticatedWebSocketUrl("/api/terminal/ws"));
     if (terminalRef.current) {
       url.searchParams.set("cols", String(terminalRef.current.cols));
@@ -81,6 +94,7 @@ export function TerminalPage() {
 
       switch (msg.type) {
         case "started":
+          setIsRoot(msg.isRoot ?? false);
           terminalRef.current?.write(
             t("terminal.started", { shell: msg.shell, pid: msg.pid }) + "\r\n"
           );
@@ -255,6 +269,11 @@ export function TerminalPage() {
       />
       <div className="flex-1 p-4">
         <Card className="h-full">
+          {isRoot && (
+            <div className="bg-red-500/20 border border-red-500/50 text-red-300 px-4 py-2 rounded-lg text-sm mb-2">
+              {t("terminal.root_warning")}
+            </div>
+          )}
           <div className="h-full min-h-[400px] flex flex-col">
             <div
               ref={containerRef}
