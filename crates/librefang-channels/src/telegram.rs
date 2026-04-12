@@ -745,7 +745,7 @@ impl TelegramAdapter {
                 return Ok(());
             }
 
-            warn!("Telegram sendMediaGroup failed ({status}): {body_text}");
+            return Err(format!("Telegram sendMediaGroup failed ({status}): {body_text}").into());
         }
         Ok(())
     }
@@ -810,8 +810,7 @@ impl TelegramAdapter {
                 return Ok(poll_id);
             }
 
-            warn!("Telegram sendPoll failed ({status}): {body_text}");
-            return Ok(String::new());
+            return Err(format!("Telegram sendPoll failed ({status}): {body_text}").into());
         }
         let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
         let poll_id = resp_body["result"]["poll"]["id"]

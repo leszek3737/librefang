@@ -2863,6 +2863,19 @@ async fn tool_channel_send(
     }
 
     if let Some(poll_question) = input.get("poll_question").and_then(|v| v.as_str()) {
+        for key in ["image_url", "image_path", "file_url", "file_path"] {
+            if input
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+            {
+                return Err(format!(
+                    "poll_question cannot be combined with media/file attachments (got {key})"
+                ));
+            }
+        }
+
         let poll_options: Vec<String> = input
             .get("poll_options")
             .and_then(|v| v.as_array())
