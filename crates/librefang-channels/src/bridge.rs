@@ -609,6 +609,35 @@ fn content_to_text(content: &ChannelContent) -> String {
         ChannelContent::FileData { filename, .. } => format!("[File: {filename}]"),
         ChannelContent::Interactive { text, .. } => text.clone(),
         ChannelContent::ButtonCallback { action, .. } => format!("[Button: {action}]"),
+        ChannelContent::DeleteMessage { message_id } => {
+            format!("[Delete message: {message_id}]")
+        }
+        ChannelContent::Audio {
+            url,
+            caption,
+            duration_seconds,
+            ..
+        } => match caption {
+            Some(c) => format!("[Audio ({duration_seconds}s): {url}]\n{c}"),
+            None => format!("[Audio ({duration_seconds}s): {url}]"),
+        },
+        ChannelContent::Animation {
+            url,
+            caption,
+            duration_seconds,
+        } => match caption {
+            Some(c) => format!("[Animation ({duration_seconds}s): {url}]\n{c}"),
+            None => format!("[Animation ({duration_seconds}s): {url}]"),
+        },
+        ChannelContent::Sticker { file_id } => format!("[Sticker: {file_id}]"),
+        ChannelContent::MediaGroup { items } => format!("[Media group: {} items]", items.len()),
+        ChannelContent::Poll { question, .. } => format!("[Poll: {question}]"),
+        ChannelContent::PollAnswer {
+            poll_id,
+            option_ids,
+        } => {
+            format!("[Poll answer: poll={poll_id}, options={option_ids:?}]")
+        }
     }
 }
 
@@ -1919,6 +1948,39 @@ async fn dispatch_message(
                     None => format!("[Button clicked: {action}]"),
                 }
             }
+        }
+        ChannelContent::DeleteMessage { ref message_id } => {
+            format!("[Delete message: {message_id}]")
+        }
+        ChannelContent::Audio {
+            ref url,
+            ref caption,
+            duration_seconds,
+            ..
+        } => match caption {
+            Some(c) => format!("[User sent audio ({duration_seconds}s): {url}]\nCaption: {c}"),
+            None => format!("[User sent audio ({duration_seconds}s): {url}]"),
+        },
+        ChannelContent::Animation {
+            ref url,
+            ref caption,
+            duration_seconds,
+        } => match caption {
+            Some(c) => {
+                format!("[User sent animation ({duration_seconds}s): {url}]\nCaption: {c}")
+            }
+            None => format!("[User sent animation ({duration_seconds}s): {url}]"),
+        },
+        ChannelContent::Sticker { ref file_id } => format!("[User sent sticker: {file_id}]"),
+        ChannelContent::MediaGroup { ref items } => {
+            format!("[User sent media group: {} items]", items.len())
+        }
+        ChannelContent::Poll { ref question, .. } => format!("[Poll: {question}]"),
+        ChannelContent::PollAnswer {
+            ref poll_id,
+            ref option_ids,
+        } => {
+            format!("[User answered poll {poll_id}: options {option_ids:?}]")
         }
     };
 
@@ -3704,6 +3766,121 @@ mod tests {
             message_text: Some("Approved".to_string()),
         };
         assert_eq!(content_to_text(&cb), "[Button: approve]");
+    }
+
+    #[test]
+    fn test_content_to_text_audio() {
+        let content = ChannelContent::Audio {
+            url: "https://example.com/song.mp3".to_string(),
+            caption: Some("My song".to_string()),
+            duration_seconds: 180,
+            title: Some("Song Title".to_string()),
+            performer: Some("Artist".to_string()),
+        };
+        let text = content_to_text(&content);
+        assert!(
+            text.contains("song.mp3") || text.contains("Song Title") || text.contains("Audio"),
+            "Audio content_to_text should contain meaningful info, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_content_to_text_audio_no_caption() {
+        let content = ChannelContent::Audio {
+            url: "https://example.com/track.mp3".to_string(),
+            caption: None,
+            duration_seconds: 60,
+            title: None,
+            performer: None,
+        };
+        let text = content_to_text(&content);
+        assert!(
+            !text.is_empty(),
+            "Audio without caption should still produce text"
+        );
+    }
+
+    #[test]
+    fn test_content_to_text_animation() {
+        let content = ChannelContent::Animation {
+            url: "https://example.com/funny.gif".to_string(),
+            caption: Some("LOL".to_string()),
+            duration_seconds: 5,
+        };
+        let text = content_to_text(&content);
+        assert!(
+            text.contains("LOL") || text.contains("Animation") || text.contains("funny.gif"),
+            "Animation content_to_text should contain meaningful info, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_content_to_text_sticker() {
+        let content = ChannelContent::Sticker {
+            file_id: "CAACAgIAAxkBAAI".to_string(),
+        };
+        let text = content_to_text(&content);
+        assert!(!text.is_empty(), "Sticker should produce non-empty text");
+    }
+
+    #[test]
+    fn test_content_to_text_media_group() {
+        let content = ChannelContent::MediaGroup {
+            items: vec![
+                crate::types::MediaGroupItem::Photo {
+                    url: "https://example.com/1.jpg".to_string(),
+                    caption: Some("First".to_string()),
+                },
+                crate::types::MediaGroupItem::Video {
+                    url: "https://example.com/2.mp4".to_string(),
+                    caption: None,
+                    duration_seconds: 30,
+                },
+            ],
+        };
+        let text = content_to_text(&content);
+        assert!(
+            text.contains("2") || text.contains("album") || text.contains("media"),
+            "MediaGroup should mention item count or type, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_content_to_text_poll() {
+        let content = ChannelContent::Poll {
+            question: "What is 2+2?".to_string(),
+            options: vec!["3".to_string(), "4".to_string(), "5".to_string()],
+            is_quiz: true,
+            correct_option_id: Some(1),
+            explanation: Some("Basic math".to_string()),
+        };
+        let text = content_to_text(&content);
+        assert!(
+            text.contains("2+2") || text.contains("Poll") || text.contains("quiz"),
+            "Poll should contain the question or type, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_content_to_text_poll_answer() {
+        let content = ChannelContent::PollAnswer {
+            poll_id: "poll_123".to_string(),
+            option_ids: vec![0, 2],
+        };
+        let text = content_to_text(&content);
+        assert!(!text.is_empty(), "PollAnswer should produce non-empty text");
+    }
+
+    #[test]
+    fn test_content_to_text_delete_message() {
+        let content = ChannelContent::DeleteMessage {
+            message_id: "42".to_string(),
+        };
+        let text = content_to_text(&content);
+        assert!(
+            text.contains("42") || text.contains("delete") || text.contains("Delete"),
+            "DeleteMessage should mention message_id or action, got: {text}"
+        );
     }
 
     mod message_debouncer {

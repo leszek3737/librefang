@@ -80,6 +80,22 @@ pub struct InteractiveMessage {
     pub buttons: Vec<Vec<InteractiveButton>>,
 }
 
+/// A single media item in a `MediaGroup` album message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MediaGroupItem {
+    /// A photo with optional caption.
+    Photo {
+        url: String,
+        caption: Option<String>,
+    },
+    /// A video with optional caption and duration.
+    Video {
+        url: String,
+        caption: Option<String>,
+        duration_seconds: u32,
+    },
+}
+
 /// Content types that can be received from a channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChannelContent {
@@ -142,6 +158,59 @@ pub enum ChannelContent {
         action: String,
         /// Original message text (if available).
         message_text: Option<String>,
+    },
+    /// Delete a previously sent message (outbound only).
+    /// Sending this variant causes the adapter to call deleteMessage.
+    DeleteMessage {
+        message_id: String,
+    },
+    /// Audio file (music/podcast — distinct from Voice messages).
+    /// Voice is for voice memos; Audio is for music files with metadata.
+    Audio {
+        url: String,
+        caption: Option<String>,
+        duration_seconds: u32,
+        /// Optional track title.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// Optional performer/artist.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        performer: Option<String>,
+    },
+    /// Animated GIF or H.264/MPEG-4 AVC video without sound.
+    Animation {
+        url: String,
+        caption: Option<String>,
+        duration_seconds: u32,
+    },
+    /// Sticker identified by a platform file_id (not a download URL).
+    Sticker {
+        file_id: String,
+    },
+    /// A group of media items sent as a single album.
+    MediaGroup {
+        items: Vec<MediaGroupItem>,
+    },
+    /// A poll or quiz sent to the user (outbound).
+    Poll {
+        question: String,
+        /// Answer option texts (2–10 options for Telegram).
+        options: Vec<String>,
+        /// When true, sent as a quiz (one correct answer).
+        #[serde(default)]
+        is_quiz: bool,
+        /// Index of the correct option (required when `is_quiz` is true).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correct_option_id: Option<u8>,
+        /// Explanation shown after user answers (quiz mode only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        explanation: Option<String>,
+    },
+    /// A user's answer to a poll (inbound only).
+    PollAnswer {
+        poll_id: String,
+        /// Indices of the selected options.
+        option_ids: Vec<u8>,
     },
 }
 
