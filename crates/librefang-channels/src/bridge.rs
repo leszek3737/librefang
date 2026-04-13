@@ -9,7 +9,7 @@ use crate::router::AgentRouter;
 use crate::sanitizer::{InputSanitizer, SanitizeResult};
 use crate::types::{
     default_phase_emoji, AgentPhase, ChannelAdapter, ChannelContent, ChannelMessage, ChannelUser,
-    LifecycleReaction, SenderContext,
+    InteractiveButton, LifecycleReaction, SenderContext,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -1831,6 +1831,49 @@ async fn dispatch_message(
     // as normal text forwarded to the agent.
     if let ChannelContent::Command { ref name, ref args } = message.content {
         if is_command_allowed(name, overrides.as_ref()) {
+            // Special-case /agents: send an inline keyboard with one button per agent.
+            if name == "agents" {
+                let agents = handle.list_agents().await.unwrap_or_default();
+                if !agents.is_empty() {
+                    let buttons: Vec<Vec<InteractiveButton>> = agents
+                        .into_iter()
+                        .map(|(_, agent_name)| {
+                            // Telegram callback_data limit is 64 bytes.
+                            // "/agent " is 7 bytes; truncate name to 57 bytes if needed.
+                            let action = {
+                                let prefix = "/agent ";
+                                let max_name_bytes = 64 - prefix.len();
+                                let safe_name = if agent_name.len() > max_name_bytes {
+                                    &agent_name[..max_name_bytes]
+                                } else {
+                                    &agent_name
+                                };
+                                format!("{prefix}{safe_name}")
+                            };
+                            vec![InteractiveButton {
+                                label: agent_name,
+                                action,
+                                style: None,
+                                url: None,
+                            }]
+                        })
+                        .collect();
+                    let content = ChannelContent::Interactive {
+                        text: "Select an agent:".to_string(),
+                        buttons,
+                    };
+                    let result = if let Some(tid) = thread_id {
+                        adapter.send_in_thread(&message.sender, content, tid).await
+                    } else {
+                        adapter.send(&message.sender, content).await
+                    };
+                    if let Err(e) = result {
+                        error!("Failed to send /agents interactive message: {e}");
+                    }
+                    return;
+                }
+                // Empty agent list — fall through to handle_command for plain text response.
+            }
             let result = handle_command(
                 name,
                 args,
@@ -2045,6 +2088,49 @@ async fn dispatch_message(
                 | "a2a"
         ) {
             if is_command_allowed(cmd, overrides.as_ref()) {
+                // Special-case /agents: send an inline keyboard with one button per agent.
+                if cmd == "agents" {
+                    let agents = handle.list_agents().await.unwrap_or_default();
+                    if !agents.is_empty() {
+                        let buttons: Vec<Vec<InteractiveButton>> = agents
+                            .into_iter()
+                            .map(|(_, name)| {
+                                // Telegram callback_data limit is 64 bytes.
+                                // "/agent " is 7 bytes; truncate name to 57 bytes if needed.
+                                let action = {
+                                    let prefix = "/agent ";
+                                    let max_name_bytes = 64 - prefix.len();
+                                    let safe_name = if name.len() > max_name_bytes {
+                                        &name[..max_name_bytes]
+                                    } else {
+                                        &name
+                                    };
+                                    format!("{prefix}{safe_name}")
+                                };
+                                vec![InteractiveButton {
+                                    label: name,
+                                    action,
+                                    style: None,
+                                    url: None,
+                                }]
+                            })
+                            .collect();
+                        let content = ChannelContent::Interactive {
+                            text: "Select an agent:".to_string(),
+                            buttons,
+                        };
+                        let result = if let Some(tid) = thread_id {
+                            adapter.send_in_thread(&message.sender, content, tid).await
+                        } else {
+                            adapter.send(&message.sender, content).await
+                        };
+                        if let Err(e) = result {
+                            error!("Failed to send /agents interactive message: {e}");
+                        }
+                        return;
+                    }
+                    // Empty agent list — fall through to handle_command for plain text response.
+                }
                 let result = handle_command(
                     cmd,
                     &args,
