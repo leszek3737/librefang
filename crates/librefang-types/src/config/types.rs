@@ -1795,6 +1795,16 @@ pub struct KernelConfig {
     /// enable this to stop remote enumeration of agents, config, and spend.
     #[serde(default)]
     pub require_auth_for_reads: bool,
+    /// Hex-encoded Ed25519 public keys (32 bytes → 64 hex chars) allowed to
+    /// sign agent manifests. `verify_signed_manifest` requires the envelope's
+    /// `signer_public_key` to be on this list before accepting a signature —
+    /// without a trust anchor, a self-signed envelope from any attacker
+    /// passes internal-consistency checks and would be indistinguishable
+    /// from a legitimate one. When empty, `SignedManifest` JSON payloads are
+    /// rejected outright (fail-closed). Raw unsigned TOML manifests are
+    /// unaffected; this list only gates the signed-envelope path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_manifest_signers: Vec<String>,
     /// Dashboard login username. When both dashboard_user and dashboard_pass
     /// are set, the dashboard requires username/password login.
     /// Can also be set via `LIBREFANG_DASHBOARD_USER` env var.
@@ -3390,6 +3400,7 @@ impl Default for KernelConfig {
             channels: ChannelsConfig::default(),
             api_key: String::new(),
             require_auth_for_reads: false,
+            trusted_manifest_signers: Vec::new(),
             dashboard_user: String::new(),
             dashboard_pass: String::new(),
             dashboard_pass_hash: String::new(),
