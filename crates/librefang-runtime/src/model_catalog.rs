@@ -214,8 +214,10 @@ impl ModelCatalog {
                 _ => false,
             };
 
-            provider.auth_status = if has_key || has_key_fallback {
+            provider.auth_status = if has_key {
                 AuthStatus::Configured
+            } else if has_key_fallback {
+                AuthStatus::AutoDetected
             } else if has_cli_fallback {
                 AuthStatus::ConfiguredCli
             } else {
@@ -239,7 +241,9 @@ impl ModelCatalog {
     pub fn providers_needing_validation(&self) -> Vec<(String, String, String)> {
         self.providers
             .iter()
-            .filter(|p| p.auth_status == AuthStatus::Configured)
+            .filter(|p| {
+                p.auth_status == AuthStatus::Configured || p.auth_status == AuthStatus::AutoDetected
+            })
             .map(|p| (p.id.clone(), p.base_url.clone(), p.api_key_env.clone()))
             .collect()
     }
