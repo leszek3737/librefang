@@ -594,7 +594,7 @@ export function getStoredApiKey(): string {
   return localStorage.getItem("librefang-api-key") || "";
 }
 
-function authHeader(): HeadersInit {
+export function authHeader(): HeadersInit {
   const lang = localStorage.getItem("i18nextLng") || navigator.language || "en";
   const token = getStoredApiKey();
   const headers: HeadersInit = { "Accept-Language": lang };
@@ -1534,7 +1534,10 @@ export async function getFullConfig(): Promise<Record<string, unknown>> {
 
 export interface ConfigFieldSchema {
   type?: string;
-  options?: (string | { id: string; name: string; provider: string })[];
+  options?: (string | { id: string; name: string; provider: string } | { value: string; label: string })[];
+  min?: number;
+  max?: number;
+  step?: number;
 }
 
 export interface ConfigSectionSchema {

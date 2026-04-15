@@ -1350,7 +1350,7 @@ impl LibreFangKernel {
             .unwrap_or_else(|| config.data_dir.join("librefang.db"));
         let mut substrate = MemorySubstrate::open_with_chunking(
             &db_path,
-            config.memory.decay_rate,
+            config.memory.decay_rate as f32,
             config.memory.chunking.clone(),
         )
         .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?;
@@ -2655,9 +2655,27 @@ system_prompt = "You are a helpful assistant."
         source_toml_path: Option<PathBuf>,
         predetermined_id: Option<AgentId>,
     ) -> KernelResult<AgentId> {
-        let agent_id = predetermined_id.unwrap_or_default();
-        let session_id = SessionId::new();
         let name = manifest.name.clone();
+        // Use a deterministic agent ID derived from the agent name so the
+        // same agent gets the same UUID across daemon restarts. This preserves
+        // session history associations in SQLite. Child agents spawned at
+        // runtime still use random IDs (via predetermined_id = None + parent).
+        let agent_id = predetermined_id.unwrap_or_else(|| {
+            if parent.is_none() {
+                AgentId::from_name(&name)
+            } else {
+                AgentId::new()
+            }
+        });
+
+        // Restore the most recent session for this agent if one exists in the
+        // database, so conversation history survives daemon restarts.
+        let session_id = self
+            .memory
+            .get_agent_session_ids(agent_id)
+            .ok()
+            .and_then(|ids| ids.into_iter().next())
+            .unwrap_or_default();
 
         // SECURITY: If this spawn is linked to a running parent agent,
         // enforce that the child's capabilities are a subset of the
@@ -8005,11 +8023,14 @@ system_prompt = "You are a helpful assistant."
                             error = result.error.as_deref().unwrap_or("unknown"),
                             "Local provider offline"
                         );
-                        // Mark unreachable local providers so dashboard doesn't show "configured"
+                        // Mark unreachable local providers as LocalOffline (not Missing).
+                        // Using Missing would cause detect_auth() to reset the status back
+                        // to NotRequired on the next unrelated auth check, making offline
+                        // providers reappear in the model switcher.
                         if let Ok(mut catalog) = kernel.model_catalog.write() {
                             catalog.set_provider_auth_status(
                                 provider_id,
-                                librefang_types::model_catalog::AuthStatus::Missing,
+                                librefang_types::model_catalog::AuthStatus::LocalOffline,
                             );
                         }
                     }
