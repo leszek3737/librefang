@@ -1,5 +1,6 @@
 import { queryOptions, useQuery } from "@tanstack/react-query";
 import {
+  getStatus,
   getQueueStatus,
   getHealthDetail,
   getSecurityStatus,
@@ -19,6 +20,18 @@ export function useDashboardSnapshot() {
 
 export function useVersionInfo() {
   return useQuery(versionInfoQueryOptions());
+}
+
+export const systemStatusQueryOptions = () =>
+  queryOptions({
+    queryKey: runtimeKeys.status(),
+    queryFn: getStatus,
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+  });
+
+export function useSystemStatus() {
+  return useQuery(systemStatusQueryOptions());
 }
 
 export const queueStatusQueryOptions = () =>

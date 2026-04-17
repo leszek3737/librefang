@@ -4,7 +4,6 @@ import { useTranslation } from "react-i18next";
 import { useNavigate } from "@tanstack/react-router";
 import { router } from "../router";
 import {
-  getHandSession,
   sendHandMessage,
   type HandDefinitionItem,
   type HandInstanceItem,
@@ -46,6 +45,7 @@ import {
   useHandSettings as useHandSettingsQuery,
   useHandStats,
   useHandStatsBatch,
+  useHandSession,
 } from "../lib/queries/hands";
 import {
   useActivateHand,
@@ -129,22 +129,22 @@ function HandChatPanel({
   const endRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
+  const { data: sessionData } = useHandSession(instanceId);
+
   useEffect(() => {
-    getHandSession(instanceId)
-      .then((data) => {
-        if (data.messages?.length) {
-          const hist: ChatMsg[] = data.messages.map((m: HandSessionMessage, i: number) => ({
-            id: `hist-${i}`,
-            role: m.role === "user" ? "user" as const : "assistant" as const,
-            content: m.content || "",
-            timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
-            blocks: m.blocks,
-          }));
-          setMessages(hist);
-        }
-      })
-      .catch(() => {});
-  }, [instanceId]);
+    if (sessionData?.messages?.length) {
+      const hist: ChatMsg[] = sessionData.messages.map(
+        (m: HandSessionMessage, i: number) => ({
+          id: `hist-${i}`,
+          role: m.role === "user" ? ("user" as const) : ("assistant" as const),
+          content: m.content || "",
+          timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+          blocks: m.blocks,
+        }),
+      );
+      setMessages(hist);
+    }
+  }, [sessionData]);
 
   useEffect(() => {
     if (messages.length > 0) {

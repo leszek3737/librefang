@@ -13,7 +13,7 @@ import {
   retryTask,
   cleanupSessions,
 } from "../../api";
-import { overviewKeys, runtimeKeys } from "../queries/keys";
+import { overviewKeys, runtimeKeys, sessionKeys } from "../queries/keys";
 
 type ShutdownResult = { status: string };
 type ReloadResult = { status: string; restart_required?: boolean; restart_reasons?: string[] };
@@ -93,5 +93,11 @@ export function useRetryTask() {
 }
 
 export function useCleanupSessions() {
-  return useMutation({ mutationFn: cleanupSessions });
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: cleanupSessions,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: sessionKeys.all });
+    },
+  });
 }

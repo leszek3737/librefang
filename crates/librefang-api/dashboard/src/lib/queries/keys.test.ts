@@ -211,6 +211,30 @@ describe("query key factories", () => {
     });
   });
 
+  describe("runtimeKeys anchoring", () => {
+    it("all sub-keys are prefixed with runtimeKeys.all", () => {
+      const prefix = runtimeKeys.all;
+      expect(runtimeKeys.status().slice(0, prefix.length)).toEqual(prefix);
+      expect(runtimeKeys.queueStatus().slice(0, prefix.length)).toEqual(prefix);
+      expect(runtimeKeys.healthDetail().slice(0, prefix.length)).toEqual(prefix);
+      expect(runtimeKeys.security().slice(0, prefix.length)).toEqual(prefix);
+      expect(runtimeKeys.backups().slice(0, prefix.length)).toEqual(prefix);
+      expect(runtimeKeys.taskStatus().slice(0, prefix.length)).toEqual(prefix);
+      expect(runtimeKeys.taskList().slice(0, prefix.length)).toEqual(prefix);
+      expect(runtimeKeys.taskList("running").slice(0, prefix.length)).toEqual(
+        prefix,
+      );
+    });
+  });
+
+  describe("overviewKeys anchoring", () => {
+    it("version is prefixed with overviewKeys.all", () => {
+      const prefix = overviewKeys.all;
+      expect(overviewKeys.version().slice(0, prefix.length)).toEqual(prefix);
+      expect(overviewKeys.snapshot().slice(0, prefix.length)).toEqual(prefix);
+    });
+  });
+
   describe("all factories exist", () => {
     const factories = [
       agentKeys,

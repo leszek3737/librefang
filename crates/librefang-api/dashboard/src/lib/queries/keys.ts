@@ -230,19 +230,19 @@ export const sessionKeys = {
 export const overviewKeys = {
   all: ["dashboard"] as const,
   snapshot: () => [...overviewKeys.all, "snapshot"] as const,
-  version: () => ["version"] as const,
+  version: () => [...overviewKeys.all, "version"] as const,
 };
 
 export const runtimeKeys = {
   all: ["runtime"] as const,
-  status: () => ["status"] as const,
-  queueStatus: () => ["queue", "status"] as const,
-  healthDetail: () => ["health", "detail"] as const,
-  security: () => ["security"] as const,
-  backups: () => ["backups"] as const,
-  taskStatus: () => ["tasks", "status"] as const,
+  status: () => [...runtimeKeys.all, "status"] as const,
+  queueStatus: () => [...runtimeKeys.all, "queue", "status"] as const,
+  healthDetail: () => [...runtimeKeys.all, "health", "detail"] as const,
+  security: () => [...runtimeKeys.all, "security"] as const,
+  backups: () => [...runtimeKeys.all, "backups"] as const,
+  taskStatus: () => [...runtimeKeys.all, "tasks", "status"] as const,
   taskList: (status?: string) =>
-    ["tasks", "list", status] as const,
+    [...runtimeKeys.all, "tasks", "list", status] as const,
 };
 
 export const auditKeys = {

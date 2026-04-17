@@ -1,6 +1,8 @@
 import { queryOptions, useQuery } from "@tanstack/react-query";
-import { listProviders, getStatus } from "../../api";
-import { providerKeys, runtimeKeys } from "./keys";
+import { listProviders } from "../../api";
+import { providerKeys } from "./keys";
+
+export { useSystemStatus as useProviderStatus } from "./runtime";
 
 export const providersQueryOptions = () =>
   queryOptions({
@@ -9,18 +11,6 @@ export const providersQueryOptions = () =>
     staleTime: 60_000,
   });
 
-export const statusQueryOptions = () =>
-  queryOptions({
-    queryKey: runtimeKeys.status(),
-    queryFn: getStatus,
-    staleTime: 30_000,
-    refetchInterval: 30_000,
-  });
-
 export function useProviders() {
   return useQuery(providersQueryOptions());
-}
-
-export function useProviderStatus() {
-  return useQuery(statusQueryOptions());
 }
