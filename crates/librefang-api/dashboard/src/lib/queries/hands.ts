@@ -91,6 +91,13 @@ export function useActiveHands() {
   return useQuery(handQueries.active());
 }
 
+export function useActiveHandsWhen(enabled: boolean) {
+  return useQuery({
+    ...handQueries.active(),
+    enabled,
+  });
+}
+
 export function useHandDetail(handId: string) {
   return useQuery(handQueries.detail(handId));
 }
