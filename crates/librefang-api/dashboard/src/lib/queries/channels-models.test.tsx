@@ -1,0 +1,200 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { renderHook, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ReactNode } from "react";
+import { useCommsEvents } from "./channels";
+import { useModels, useModelOverrides } from "./models";
+import * as httpClient from "../http/client";
+import { commsKeys, modelKeys } from "./keys";
+
+vi.mock("../http/client", () => ({
+  listCommsEvents: vi.fn(),
+  listModels: vi.fn(),
+  getModelOverrides: vi.fn(),
+}));
+
+function createWrapper() {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return function Wrapper({ children }: { children: ReactNode }) {
+    return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+describe("useCommsEvents", () => {
+  it("should fetch when enabled is undefined (default)", async () => {
+    const mockEvents = [{ id: "evt-1", kind: "message" }];
+    vi.mocked(httpClient.listCommsEvents).mockResolvedValue(mockEvents);
+
+    const { result } = renderHook(() => useCommsEvents(), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual(mockEvents);
+    expect(httpClient.listCommsEvents).toHaveBeenCalled();
+  });
+
+  it("should not fetch when enabled is false", () => {
+    const { result } = renderHook(() => useCommsEvents(50, { enabled: false }), {
+      wrapper: createWrapper(),
+    });
+
+    expect(result.current.data).toBeUndefined();
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(httpClient.listCommsEvents).not.toHaveBeenCalled();
+  });
+
+  it("should fetch when enabled is true", async () => {
+    const mockEvents = [{ id: "evt-1", kind: "message" }];
+    vi.mocked(httpClient.listCommsEvents).mockResolvedValue(mockEvents);
+
+    const { result } = renderHook(() => useCommsEvents(50, { enabled: true }), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual(mockEvents);
+    expect(httpClient.listCommsEvents).toHaveBeenCalledWith(50);
+  });
+
+  it("should use the correct queryKey", async () => {
+    vi.mocked(httpClient.listCommsEvents).mockResolvedValue([]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+    );
+    renderHook(() => useCommsEvents(100, { enabled: true }), { wrapper });
+
+    await waitFor(() => {
+      expect(qc.getQueryCache().find(commsKeys.events(100))).toBeDefined();
+    });
+    expect(
+      qc.getQueryCache().find(commsKeys.events(100))?.queryKey,
+    ).toEqual(commsKeys.events(100));
+  });
+});
+
+describe("useModels", () => {
+  it("should fetch when enabled is undefined (default)", async () => {
+    const mockResponse = { models: [{ id: "gpt-4", provider: "openai" }], total: 1, available: 1 };
+    vi.mocked(httpClient.listModels).mockResolvedValue(mockResponse);
+
+    const { result } = renderHook(() => useModels(), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual(mockResponse);
+    expect(httpClient.listModels).toHaveBeenCalled();
+  });
+
+  it("should not fetch when enabled is false", () => {
+    const { result } = renderHook(() => useModels({}, { enabled: false }), {
+      wrapper: createWrapper(),
+    });
+
+    expect(result.current.data).toBeUndefined();
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(httpClient.listModels).not.toHaveBeenCalled();
+  });
+
+  it("should fetch when enabled is true", async () => {
+    const mockResponse = { models: [{ id: "gpt-4", provider: "openai" }], total: 1, available: 1 };
+    vi.mocked(httpClient.listModels).mockResolvedValue(mockResponse);
+
+    const { result } = renderHook(() => useModels({}, { enabled: true }), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual(mockResponse);
+    expect(httpClient.listModels).toHaveBeenCalledWith({});
+  });
+
+  it("should pass filters to the API call", async () => {
+    const mockResponse = { models: [{ id: "claude-3", provider: "anthropic" }], total: 1, available: 1 };
+    vi.mocked(httpClient.listModels).mockResolvedValue(mockResponse);
+
+    const filters = { provider: "anthropic", tier: "premium" };
+    const { result } = renderHook(() => useModels(filters, { enabled: true }), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(httpClient.listModels).toHaveBeenCalledWith(filters);
+  });
+
+  it("should use the correct queryKey", async () => {
+    vi.mocked(httpClient.listModels).mockResolvedValue({ models: [], total: 0, available: 0 });
+
+    const filters = { provider: "openai" };
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+    );
+    renderHook(() => useModels(filters, { enabled: true }), { wrapper });
+
+    await waitFor(() => {
+      expect(qc.getQueryCache().find(modelKeys.list(filters))).toBeDefined();
+    });
+    expect(
+      qc.getQueryCache().find(modelKeys.list(filters))?.queryKey,
+    ).toEqual(modelKeys.list(filters));
+  });
+});
+
+describe("useModelOverrides", () => {
+  it("should be disabled when modelKey is empty string", () => {
+    const { result } = renderHook(() => useModelOverrides(""), {
+      wrapper: createWrapper(),
+    });
+
+    expect(result.current.data).toBeUndefined();
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(httpClient.getModelOverrides).not.toHaveBeenCalled();
+  });
+
+  it("should fetch when modelKey is valid", async () => {
+    const mockOverrides = { temperature: 0.7, max_tokens: 4096 };
+    vi.mocked(httpClient.getModelOverrides).mockResolvedValue(mockOverrides);
+
+    const { result } = renderHook(() => useModelOverrides("gpt-4"), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual(mockOverrides);
+    expect(httpClient.getModelOverrides).toHaveBeenCalledWith("gpt-4");
+  });
+
+  it("should use the correct queryKey", async () => {
+    vi.mocked(httpClient.getModelOverrides).mockResolvedValue({});
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+    );
+    renderHook(() => useModelOverrides("claude-3"), { wrapper });
+
+    await waitFor(() => {
+      expect(qc.getQueryCache().find(modelKeys.overrides("claude-3"))).toBeDefined();
+    });
+    expect(
+      qc.getQueryCache().find(modelKeys.overrides("claude-3"))?.queryKey,
+    ).toEqual(modelKeys.overrides("claude-3"));
+  });
+});

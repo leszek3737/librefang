@@ -1,0 +1,132 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { renderHook, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ReactNode } from "react";
+import { useAgentDetail, useAgentSessions, useAgentTemplates } from "./agents";
+import * as httpClient from "../http/client";
+import { agentKeys } from "./keys";
+
+vi.mock("../http/client", () => ({
+  getAgentDetail: vi.fn(),
+  listAgentSessions: vi.fn(),
+  listAgentTemplates: vi.fn(),
+}));
+
+function createWrapper() {
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return function Wrapper({ children }: { children: ReactNode }) {
+    return (
+      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+    );
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+describe("useAgentDetail", () => {
+  it("should be disabled when agentId is empty string", () => {
+    const { result } = renderHook(() => useAgentDetail(""), {
+      wrapper: createWrapper(),
+    });
+
+    expect(result.current.data).toBeUndefined();
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(httpClient.getAgentDetail).not.toHaveBeenCalled();
+  });
+
+  it("should be enabled when agentId is a valid string", async () => {
+    const mockAgent = { id: "agent-1", name: "Test Agent" };
+    vi.mocked(httpClient.getAgentDetail).mockResolvedValue(mockAgent);
+
+    const { result } = renderHook(() => useAgentDetail("agent-1"), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual(mockAgent);
+    expect(httpClient.getAgentDetail).toHaveBeenCalledWith("agent-1");
+  });
+
+  it("should use the correct queryKey", () => {
+    const { result } = renderHook(() => useAgentDetail("test-id"), {
+      wrapper: createWrapper(),
+    });
+
+    expect(result.current.data).toBeUndefined();
+    expect(httpClient.getAgentDetail).toHaveBeenCalledWith("test-id");
+  });
+});
+
+describe("useAgentSessions", () => {
+  it("should be disabled when agentId is empty string", () => {
+    const { result } = renderHook(() => useAgentSessions(""), {
+      wrapper: createWrapper(),
+    });
+
+    expect(result.current.data).toBeUndefined();
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(httpClient.listAgentSessions).not.toHaveBeenCalled();
+  });
+
+  it("should be enabled when agentId is a valid string", async () => {
+    const mockSessions = [{ id: "session-1", agentId: "agent-1" }];
+    vi.mocked(httpClient.listAgentSessions).mockResolvedValue(mockSessions);
+
+    const { result } = renderHook(() => useAgentSessions("agent-1"), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual(mockSessions);
+    expect(httpClient.listAgentSessions).toHaveBeenCalledWith("agent-1");
+  });
+});
+
+describe("useAgentTemplates", () => {
+  it("should fetch by default when enabled is not provided", async () => {
+    const mockTemplates = [{ id: "template-1", name: "Test Template" }];
+    vi.mocked(httpClient.listAgentTemplates).mockResolvedValue(mockTemplates);
+
+    const { result } = renderHook(() => useAgentTemplates(), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual(mockTemplates);
+    expect(httpClient.listAgentTemplates).toHaveBeenCalled();
+  });
+
+  it("should not fetch when enabled is false", () => {
+    const { result } = renderHook(() => useAgentTemplates({ enabled: false }), {
+      wrapper: createWrapper(),
+    });
+
+    expect(result.current.data).toBeUndefined();
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(httpClient.listAgentTemplates).not.toHaveBeenCalled();
+  });
+
+  it("should fetch when enabled is true", async () => {
+    const mockTemplates = [{ id: "template-1", name: "Test Template" }];
+    vi.mocked(httpClient.listAgentTemplates).mockResolvedValue(mockTemplates);
+
+    const { result } = renderHook(() => useAgentTemplates({ enabled: true }), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual(mockTemplates);
+    expect(httpClient.listAgentTemplates).toHaveBeenCalled();
+  });
+});
