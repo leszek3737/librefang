@@ -16,7 +16,7 @@
 <p align="center">
   <a href="https://librefang.ai/">网站</a> &bull;
   <a href="https://docs.librefang.ai">文档</a> &bull;
-   <a href="../CONTRIBUTING.md">贡献</a> &bull;
+  <a href="../CONTRIBUTING.md">贡献</a> &bull;
   <a href="https://discord.gg/DzTYqAZZmc">Discord</a>
 </p>
 

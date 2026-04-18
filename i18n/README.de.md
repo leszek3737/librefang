@@ -16,7 +16,7 @@
 <p align="center">
   <a href="https://librefang.ai/">Webseite</a> &bull;
   <a href="https://docs.librefang.ai">Dokumentation</a> &bull;
-   <a href="../CONTRIBUTING.md">Mitwirken</a> &bull;
+  <a href="../CONTRIBUTING.md">Mitwirken</a> &bull;
   <a href="https://discord.gg/DzTYqAZZmc">Discord</a>
 </p>
 
