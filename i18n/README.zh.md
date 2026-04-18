@@ -116,7 +116,7 @@ librefang hand status researcher     # 查看进度
 librefang hand list                  # 查看所有 Hands
 ```
 
-自定义 Hand：定义 `HAND.toml` + 系统提示词 + `SKILL.md`。[指南](../docs/src/app/agent/skills/page.mdx)
+自定义 Hand：定义 `HAND.toml` + 系统提示词 + `SKILL.md`。[指南](https://docs.librefang.ai/agent/skills)
 
 ## 架构
 
@@ -141,13 +141,13 @@ xtask                 构建自动化
 
 ## 核心特性
 
-**40 个渠道适配器** — Telegram、Discord、Slack、WhatsApp、Signal、Matrix、Email、Teams、Google Chat、飞书、LINE、Mastodon、Bluesky 等。[完整列表](../docs/src/app/integrations/channels/page.mdx)
+**40 个渠道适配器** — Telegram、Discord、Slack、WhatsApp、Signal、Matrix、Email、Teams、Google Chat、飞书、LINE、Mastodon、Bluesky 等。[完整列表](https://docs.librefang.ai/integrations/channels)
 
-**27 个 LLM 服务商** — Anthropic、Gemini、OpenAI、Groq、DeepSeek、OpenRouter、Ollama 等。智能路由、自动回退、成本追踪。[详情](../docs/src/app/configuration/providers/page.mdx)
+**27 个 LLM 服务商** — Anthropic、Gemini、OpenAI、Groq、DeepSeek、OpenRouter、Ollama 等。智能路由、自动回退、成本追踪。[详情](https://docs.librefang.ai/configuration/providers)
 
-**16 层安全体系** — WASM 沙箱、Merkle 审计链、污点追踪、Ed25519 签名、SSRF 防护、密钥清零等。[详情](../docs/src/app/getting-started/comparison/page.mdx)
+**16 层安全体系** — WASM 沙箱、Merkle 审计链、污点追踪、Ed25519 签名、SSRF 防护、密钥清零等。[详情](https://docs.librefang.ai/getting-started/comparison#16-security-systems--defense-in-depth)
 
-**OpenAI 兼容 API** — 即插即用的 `/v1/chat/completions` 端点。140+ REST/WS/SSE 端点。[API 参考](../docs/src/app/integrations/api/page.mdx)
+**OpenAI 兼容 API** — 即插即用的 `/v1/chat/completions` 端点。140+ REST/WS/SSE 端点。[API 参考](https://docs.librefang.ai/integrations/api)
 
 **客户端 SDK** — 完整 REST 客户端，支持流式传输。
 
@@ -185,9 +185,9 @@ client := librefang.New("http://localhost:4545")
 agent, _ := client.Agents.Create(map[string]interface{}{"template": "assistant"})
 ```
 
-**MCP 支持** — 内置 MCP 客户端和服务器。连接 IDE、扩展自定义工具、组合智能体管道。[详情](../docs/src/app/integrations/mcp-a2a/page.mdx)
+**MCP 支持** — 内置 MCP 客户端和服务器。连接 IDE、扩展自定义工具、组合智能体管道。[详情](https://docs.librefang.ai/integrations/mcp-a2a)
 
-**A2A 协议** — 支持 Google Agent-to-Agent 协议。跨智能体系统发现、通信和任务委派。[详情](../docs/src/app/integrations/mcp-a2a/page.mdx)
+**A2A 协议** — 支持 Google Agent-to-Agent 协议。跨智能体系统发现、通信和任务委派。[详情](https://docs.librefang.ai/integrations/mcp-a2a)
 
 **桌面应用** — Tauri 2.0 原生应用，支持系统托盘、通知和全局快捷键。
 
@@ -204,11 +204,11 @@ cargo fmt --all -- --check                               # 格式化检查
 
 ## 对比
 
-查看 [docs/comparison.md](../docs/src/app/getting-started/comparison/page.mdx) 了解 LibreFang 与 OpenClaw、ZeroClaw、CrewAI、AutoGen、LangGraph 的基准测试和功能对比。
+查看 [对比](https://docs.librefang.ai/getting-started/comparison#16-security-systems--defense-in-depth) 了解 LibreFang 与 OpenClaw、ZeroClaw、CrewAI、AutoGen、LangGraph 的基准测试和功能对比。
 
 ## 链接
 
-- [文档](https://docs.librefang.ai) &bull; [API 参考](../docs/src/app/integrations/api/page.mdx) &bull; [入门指南](../docs/src/app/getting-started/page.mdx) &bull; [故障排除](../docs/src/app/operations/troubleshooting/page.mdx)
+- [文档](https://docs.librefang.ai) &bull; [API 参考](https://docs.librefang.ai/integrations/api) &bull; [入门指南](https://docs.librefang.ai/getting-started) &bull; [故障排除](https://docs.librefang.ai/operations/troubleshooting)
 - [贡献](../CONTRIBUTING.md) &bull; [治理](../GOVERNANCE.md) &bull; [安全](../SECURITY.md)
 - 讨论: [问答](https://github.com/librefang/librefang/discussions/categories/q-a) &bull; [用例展示](https://github.com/librefang/librefang/discussions/categories/show-and-tell) &bull; [功能投票](https://github.com/librefang/librefang/discussions/categories/ideas) &bull; [公告](https://github.com/librefang/librefang/discussions/categories/announcements) &bull; [Discord](https://discord.gg/DzTYqAZZmc)
 

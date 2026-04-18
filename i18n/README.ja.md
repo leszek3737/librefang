@@ -116,7 +116,7 @@ librefang hand status researcher     # 進捗確認
 librefang hand list                  # 全 Hands を表示
 ```
 
-独自の Hand を作成: `HAND.toml` + システムプロンプト + `SKILL.md` を定義。[ガイド](../docs/src/app/agent/skills/page.mdx)
+独自の Hand を作成: `HAND.toml` + システムプロンプト + `SKILL.md` を定義。[ガイド](https://docs.librefang.ai/agent/skills)
 
 ## アーキテクチャ
 
@@ -141,13 +141,13 @@ xtask                 ビルド自動化
 
 ## 主な機能
 
-**40 チャネルアダプター** — Telegram、Discord、Slack、WhatsApp、Signal、Matrix、Email、Teams、Google Chat、Feishu、LINE、Mastodon、Bluesky 他。[完全リスト](../docs/src/app/integrations/channels/page.mdx)
+**40 チャネルアダプター** — Telegram、Discord、Slack、WhatsApp、Signal、Matrix、Email、Teams、Google Chat、Feishu、LINE、Mastodon、Bluesky 他。[完全リスト](https://docs.librefang.ai/integrations/channels)
 
-**27 LLM プロバイダー** — Anthropic、Gemini、OpenAI、Groq、DeepSeek、OpenRouter、Ollama 他。インテリジェントルーティング、自動フォールバック、コスト追跡。[詳細](../docs/src/app/configuration/providers/page.mdx)
+**27 LLM プロバイダー** — Anthropic、Gemini、OpenAI、Groq、DeepSeek、OpenRouter、Ollama 他。インテリジェントルーティング、自動フォールバック、コスト追跡。[詳細](https://docs.librefang.ai/configuration/providers)
 
-**16 セキュリティレイヤー** — WASM サンドボックス、Merkle 監査証跡、テイント追跡、Ed25519 署名、SSRF 保護、シークレットゼロ化他。[詳細](../docs/src/app/getting-started/comparison/page.mdx)
+**16 セキュリティレイヤー** — WASM サンドボックス、Merkle 監査証跡、テイント追跡、Ed25519 署名、SSRF 保護、シークレットゼロ化他。[詳細](https://docs.librefang.ai/getting-started/comparison#16-security-systems--defense-in-depth)
 
-**OpenAI 互換 API** — ドロップインの `/v1/chat/completions` エンドポイント。140+ REST/WS/SSE エンドポイント。[API リファレンス](../docs/src/app/integrations/api/page.mdx)
+**OpenAI 互換 API** — ドロップインの `/v1/chat/completions` エンドポイント。140+ REST/WS/SSE エンドポイント。[API リファレンス](https://docs.librefang.ai/integrations/api)
 
 **クライアント SDK** — ストリーミング対応の完全な REST クライアント。
 
@@ -185,9 +185,9 @@ client := librefang.New("http://localhost:4545")
 agent, _ := client.Agents.Create(map[string]interface{}{"template": "assistant"})
 ```
 
-**MCP サポート** — MCP クライアントとサーバーを内蔵。IDE 連携、カスタムツール拡張、エージェントパイプライン構築。[詳細](../docs/src/app/integrations/mcp-a2a/page.mdx)
+**MCP サポート** — MCP クライアントとサーバーを内蔵。IDE 連携、カスタムツール拡張、エージェントパイプライン構築。[詳細](https://docs.librefang.ai/integrations/mcp-a2a)
 
-**A2A プロトコル** — Google Agent-to-Agent プロトコル対応。エージェントシステム間の発見・通信・タスク委譲。[詳細](../docs/src/app/integrations/mcp-a2a/page.mdx)
+**A2A プロトコル** — Google Agent-to-Agent プロトコル対応。エージェントシステム間の発見・通信・タスク委譲。[詳細](https://docs.librefang.ai/integrations/mcp-a2a)
 
 **デスクトップアプリ** — Tauri 2.0 ネイティブアプリ。システムトレイ、通知、グローバルショートカット。
 
@@ -204,11 +204,11 @@ cargo fmt --all -- --check                               # フォーマットチ
 
 ## 比較
 
-[docs/comparison.md](../docs/src/app/getting-started/comparison/page.mdx) で OpenClaw、ZeroClaw、CrewAI、AutoGen、LangGraph とのベンチマークと機能比較を確認できます。
+[比較](https://docs.librefang.ai/getting-started/comparison#16-security-systems--defense-in-depth) で OpenClaw、ZeroClaw、CrewAI、AutoGen、LangGraph とのベンチマークと機能比較を確認できます。
 
 ## リンク
 
-- [ドキュメント](https://docs.librefang.ai) &bull; [API リファレンス](../docs/src/app/integrations/api/page.mdx) &bull; [入門ガイド](../docs/src/app/getting-started/page.mdx) &bull; [トラブルシューティング](../docs/src/app/operations/troubleshooting/page.mdx)
+- [ドキュメント](https://docs.librefang.ai) &bull; [API リファレンス](https://docs.librefang.ai/integrations/api) &bull; [入門ガイド](https://docs.librefang.ai/getting-started) &bull; [トラブルシューティング](https://docs.librefang.ai/operations/troubleshooting)
 - [コントリビュート](../CONTRIBUTING.md) &bull; [ガバナンス](../GOVERNANCE.md) &bull; [セキュリティ](../SECURITY.md)
 - ディスカッション: [Q&A](https://github.com/librefang/librefang/discussions/categories/q-a) &bull; [ユースケース](https://github.com/librefang/librefang/discussions/categories/show-and-tell) &bull; [機能投票](https://github.com/librefang/librefang/discussions/categories/ideas) &bull; [お知らせ](https://github.com/librefang/librefang/discussions/categories/announcements) &bull; [Discord](https://discord.gg/DzTYqAZZmc)
 

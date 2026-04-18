@@ -116,7 +116,7 @@ librefang hand status researcher     # Check progress
 librefang hand list                  # See all Hands
 ```
 
-Build your own: define a `HAND.toml` + system prompt + `SKILL.md`. [Guide](docs/src/app/agent/skills/page.mdx)
+Build your own: define a `HAND.toml` + system prompt + `SKILL.md`. [Guide](https://docs.librefang.ai/agent/skills)
 
 ## Architecture
 
@@ -141,13 +141,13 @@ xtask                 Build automation
 
 ## Key Features
 
-**40 Channel Adapters** — Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Email, Teams, Google Chat, Feishu, LINE, Mastodon, Bluesky, and 26 more. [Full list](docs/src/app/integrations/channels/page.mdx)
+**40 Channel Adapters** — Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Email, Teams, Google Chat, Feishu, LINE, Mastodon, Bluesky, and 26 more. [Full list](https://docs.librefang.ai/integrations/channels)
 
-**28 LLM Providers** — Anthropic, Gemini, OpenAI, Groq, DeepSeek, OpenRouter, Ollama, Alibaba Coding Plan, and 20 more. Intelligent routing, automatic fallback, cost tracking. [Details](docs/src/app/configuration/providers/page.mdx)
+**28 LLM Providers** — Anthropic, Gemini, OpenAI, Groq, DeepSeek, OpenRouter, Ollama, Alibaba Coding Plan, and 20 more. Intelligent routing, automatic fallback, cost tracking. [Details](https://docs.librefang.ai/configuration/providers)
 
-**16 Security Layers** — WASM sandbox, Merkle audit trail, taint tracking, Ed25519 signing, SSRF protection, secret zeroization, and more. [Details](docs/src/app/getting-started/comparison/page.mdx)
+**16 Security Layers** — WASM sandbox, Merkle audit trail, taint tracking, Ed25519 signing, SSRF protection, secret zeroization, and more. [Details](https://docs.librefang.ai/getting-started/comparison#16-security-systems--defense-in-depth)
 
-**OpenAI-Compatible API** — Drop-in `/v1/chat/completions` endpoint. 140+ REST/WS/SSE endpoints. [API Reference](docs/src/app/integrations/api/page.mdx)
+**OpenAI-Compatible API** — Drop-in `/v1/chat/completions` endpoint. 140+ REST/WS/SSE endpoints. [API Reference](https://docs.librefang.ai/integrations/api)
 
 **Client SDKs** — Full REST client with streaming support.
 
@@ -185,9 +185,9 @@ client := librefang.New("http://localhost:4545")
 agent, _ := client.Agents.Create(map[string]interface{}{"template": "assistant"})
 ```
 
-**MCP Support** — Built-in MCP client and server. Connect to IDEs, extend with custom tools, compose agent pipelines. [Details](docs/src/app/integrations/mcp-a2a/page.mdx)
+**MCP Support** — Built-in MCP client and server. Connect to IDEs, extend with custom tools, compose agent pipelines. [Details](https://docs.librefang.ai/integrations/mcp-a2a)
 
-**A2A Protocol** — Google Agent-to-Agent protocol support. Discover, communicate, and delegate tasks across agent systems. [Details](docs/src/app/integrations/mcp-a2a/page.mdx)
+**A2A Protocol** — Google Agent-to-Agent protocol support. Discover, communicate, and delegate tasks across agent systems. [Details](https://docs.librefang.ai/integrations/mcp-a2a)
 
 **Desktop App** — Tauri 2.0 native app with system tray, notifications, and global shortcuts.
 
@@ -204,11 +204,11 @@ cargo fmt --all -- --check                               # Format check
 
 ## Comparison
 
-See [docs/comparison.md](docs/src/app/getting-started/comparison/page.mdx) for benchmarks and feature-by-feature comparison vs OpenClaw, ZeroClaw, CrewAI, AutoGen, and LangGraph.
+See [Comparison](https://docs.librefang.ai/getting-started/comparison#16-security-systems--defense-in-depth) for benchmarks and feature-by-feature comparison vs OpenClaw, ZeroClaw, CrewAI, AutoGen, and LangGraph.
 
 ## Links
 
-- [Documentation](https://docs.librefang.ai) &bull; [API Reference](docs/src/app/integrations/api/page.mdx) &bull; [Getting Started](docs/src/app/getting-started/page.mdx) &bull; [Troubleshooting](docs/src/app/operations/troubleshooting/page.mdx)
+- [Documentation](https://docs.librefang.ai) &bull; [API Reference](https://docs.librefang.ai/integrations/api) &bull; [Getting Started](https://docs.librefang.ai/getting-started) &bull; [Troubleshooting](https://docs.librefang.ai/operations/troubleshooting)
 - [Contributing](CONTRIBUTING.md) &bull; [Governance](GOVERNANCE.md) &bull; [Security](SECURITY.md)
 - Discussions: [Q&A](https://github.com/librefang/librefang/discussions/categories/q-a) &bull; [Use Cases](https://github.com/librefang/librefang/discussions/categories/show-and-tell) &bull; [Feature Votes](https://github.com/librefang/librefang/discussions/categories/ideas) &bull; [Announcements](https://github.com/librefang/librefang/discussions/categories/announcements) &bull; [Discord](https://discord.gg/DzTYqAZZmc)
 

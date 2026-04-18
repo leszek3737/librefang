@@ -116,7 +116,7 @@ librefang hand status researcher     # 진행 상황 확인
 librefang hand list                  # 모든 Hands 보기
 ```
 
-나만의 Hand 만들기: `HAND.toml` + 시스템 프롬프트 + `SKILL.md`를 정의하세요. [가이드](../docs/src/app/agent/skills/page.mdx)
+나만의 Hand 만들기: `HAND.toml` + 시스템 프롬프트 + `SKILL.md`를 정의하세요. [가이드](https://docs.librefang.ai/agent/skills)
 
 ## 아키텍처
 
@@ -141,13 +141,13 @@ xtask                 빌드 자동화
 
 ## 주요 기능
 
-**40 채널 어댑터** — Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Email, Teams, Google Chat, Feishu, LINE, Mastodon, Bluesky 등. [전체 목록](../docs/src/app/integrations/channels/page.mdx)
+**40 채널 어댑터** — Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Email, Teams, Google Chat, Feishu, LINE, Mastodon, Bluesky 등. [전체 목록](https://docs.librefang.ai/integrations/channels)
 
-**27 LLM 프로바이더** — Anthropic, Gemini, OpenAI, Groq, DeepSeek, OpenRouter, Ollama 등. 지능형 라우팅, 자동 폴백, 비용 추적. [상세](../docs/src/app/configuration/providers/page.mdx)
+**27 LLM 프로바이더** — Anthropic, Gemini, OpenAI, Groq, DeepSeek, OpenRouter, Ollama 등. 지능형 라우팅, 자동 폴백, 비용 추적. [상세](https://docs.librefang.ai/configuration/providers)
 
-**16 보안 레이어** — WASM 샌드박스, Merkle 감사 추적, 테인트 추적, Ed25519 서명, SSRF 보호, 시크릿 제로화 등. [상세](../docs/src/app/getting-started/comparison/page.mdx)
+**16 보안 레이어** — WASM 샌드박스, Merkle 감사 추적, 테인트 추적, Ed25519 서명, SSRF 보호, 시크릿 제로화 등. [상세](https://docs.librefang.ai/getting-started/comparison#16-security-systems--defense-in-depth)
 
-**OpenAI 호환 API** — 드롭인 `/v1/chat/completions` 엔드포인트. 140+ REST/WS/SSE 엔드포인트. [API 레퍼런스](../docs/src/app/integrations/api/page.mdx)
+**OpenAI 호환 API** — 드롭인 `/v1/chat/completions` 엔드포인트. 140+ REST/WS/SSE 엔드포인트. [API 레퍼런스](https://docs.librefang.ai/integrations/api)
 
 **클라이언트 SDK** — 스트리밍 지원 완전한 REST 클라이언트.
 
@@ -185,9 +185,9 @@ client := librefang.New("http://localhost:4545")
 agent, _ := client.Agents.Create(map[string]interface{}{"template": "assistant"})
 ```
 
-**MCP 지원** — MCP 클라이언트 및 서버 내장. IDE 연동, 커스텀 도구 확장, 에이전트 파이프라인 구성. [상세](../docs/src/app/integrations/mcp-a2a/page.mdx)
+**MCP 지원** — MCP 클라이언트 및 서버 내장. IDE 연동, 커스텀 도구 확장, 에이전트 파이프라인 구성. [상세](https://docs.librefang.ai/integrations/mcp-a2a)
 
-**A2A 프로토콜** — Google Agent-to-Agent 프로토콜 지원. 에이전트 시스템 간 탐색, 통신, 태스크 위임. [상세](../docs/src/app/integrations/mcp-a2a/page.mdx)
+**A2A 프로토콜** — Google Agent-to-Agent 프로토콜 지원. 에이전트 시스템 간 탐색, 통신, 태스크 위임. [상세](https://docs.librefang.ai/integrations/mcp-a2a)
 
 **데스크톱 앱** — Tauri 2.0 네이티브 앱. 시스템 트레이, 알림, 글로벌 단축키.
 
@@ -204,11 +204,11 @@ cargo fmt --all -- --check                               # 포맷 체크
 
 ## 비교
 
-[docs/comparison.md](../docs/src/app/getting-started/comparison/page.mdx)에서 OpenClaw, ZeroClaw, CrewAI, AutoGen, LangGraph와의 벤치마크 및 기능 비교를 확인하세요.
+[비교](https://docs.librefang.ai/getting-started/comparison#16-security-systems--defense-in-depth)에서 OpenClaw, ZeroClaw, CrewAI, AutoGen, LangGraph와의 벤치마크 및 기능 비교를 확인하세요.
 
 ## 링크
 
-- [문서](https://docs.librefang.ai) &bull; [API 레퍼런스](../docs/src/app/integrations/api/page.mdx) &bull; [시작 가이드](../docs/src/app/getting-started/page.mdx) &bull; [문제 해결](../docs/src/app/operations/troubleshooting/page.mdx)
+- [문서](https://docs.librefang.ai) &bull; [API 레퍼런스](https://docs.librefang.ai/integrations/api) &bull; [시작 가이드](https://docs.librefang.ai/getting-started) &bull; [문제 해결](https://docs.librefang.ai/operations/troubleshooting)
 - [기여](../CONTRIBUTING.md) &bull; [거버넌스](../GOVERNANCE.md) &bull; [보안](../SECURITY.md)
 - 토론: [Q&A](https://github.com/librefang/librefang/discussions/categories/q-a) &bull; [유스케이스](https://github.com/librefang/librefang/discussions/categories/show-and-tell) &bull; [기능 투표](https://github.com/librefang/librefang/discussions/categories/ideas) &bull; [공지](https://github.com/librefang/librefang/discussions/categories/announcements) &bull; [Discord](https://discord.gg/DzTYqAZZmc)
 
