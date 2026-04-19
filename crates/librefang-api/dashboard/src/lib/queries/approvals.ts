@@ -74,7 +74,7 @@ export function usePendingApprovals(
   return useQuery({
     ...approvalQueries.pending(agentId),
     enabled: options.enabled,
-    refetchInterval: options.refetchInterval ?? REFETCH_PENDING,
+    ...(options.refetchInterval != null ? { refetchInterval: options.refetchInterval } : {}),
   });
 }
 

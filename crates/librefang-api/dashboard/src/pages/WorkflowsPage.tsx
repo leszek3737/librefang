@@ -71,21 +71,19 @@ export function WorkflowsPage() {
   );
 
   useEffect(() => {
+    if (!workflowsQuery.isSuccess) return;
     if (workflows.length === 0) {
-      if (selectedWorkflowId) setSelectedWorkflowId("");
-      if (manualSelection) setManualSelection(false);
+      if (!manualSelection && selectedWorkflowId) setSelectedWorkflowId("");
       return;
     }
-
     if (!selectedWorkflowId) {
       setSelectedWorkflowId(workflows[0]?.id ?? "");
       return;
     }
-
-    if (!workflows.some((workflow) => workflow.id === selectedWorkflowId) && !manualSelection) {
+    if (!manualSelection && !workflows.some((workflow) => workflow.id === selectedWorkflowId)) {
       setSelectedWorkflowId(workflows[0]?.id ?? "");
     }
-  }, [workflows, selectedWorkflowId, manualSelection]);
+  }, [workflows, selectedWorkflowId, manualSelection, workflowsQuery.isSuccess]);
 
   const handleRun = async () => {
     if (!selectedWorkflowId) return;
