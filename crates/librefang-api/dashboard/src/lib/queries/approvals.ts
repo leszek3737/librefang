@@ -67,8 +67,15 @@ export function useApprovalCount(options: { refetchInterval?: number } = {}) {
   });
 }
 
-export function usePendingApprovals(agentId?: string) {
-  return useQuery(approvalQueries.pending(agentId));
+export function usePendingApprovals(
+  agentId?: string,
+  options: { enabled?: boolean; refetchInterval?: number } = {},
+) {
+  return useQuery({
+    ...approvalQueries.pending(agentId),
+    enabled: options.enabled,
+    refetchInterval: options.refetchInterval ?? REFETCH_PENDING,
+  });
 }
 
 export function useApprovalAudit(params: {

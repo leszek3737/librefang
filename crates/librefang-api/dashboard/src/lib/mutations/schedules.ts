@@ -56,7 +56,10 @@ export function useUpdateTrigger() {
   return useMutation({
     mutationFn: ({ id, data }: { id: string; data: { enabled: boolean } }) =>
       updateTrigger(id, data),
-    onSuccess: () => qc.invalidateQueries({ queryKey: triggerKeys.all }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: triggerKeys.all });
+      qc.invalidateQueries({ queryKey: cronKeys.all });
+    },
   });
 }
 
@@ -64,6 +67,9 @@ export function useDeleteTrigger() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: deleteTrigger,
-    onSuccess: () => qc.invalidateQueries({ queryKey: triggerKeys.all }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: triggerKeys.all });
+      qc.invalidateQueries({ queryKey: cronKeys.all });
+    },
   });
 }

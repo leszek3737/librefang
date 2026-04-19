@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { formatDate } from "../lib/datetime";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "@tanstack/react-router";
 import {
@@ -53,6 +53,7 @@ export function WorkflowsPage() {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [expandedStepIdx, setExpandedStepIdx] = useState<number | null>(null);
   const [dryRunResult, setDryRunResult] = useState<DryRunResult | null>(null);
+  const [manualSelection, setManualSelection] = useState(false);
 
   const workflowsQuery = useWorkflows();
   const runsQuery = useWorkflowRuns(selectedWorkflowId);
@@ -68,6 +69,23 @@ export function WorkflowsPage() {
       .filter(wf => !searchQuery || wf.name?.toLowerCase().includes(searchQuery.toLowerCase()) || wf.description?.toLowerCase().includes(searchQuery.toLowerCase())),
     [workflowsQuery.data, searchQuery]
   );
+
+  useEffect(() => {
+    if (workflows.length === 0) {
+      if (selectedWorkflowId) setSelectedWorkflowId("");
+      if (manualSelection) setManualSelection(false);
+      return;
+    }
+
+    if (!selectedWorkflowId) {
+      setSelectedWorkflowId(workflows[0]?.id ?? "");
+      return;
+    }
+
+    if (!workflows.some((workflow) => workflow.id === selectedWorkflowId) && !manualSelection) {
+      setSelectedWorkflowId(workflows[0]?.id ?? "");
+    }
+  }, [workflows, selectedWorkflowId, manualSelection]);
 
   const handleRun = async () => {
     if (!selectedWorkflowId) return;
@@ -103,6 +121,9 @@ export function WorkflowsPage() {
     setConfirmDeleteId(null);
     try {
       await deleteMutation.mutateAsync(id);
+      if (selectedWorkflowId === id) {
+        setManualSelection(false);
+      }
     } catch (err) {
       addToast(
         err instanceof Error ? err.message : t("workflows.delete_failed", { defaultValue: "Delete failed" }),
@@ -291,7 +312,10 @@ export function WorkflowsPage() {
             </h2>
             {workflows.map(wf => (
               <div key={wf.id}
-                onClick={() => setSelectedWorkflowId(wf.id)}
+                onClick={() => {
+                  setSelectedWorkflowId(wf.id);
+                  setManualSelection(true);
+                }}
                 onDoubleClick={() => openWorkflow(wf.id)}
                 className={`group flex items-center gap-4 p-4 rounded-2xl border cursor-pointer transition-colors ${
                   selectedWorkflowId === wf.id
