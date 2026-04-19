@@ -22,6 +22,7 @@ function AddMemoryDialog({ onClose }: { onClose: () => void }) {
   const { t } = useTranslation();
   const [content, setContent] = useState("");
   const [agentId, setAgentId] = useState("");
+  const [level] = useState("user");
 
   const addMutation = useAddMemory();
 
