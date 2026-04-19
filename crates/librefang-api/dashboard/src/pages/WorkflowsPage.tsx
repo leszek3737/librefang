@@ -81,6 +81,9 @@ export function WorkflowsPage() {
       return;
     }
     if (!manualSelection && !workflows.some((workflow) => workflow.id === selectedWorkflowId)) {
+      setSelectedRunId(null);
+      setRunInput("");
+      setDryRunResult(null);
       setSelectedWorkflowId(workflows[0]?.id ?? "");
     }
   }, [workflows, selectedWorkflowId, manualSelection, workflowsQuery.isSuccess]);
