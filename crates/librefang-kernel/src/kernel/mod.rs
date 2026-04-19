@@ -8866,7 +8866,7 @@ system_prompt = "You are a helpful assistant."
                                 // get their own isolated session (channel="cron").
                                 let cron_sender = SenderContext {
                                     channel: "cron".to_string(),
-                                    user_id: String::new(),
+                                    user_id: job.peer_id.clone().unwrap_or_default(),
                                     display_name: "cron".to_string(),
                                     is_group: false,
                                     was_mentioned: false,
@@ -12250,6 +12250,7 @@ impl KernelHandle for LibreFangKernel {
             schedule,
             action,
             delivery,
+            peer_id: None,
             enabled: true,
             created_at: chrono::Utc::now(),
             next_run: None,
