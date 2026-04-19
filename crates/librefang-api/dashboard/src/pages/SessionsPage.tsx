@@ -38,8 +38,6 @@ export function SessionsPage() {
     const list = sessionsQuery.data ?? [];
     return list
       .filter(s => {
-        // Hide sessions for agents that no longer exist
-        if (!agentMap.has(s.agent_id || "")) return false;
         if (!search) return true;
         const agent = agentMap.get(s.agent_id || "");
         return (agent?.name || "").toLowerCase().includes(search.toLowerCase()) || s.session_id.includes(search);
@@ -159,11 +157,11 @@ export function SessionsPage() {
                           autoFocus
                           value={labelValue}
                           onChange={e => setLabelValue(e.target.value)}
-                          onKeyDown={e => { if (e.key === "Enter") labelMutation.mutate({ sessionId: s.session_id, label: labelValue }, { onSuccess: () => setEditingLabelId(null) }); if (e.key === "Escape") setEditingLabelId(null); }}
+                          onKeyDown={e => { if (e.key === "Enter") labelMutation.mutate({ sessionId: s.session_id, label: labelValue, agentId: s.agent_id ?? undefined }, { onSuccess: () => setEditingLabelId(null) }); if (e.key === "Escape") setEditingLabelId(null); }}
                           className="px-1.5 py-0.5 rounded border border-brand bg-main text-[10px] w-24 outline-none"
                           placeholder={t("sessions.label_placeholder", { defaultValue: "Label..." })}
                         />
-                        <button onClick={() => labelMutation.mutate({ sessionId: s.session_id, label: labelValue }, { onSuccess: () => setEditingLabelId(null) })} className="text-success"><Check className="w-3 h-3" /></button>
+                        <button onClick={() => labelMutation.mutate({ sessionId: s.session_id, label: labelValue, agentId: s.agent_id ?? undefined }, { onSuccess: () => setEditingLabelId(null) })} className="text-success"><Check className="w-3 h-3" /></button>
                         <button onClick={() => setEditingLabelId(null)} className="text-text-dim"><X className="w-3 h-3" /></button>
                       </span>
                     ) : (
