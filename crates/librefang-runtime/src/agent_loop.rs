@@ -570,6 +570,7 @@ struct ToolExecutionContext<'a> {
     docker_config: Option<&'a librefang_types::config::DockerSandboxConfig>,
     hooks: Option<&'a crate::hooks::HookRegistry>,
     process_manager: Option<&'a crate::process_manager::ProcessManager>,
+    process_registry: Option<&'a crate::process_registry::ProcessRegistry>,
     sender_user_id: Option<&'a str>,
     sender_channel: Option<&'a str>,
     checkpoint_manager: Option<&'a Arc<CheckpointManager>>,
@@ -744,6 +745,7 @@ async fn execute_single_tool_call(
             ctx.tts_engine,
             ctx.docker_config,
             ctx.process_manager,
+            ctx.process_registry,
             ctx.sender_user_id,
             ctx.sender_channel,
             ctx.checkpoint_manager,
@@ -2444,6 +2446,7 @@ pub async fn run_agent_loop(
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
     checkpoint_manager: Option<Arc<CheckpointManager>>,
+    process_registry: Option<&crate::process_registry::ProcessRegistry>,
     user_content_blocks: Option<Vec<ContentBlock>>,
     proactive_memory: Option<Arc<librefang_memory::ProactiveMemoryStore>>,
     context_engine: Option<&dyn ContextEngine>,
@@ -2944,6 +2947,7 @@ pub async fn run_agent_loop(
                         docker_config,
                         hooks,
                         process_manager,
+                        process_registry,
                         sender_user_id: sender_user_id.as_deref(),
                         sender_channel: sender_channel.as_deref(),
                         checkpoint_manager: checkpoint_manager.as_ref(),
@@ -3464,6 +3468,7 @@ pub async fn run_agent_loop_streaming(
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
     checkpoint_manager: Option<Arc<CheckpointManager>>,
+    process_registry: Option<&crate::process_registry::ProcessRegistry>,
     user_content_blocks: Option<Vec<ContentBlock>>,
     proactive_memory: Option<Arc<librefang_memory::ProactiveMemoryStore>>,
     context_engine: Option<&dyn ContextEngine>,
@@ -4015,6 +4020,7 @@ pub async fn run_agent_loop_streaming(
                         docker_config,
                         hooks,
                         process_manager,
+                        process_registry,
                         sender_user_id: sender_user_id.as_deref(),
                         sender_channel: sender_channel.as_deref(),
                         checkpoint_manager: checkpoint_manager.as_ref(),
@@ -6377,6 +6383,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
@@ -6437,6 +6444,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
@@ -6496,6 +6504,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
@@ -6549,6 +6558,7 @@ mod tests {
             None,
             None,
             None, // checkpoint_manager
+            None, // process_registry
             None,
             None,
             None,
@@ -6604,6 +6614,7 @@ mod tests {
             None,
             None,
             None, // checkpoint_manager
+            None, // process_registry
             None,
             None,
             None,
@@ -6660,6 +6671,7 @@ mod tests {
             None,
             None,
             None, // checkpoint_manager
+            None, // process_registry
             None,
             None,
             None,
@@ -6722,6 +6734,7 @@ mod tests {
             None,
             None,
             None, // checkpoint_manager
+            None, // process_registry
             None,
             None,
             None,
@@ -6778,6 +6791,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
@@ -6912,6 +6926,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
@@ -6965,6 +6980,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
@@ -7026,6 +7042,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
@@ -7809,6 +7826,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
@@ -7882,6 +7900,7 @@ mod tests {
             None,
             None,
             None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
@@ -7951,6 +7970,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
@@ -8250,6 +8270,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
@@ -8308,6 +8329,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
@@ -8367,6 +8389,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
@@ -8427,6 +8450,7 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
