@@ -69,8 +69,9 @@ export function useDeleteAgent() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: deleteAgent,
-    onSuccess: () => {
+    onSuccess: (_data, variables) => {
       qc.invalidateQueries({ queryKey: agentKeys.lists() });
+      qc.removeQueries({ queryKey: agentKeys.detail(variables) });
       qc.invalidateQueries({ queryKey: overviewKeys.snapshot() });
     },
   });

@@ -8,6 +8,7 @@ import {
 } from "../http/client";
 import { modelKeys, providerKeys, runtimeKeys } from "../queries/keys";
 
+// Fire-and-forget: one-shot probe, test result returned to caller, no cache to invalidate.
 export function useTestProvider() {
   return useMutation({
     mutationFn: testProvider,

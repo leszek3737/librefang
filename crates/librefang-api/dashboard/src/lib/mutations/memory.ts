@@ -23,6 +23,7 @@ export function useUpdateMemory() {
       updateMemory(id, content),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: memoryKeys.lists() });
+      qc.invalidateQueries({ queryKey: memoryKeys.statsAll() });
     },
   });
 }

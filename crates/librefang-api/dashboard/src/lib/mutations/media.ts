@@ -22,7 +22,7 @@ export function useGenerateImage(
     >
   >,
 ) {
-  return useMutation<MediaImageResult, Error, { prompt: string; provider?: string; model?: string; count?: number; aspect_ratio?: string }>({
+  return useMutation({
     ...options,
     mutationFn: generateImage,
   });
@@ -37,7 +37,7 @@ export function useSynthesizeSpeech(
     >
   >,
 ) {
-  return useMutation<SpeechResult, Error, { text: string; provider?: string; model?: string; voice?: string; format?: string; language?: string; speed?: number }>({
+  return useMutation({
     ...options,
     mutationFn: synthesizeSpeech,
   });
@@ -52,7 +52,7 @@ export function useSubmitVideo(
     >
   >,
 ) {
-  return useMutation<MediaVideoSubmitResult, Error, { prompt: string; provider?: string; model?: string }>({
+  return useMutation({
     ...options,
     mutationFn: submitVideo,
   });
@@ -67,7 +67,7 @@ export function useGenerateMusic(
     >
   >,
 ) {
-  return useMutation<MediaMusicResult, Error, { prompt?: string; lyrics?: string; provider?: string; model?: string; instrumental?: boolean }>({
+  return useMutation({
     ...options,
     mutationFn: generateMusic,
   });
