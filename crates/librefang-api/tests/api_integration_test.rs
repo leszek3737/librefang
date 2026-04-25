@@ -515,7 +515,7 @@ async fn test_run_migrate_uses_daemon_home_when_target_dir_is_empty() {
     )
     .unwrap();
 
-    let request = Request::builder()
+    let mut request = Request::builder()
         .method("POST")
         .uri("/api/migrate")
         .header("content-type", "application/json")
@@ -529,6 +529,16 @@ async fn test_run_migrate_uses_daemon_home_when_target_dir_is_empty() {
             .unwrap(),
         ))
         .unwrap();
+    // Simulate a loopback connection so the unauth-fail-closed branch
+    // (when api_key is empty) treats this oneshot as a localhost caller
+    // rather than a non-loopback origin. Production gets ConnectInfo from
+    // axum's connection layer; oneshot bypasses that, so we inject it.
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            0,
+        ))));
 
     let response = harness.app.clone().oneshot(request).await.unwrap();
 
@@ -1626,6 +1636,9 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         dashboard_auth_enabled: false,
         user_api_keys: Arc::new(Vec::new()),
         require_auth_for_reads: false,
+        // Tests synthesize requests without ConnectInfo, so opt in to the
+        // open-server path to keep them green.
+        allow_no_auth: true,
     };
 
     let app = Router::new()
