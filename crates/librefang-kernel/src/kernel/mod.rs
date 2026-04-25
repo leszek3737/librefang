@@ -9440,9 +9440,21 @@ system_prompt = "You are a helpful assistant."
             .deactivate(instance_id)
             .map_err(|e| KernelError::LibreFang(LibreFangError::Internal(e.to_string())))?;
 
-        // Kill all agents spawned by this hand (multi-agent support)
+        // Collect every hand-agent id touched by this instance so we can both
+        // kill the live runtime and scrub the persisted SQLite rows below.
+        //
+        // `kill_agent` already calls `memory.remove_agent` on its happy path,
+        // but it bails out with `Err` at `registry.remove(agent_id)?` when the
+        // agent isn't in the in-memory registry — which is exactly what
+        // happens to hand-agents across a restart since the boot fix in
+        // #a023519d skips `is_hand=true` rows in `load_all_agents`. On the
+        // error path the SQLite row is never touched, so without the explicit
+        // `memory.remove_agent` pass below the orphan accumulates every
+        // deactivate/reactivate cycle.
+        let mut affected_agents: Vec<AgentId> = Vec::new();
         if !instance.agent_ids.is_empty() {
             for &agent_id in instance.agent_ids.values() {
+                affected_agents.push(agent_id);
                 if let Err(e) = self.kill_agent(agent_id) {
                     warn!(agent = %agent_id, error = %e, "Failed to kill hand agent (may already be dead)");
                 }
@@ -9452,6 +9464,7 @@ system_prompt = "You are a helpful assistant."
             let hand_tag = format!("hand:{}", instance.hand_id);
             for entry in self.registry.list() {
                 if entry.tags.contains(&hand_tag) {
+                    affected_agents.push(entry.id);
                     if let Err(e) = self.kill_agent(entry.id) {
                         warn!(agent = %entry.id, error = %e, "Failed to kill orphaned hand agent");
                     } else {
@@ -9460,6 +9473,21 @@ system_prompt = "You are a helpful assistant."
                 }
             }
         }
+
+        // Remove the SQLite rows for every hand-agent we just tore down.
+        // `remove_agent` cascades to session rows, so we don't need a
+        // separate `delete_agent_sessions` call here.
+        for agent_id in &affected_agents {
+            if let Err(e) = self.memory.remove_agent(*agent_id) {
+                warn!(
+                    agent = %agent_id,
+                    hand_id = %instance.hand_id,
+                    error = %e,
+                    "Failed to remove hand-agent row from SQLite on deactivate"
+                );
+            }
+        }
+
         // Persist hand state so it survives restarts
         self.persist_hand_state();
         Ok(())
@@ -9544,6 +9572,105 @@ system_prompt = "You are a helpful assistant."
 
         self.hand_registry
             .update_agent_runtime_override(instance.instance_id, &role, merged)
+            .map_err(|e| KernelError::LibreFang(LibreFangError::Internal(e.to_string())))?;
+        self.persist_hand_state();
+        Ok(())
+    }
+
+    /// Clear all runtime overrides for a hand agent, restoring the live
+    /// manifest to the defaults declared in the owning hand's HAND.toml.
+    ///
+    /// Returns [`LibreFangError::AgentNotFound`] if the agent id is not
+    /// attached to any active hand. Returns an `Internal` error with the
+    /// `Hand role not found` prefix if the hand instance exists but no role
+    /// maps to the given agent id (should not happen in practice — guarded
+    /// so the HTTP layer can surface a 409 instead of a silent 500).
+    ///
+    /// Unlike [`Self::update_hand_agent_runtime_override`], this is a full
+    /// reset: the per-role entry in `agent_runtime_overrides` is dropped and
+    /// the agent's `model`, `provider`, `api_key_env`, `base_url`,
+    /// `max_tokens`, `temperature`, and `web_search_augmentation` fields
+    /// are rewritten from `def.agents[role].manifest`. State is persisted
+    /// via [`Self::persist_hand_state`] before returning.
+    pub fn clear_hand_agent_runtime_override(&self, agent_id: AgentId) -> KernelResult<()> {
+        let instance = self.hand_registry.find_by_agent(agent_id).ok_or_else(|| {
+            KernelError::LibreFang(LibreFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+        let role = instance
+            .agent_ids
+            .iter()
+            .find_map(|(role, id)| (*id == agent_id).then(|| role.clone()))
+            .ok_or_else(|| {
+                KernelError::LibreFang(LibreFangError::Internal(format!(
+                    "Hand role not found for agent {agent_id}"
+                )))
+            })?;
+
+        // Look up the owning hand definition so we know what "default" means
+        // for this role. If the definition was unloaded (unusual — indicates
+        // the hand was uninstalled while the instance still lives) we still
+        // drop the override from hand_state and skip the manifest rewrite,
+        // matching the graceful-degradation pattern used elsewhere in this
+        // module.
+        let def = self.hand_registry.get_definition(&instance.hand_id);
+        if let Some(def) = def {
+            if let Some(agent_def) = def.agents.get(&role) {
+                // Start from the raw HAND.toml manifest and re-apply the
+                // same "default" sentinel resolution that `activate_hand_with_id`
+                // runs at activation time. Going through the raw manifest
+                // would leave `model = "default"` on disk, which the LLM
+                // driver can't route.
+                let cfg = self.config.load();
+                let mut provider = agent_def.manifest.model.provider.clone();
+                let mut model = agent_def.manifest.model.model.clone();
+                let mut api_key_env = agent_def.manifest.model.api_key_env.clone();
+                let mut base_url = agent_def.manifest.model.base_url.clone();
+                if provider == "default" {
+                    provider = cfg.default_model.provider.clone();
+                    if api_key_env.is_none() {
+                        api_key_env = Some(cfg.default_model.api_key_env.clone());
+                    }
+                    if base_url.is_none() {
+                        base_url = cfg.default_model.base_url.clone();
+                    }
+                }
+                if model == "default" {
+                    model = cfg.default_model.model.clone();
+                }
+
+                self.registry
+                    .update_model_provider_config(agent_id, model, provider, api_key_env, base_url)
+                    .map_err(KernelError::LibreFang)?;
+                self.registry
+                    .update_max_tokens(agent_id, agent_def.manifest.model.max_tokens)
+                    .map_err(KernelError::LibreFang)?;
+                self.registry
+                    .update_temperature(agent_id, agent_def.manifest.model.temperature)
+                    .map_err(KernelError::LibreFang)?;
+                self.registry
+                    .update_web_search_augmentation(
+                        agent_id,
+                        agent_def.manifest.web_search_augmentation,
+                    )
+                    .map_err(KernelError::LibreFang)?;
+            } else {
+                warn!(
+                    agent = %agent_id,
+                    hand = %instance.hand_id,
+                    role = %role,
+                    "Hand definition has no entry for role; skipping manifest reset"
+                );
+            }
+        } else {
+            warn!(
+                agent = %agent_id,
+                hand = %instance.hand_id,
+                "Hand definition not loaded; skipping manifest reset on clear"
+            );
+        }
+
+        self.hand_registry
+            .clear_agent_runtime_override(instance.instance_id, &role)
             .map_err(|e| KernelError::LibreFang(LibreFangError::Internal(e.to_string())))?;
         self.persist_hand_state();
         Ok(())
@@ -10392,6 +10519,61 @@ system_prompt = "You are a helpful assistant."
                 }
                 // Write an empty state file so subsequent boots skip this block.
                 self.persist_hand_state();
+            }
+        }
+
+        // ── Orphaned hand-agent GC ────────────────────────────────────────
+        // After the boot restore loop above, `hand_registry.list_instances()`
+        // contains every agent id that belongs to a currently active hand.
+        // Any `is_hand = true` row in SQLite whose id is not in that live
+        // set is orphaned — it belonged to a previous activation that was
+        // deactivated or failed to restore, and since the #a023519d fix
+        // skips `is_hand` rows in `load_all_agents`, it will never be
+        // reconstructed. Remove it (and its sessions via the cascade in
+        // `memory.remove_agent`) so the DB doesn't accumulate garbage
+        // across restart cycles.
+        //
+        // Non-hand agents are untouched; we filter on `entry.is_hand`
+        // before considering a row for deletion.
+        {
+            let live_hand_agents: std::collections::HashSet<AgentId> = self
+                .hand_registry
+                .list_instances()
+                .iter()
+                .flat_map(|inst| inst.agent_ids.values().copied().collect::<Vec<_>>())
+                .collect();
+            match self.memory.load_all_agents() {
+                Ok(all) => {
+                    let mut removed = 0usize;
+                    for entry in all {
+                        if !entry.is_hand {
+                            continue;
+                        }
+                        if live_hand_agents.contains(&entry.id) {
+                            continue;
+                        }
+                        match self.memory.remove_agent(entry.id) {
+                            Ok(()) => {
+                                removed += 1;
+                                info!(
+                                    agent = %entry.name,
+                                    id = %entry.id,
+                                    "GC: removed orphaned hand-agent row from SQLite"
+                                );
+                            }
+                            Err(e) => warn!(
+                                agent = %entry.name,
+                                id = %entry.id,
+                                error = %e,
+                                "GC: failed to remove orphaned hand-agent row"
+                            ),
+                        }
+                    }
+                    if removed > 0 {
+                        info!("GC: removed {removed} orphaned hand-agent row(s) from SQLite");
+                    }
+                }
+                Err(e) => warn!("GC: failed to enumerate agents for orphan scan: {e}"),
             }
         }
 

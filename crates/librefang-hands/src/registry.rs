@@ -15,6 +15,41 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Current version of the persisted hand state format.
+///
+/// # Version history
+///
+/// - **v1**: bare JSON array of instance objects, `agent_id` as a single
+///   [`AgentId`] (pre-multi-agent hands).
+/// - **v2**: introduced the `{ version, instances: [...] }` wrapper; still
+///   single-agent-per-hand.
+/// - **v3**: multi-agent support — `agent_ids` is a `BTreeMap<role, AgentId>`
+///   and adds `coordinator_role`. Typed-serde path begins here.
+/// - **v4**: adds `activated_at` / `updated_at` timestamps so a restart does
+///   not reset the "activated" clock shown in the dashboard.
+/// - **v5** *(current)*: adds `agent_runtime_overrides` — a per-role
+///   [`HandAgentRuntimeOverride`] map capturing dashboard-edited model /
+///   provider / max_tokens / temperature / web_search_augmentation values
+///   so they survive daemon restarts instead of being rebuilt from the
+///   hand definition on every boot.
+///
+/// # Forward/backward compatibility
+///
+/// [`PersistedInstance`] uses `#[serde(default)]` + `skip_serializing_if` on
+/// every version-bump field, so:
+///
+/// - **Forward-compat (load old state)**: a daemon running v5 can read v1-v4
+///   state files untouched. Unknown older shapes drop through to the
+///   untyped fallback in [`HandRegistry::load_state`], and a legacy
+///   `config.__model_overrides__` blob is migrated into
+///   `agent_runtime_overrides` there via [`legacy_agent_runtime_overrides`]
+///   without clobbering any overrides already present in the v5 map.
+/// - **Backward-compat (downgrade daemon)**: a v4 daemon loading a file
+///   written by v5 will silently drop the `agent_runtime_overrides` field
+///   (it serializes with `skip_serializing_if = "BTreeMap::is_empty"` and
+///   is not in the v4 struct). This is **expected** — a downgrade will
+///   strip runtime overrides from the restored hands, and the user must
+///   re-apply them from the dashboard. Tests in `kernel/tests.rs` guard
+///   the happy path (same-version round-trip).
 const PERSIST_VERSION: u32 = 5;
 
 /// Typed representation of persisted hand state.
@@ -242,23 +277,25 @@ fn legacy_agent_runtime_overrides(
         let Some(obj) = value.as_object() else {
             continue;
         };
-        let mut cfg = HandAgentRuntimeOverride::default();
-        cfg.model = obj
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string);
-        cfg.provider = obj
-            .get("provider")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string);
-        cfg.max_tokens = obj
-            .get("max_tokens")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok());
-        cfg.temperature = obj
-            .get("temperature")
-            .and_then(|v| v.as_f64())
-            .map(|v| v as f32);
+        let cfg = HandAgentRuntimeOverride {
+            model: obj
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            provider: obj
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            max_tokens: obj
+                .get("max_tokens")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
+            temperature: obj
+                .get("temperature")
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32),
+            ..Default::default()
+        };
         if cfg != HandAgentRuntimeOverride::default() {
             out.insert(role.clone(), cfg);
         }
@@ -916,6 +953,30 @@ impl HandRegistry {
             .insert(role.to_string(), override_config);
         entry.updated_at = chrono::Utc::now();
         Ok(())
+    }
+
+    /// Drop the runtime override entry for `(instance_id, role)`, returning
+    /// the previous value if any.
+    ///
+    /// Returns `Ok(None)` if the instance exists but no override was stored
+    /// for the role — idempotent by design so the HTTP DELETE handler can
+    /// safely retry without surfacing a "not found" to callers. Returns
+    /// [`HandError::InstanceNotFound`] only when the hand instance itself
+    /// has been torn down.
+    pub fn clear_agent_runtime_override(
+        &self,
+        instance_id: Uuid,
+        role: &str,
+    ) -> HandResult<Option<HandAgentRuntimeOverride>> {
+        let mut entry = self
+            .instances
+            .get_mut(&instance_id)
+            .ok_or(HandError::InstanceNotFound(instance_id))?;
+        let removed = entry.agent_runtime_overrides.remove(role);
+        if removed.is_some() {
+            entry.updated_at = chrono::Utc::now();
+        }
+        Ok(removed)
     }
 
     /// Backward-compatible: set a single agent ID under the "main" role.
@@ -1596,6 +1657,41 @@ system_prompt = "Prompt"
         );
         assert_eq!(override_config.max_tokens, Some(7777));
         assert_eq!(override_config.temperature, Some(0.4));
+    }
+
+    #[test]
+    fn clear_agent_runtime_override_removes_entry_and_is_idempotent() {
+        let reg = HandRegistry::new();
+        reg.reload_from_disk(&ensure_test_home());
+
+        let inst = reg.activate("clip", HashMap::new()).unwrap();
+        reg.update_agent_runtime_override(
+            inst.instance_id,
+            "main",
+            HandAgentRuntimeOverride {
+                model: Some("x".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // First clear returns the previous value.
+        let removed = reg
+            .clear_agent_runtime_override(inst.instance_id, "main")
+            .expect("instance exists");
+        assert_eq!(removed.and_then(|o| o.model).as_deref(), Some("x"));
+
+        // Subsequent clears are a no-op returning `None`.
+        let again = reg
+            .clear_agent_runtime_override(inst.instance_id, "main")
+            .expect("instance still exists");
+        assert!(again.is_none());
+
+        // Clearing a missing instance still reports `InstanceNotFound`.
+        let missing = reg.clear_agent_runtime_override(Uuid::new_v4(), "main");
+        assert!(matches!(missing, Err(HandError::InstanceNotFound(_))));
+
+        reg.deactivate(inst.instance_id).unwrap();
     }
 
     #[test]
@@ -2394,5 +2490,96 @@ metrics = []
 "#;
         let result = registry.install_from_content(toml_content, "");
         assert!(result.is_ok());
+    }
+
+    /// A v4-era state file stashed its dashboard-edited overrides inside
+    /// `config.__model_overrides__` (a stringly-typed JSON blob) rather than
+    /// the typed `agent_runtime_overrides` field introduced in v5. When v5
+    /// loads that file it must migrate the legacy blob into
+    /// `agent_runtime_overrides` so the restart path can re-apply the
+    /// override to the spawned manifest — and it must **not** clobber any
+    /// value that v5 already persisted for the same role.
+    #[test]
+    fn load_state_migrates_legacy_model_overrides_without_overwriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_path = tmp.path().join("hand_state.json");
+
+        // One instance with a typed (v5) override for role "main" plus a
+        // legacy (v4) blob that carries the same role "main" AND a fresh
+        // role "helper". The migration must:
+        //   - leave "main" untouched (typed value wins),
+        //   - insert "helper" from the legacy blob.
+        let state_json = serde_json::json!({
+            "version": 5,
+            "instances": [{
+                "hand_id": "legacy-hand",
+                "instance_id": "11111111-1111-1111-1111-111111111111",
+                "config": {
+                    "__model_overrides__": {
+                        "main": {
+                            "model": "legacy-model",
+                            "provider": "legacy-provider",
+                            "max_tokens": 1000,
+                            "temperature": 0.1
+                        },
+                        "helper": {
+                            "model": "helper-model",
+                            "provider": "helper-provider",
+                            "max_tokens": 2000,
+                            "temperature": 0.2
+                        }
+                    }
+                },
+                "agent_runtime_overrides": {
+                    "main": {
+                        "model": "typed-model",
+                        "provider": "typed-provider",
+                        "max_tokens": 9999,
+                        "temperature": 0.9
+                    }
+                },
+                "agent_ids": {},
+                "coordinator_role": "main",
+                "status": "Active"
+            }]
+        });
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&state_json).unwrap(),
+        )
+        .unwrap();
+
+        let restored = HandRegistry::load_state(&state_path);
+        assert_eq!(restored.len(), 1);
+        let entry = &restored[0];
+
+        // Typed v5 value for "main" must win — the legacy blob must NOT
+        // overwrite it.
+        let main = entry
+            .agent_runtime_overrides
+            .get("main")
+            .expect("main override must be present");
+        assert_eq!(main.model.as_deref(), Some("typed-model"));
+        assert_eq!(main.provider.as_deref(), Some("typed-provider"));
+        assert_eq!(main.max_tokens, Some(9999));
+        assert_eq!(main.temperature, Some(0.9));
+
+        // "helper" was only present in the legacy blob — must be migrated
+        // into the typed map verbatim.
+        let helper = entry
+            .agent_runtime_overrides
+            .get("helper")
+            .expect("helper override must be migrated from legacy blob");
+        assert_eq!(helper.model.as_deref(), Some("helper-model"));
+        assert_eq!(helper.provider.as_deref(), Some("helper-provider"));
+        assert_eq!(helper.max_tokens, Some(2000));
+        assert!(
+            helper
+                .temperature
+                .map(|t| (t - 0.2).abs() < 1e-6)
+                .unwrap_or(false),
+            "helper temperature must migrate from legacy blob: {:?}",
+            helper.temperature
+        );
     }
 }
