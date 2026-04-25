@@ -264,6 +264,10 @@ fn safe_trim_messages(
 
     // Re-validate after trim.
     *messages = crate::session_repair::validate_and_repair(messages);
+    // Ensure history starts with a user turn: trimming may have left an
+    // assistant turn at position 0, which strict providers (e.g. Gemini)
+    // reject with INVALID_ARGUMENT on function-call turns.
+    *messages = crate::session_repair::ensure_starts_with_user(std::mem::take(messages));
 
     // Post-trim safety: ensure at least a user message survives so the LLM
     // request body is never empty.
@@ -3031,6 +3035,8 @@ pub async fn run_agent_loop(
             if !compression_events.is_empty() {
                 messages = compressed;
                 messages = crate::session_repair::validate_and_repair(&messages);
+                // Ensure history starts with a user turn after soft compression.
+                messages = crate::session_repair::ensure_starts_with_user(messages);
                 // Keep session.messages in sync with the compressed LLM working copy
                 // so subsequent turns don't re-read the uncompressed history.
                 session.messages = messages.clone();
@@ -3054,6 +3060,8 @@ pub async fn run_agent_loop(
                     }
                     if recovery != RecoveryStage::None {
                         messages = crate::session_repair::validate_and_repair(&messages);
+                        // Ensure history starts with a user turn after overflow recovery.
+                        messages = crate::session_repair::ensure_starts_with_user(messages);
                     }
                 }
             } else {
@@ -3068,6 +3076,8 @@ pub async fn run_agent_loop(
                 }
                 if recovery != RecoveryStage::None {
                     messages = crate::session_repair::validate_and_repair(&messages);
+                    // Ensure history starts with a user turn after overflow recovery.
+                    messages = crate::session_repair::ensure_starts_with_user(messages);
                 }
             }
             apply_context_guard(&mut messages, &context_budget, available_tools);
@@ -4353,6 +4363,8 @@ pub async fn run_agent_loop_streaming(
             if !compression_events.is_empty() {
                 messages = compressed;
                 messages = crate::session_repair::validate_and_repair(&messages);
+                // Ensure history starts with a user turn after soft compression.
+                messages = crate::session_repair::ensure_starts_with_user(messages);
                 // Keep session.messages in sync with the compressed LLM working copy
                 // so subsequent turns don't re-read the uncompressed history.
                 session.messages = messages.clone();
@@ -4373,6 +4385,8 @@ pub async fn run_agent_loop_streaming(
                     );
                     if r != RecoveryStage::None {
                         messages = crate::session_repair::validate_and_repair(&messages);
+                        // Ensure history starts with a user turn after overflow recovery.
+                        messages = crate::session_repair::ensure_starts_with_user(messages);
                     }
                     r
                 } else {
@@ -4389,6 +4403,8 @@ pub async fn run_agent_loop_streaming(
                 );
                 if recovery != RecoveryStage::None {
                     messages = crate::session_repair::validate_and_repair(&messages);
+                    // Ensure history starts with a user turn after overflow recovery.
+                    messages = crate::session_repair::ensure_starts_with_user(messages);
                 }
                 apply_context_guard(&mut messages, &context_budget, available_tools);
                 recovery
