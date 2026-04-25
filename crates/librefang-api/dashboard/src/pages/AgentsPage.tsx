@@ -64,6 +64,7 @@ import {
   useDeletePromptVersion,
   usePatchAgent,
   usePatchAgentConfig,
+  usePatchHandAgentRuntimeConfig,
   usePauseExperiment,
   useResumeAgent,
   useSpawnAgent,
@@ -189,6 +190,7 @@ export function AgentsPage() {
   const suspendMutation = useSuspendAgent();
   const resumeMutation = useResumeAgent();
   const patchAgentConfigMutation = usePatchAgentConfig();
+  const patchHandAgentRuntimeConfigMutation = usePatchHandAgentRuntimeConfig();
   const patchAgentMutation = usePatchAgent();
   const cloneMutation = useCloneAgent();
   const qc = useQueryClient();
@@ -375,8 +377,14 @@ export function AgentsPage() {
       return;
     }
 
-    patchAgentConfigMutation.mutate(
-      { agentId: detailAgent.id, isHand: detailAgent.is_hand, config: patch },
+    // Caller picks the mutation based on cached agent-detail knowledge: hand
+    // agents go through the hand-runtime-config endpoint (also invalidates
+    // handKeys.details()), everyone else hits the standalone /config route.
+    const mutation = detailAgent.is_hand
+      ? patchHandAgentRuntimeConfigMutation
+      : patchAgentConfigMutation;
+    mutation.mutate(
+      { agentId: detailAgent.id, config: patch },
       {
         onSuccess: async () => {
           setEditingModel(false);
@@ -760,11 +768,16 @@ export function AgentsPage() {
         // ARE renameable: a fresh agent spawned from a template is a regular
         // user-owned agent.
         const lockRename = !!detailAgent.is_hand;
+        // Pick the config mutation that matches this agent's role; mirrors
+        // the branching in saveModelEdit / web-search toggle below.
+        const activeConfigMutation = detailAgent.is_hand
+          ? patchHandAgentRuntimeConfigMutation
+          : patchAgentConfigMutation;
         // Hold backdrop dismissal during edit-in-flight so a stray click
         // doesn't close the modal mid-PATCH and still toast "Agent renamed".
         const lockBackdropDismiss = editingName || patchAgentMutation.isPending;
         const saveModelDisabled =
-          patchAgentConfigMutation.isPending
+          activeConfigMutation.isPending
           || !modelDraft.provider.trim()
           || !modelDraft.model.trim()
           || isNaN(parseInt(modelDraft.max_tokens, 10))
@@ -962,7 +975,7 @@ export function AgentsPage() {
                             disabled={saveModelDisabled}
                             className="px-3 py-1 rounded-md text-xs font-semibold bg-brand hover:bg-brand/90 text-white disabled:opacity-50"
                           >
-                            {patchAgentConfigMutation.isPending ? t("common.saving") : t("common.save")}
+                            {activeConfigMutation.isPending ? t("common.saving") : t("common.save")}
                           </button>
                         </div>
                       </>
@@ -1005,8 +1018,14 @@ export function AgentsPage() {
                       value={detailAgent.web_search_augmentation || "off"}
                       onChange={e => {
                         const mode = e.target.value as "off" | "auto" | "always";
-                        patchAgentConfigMutation.mutate(
-                          { agentId: detailAgent.id, isHand: detailAgent.is_hand, config: { web_search_augmentation: mode } },
+                        // Branch in the caller, not the hook — only the
+                        // caller knows from the cached detail whether this
+                        // agent is a hand role.
+                        const mutation = detailAgent.is_hand
+                          ? patchHandAgentRuntimeConfigMutation
+                          : patchAgentConfigMutation;
+                        mutation.mutate(
+                          { agentId: detailAgent.id, config: { web_search_augmentation: mode } },
                           {
                             onSuccess: async () => {
                               await refreshDetailAgent(detailAgent.id, detailAgent.is_hand);
