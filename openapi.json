@@ -868,6 +868,135 @@
         }
       }
     },
+    "/api/agents/{id}/hand-runtime-config": {
+      "delete": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "DELETE /api/agents/{id}/hand-runtime-config — Drop all runtime overrides\nfor the hand agent's role, restoring the live manifest to the HAND.toml\ndefaults and persisting the cleared state to `hand_state.json`.",
+        "description": "Returns 204 No Content on success (idempotent — a second call against an\nalready-clean role is also 204).",
+        "operationId": "delete_hand_agent_runtime_config",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Hand agent ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Runtime overrides cleared; manifest restored to HAND.toml defaults"
+          },
+          "400": {
+            "description": "Invalid agent id or target agent is not managed by a hand",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "Agent not found",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "409": {
+            "description": "Hand role not found for the agent (hand registry inconsistency)",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "Internal kernel error",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "PATCH /api/agents/{id}/hand-runtime-config — Runtime-only config override for hand agents.",
+        "operationId": "patch_hand_agent_runtime_config",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Hand agent ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Runtime override fields; empty strings for `api_key_env` / `base_url` clear the override",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchAgentConfigRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Runtime override applied to the live manifest and persisted to hand_state.json",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid agent id or target agent is not managed by a hand",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "Agent not found",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "409": {
+            "description": "Hand role not found for the agent (hand registry inconsistency)",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "Internal kernel error",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/agents/{id}/history": {
       "delete": {
         "tags": [

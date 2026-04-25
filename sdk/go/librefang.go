@@ -332,6 +332,14 @@ func (r *AgentsResource) DeleteAgentFile(id string, filename string) (interface{
 	return r.client.request("DELETE", fmt.Sprintf("/api/agents/%s/files/%s", id, filename), nil, nil)
 }
 
+func (r *AgentsResource) DeleteHandAgentRuntimeConfig(id string) (interface{}, error) {
+	return r.client.request("DELETE", fmt.Sprintf("/api/agents/%s/hand-runtime-config", id), nil, nil)
+}
+
+func (r *AgentsResource) PatchHandAgentRuntimeConfig(id string, data map[string]interface{}) (interface{}, error) {
+	return r.client.request("PATCH", fmt.Sprintf("/api/agents/%s/hand-runtime-config", id), data, nil)
+}
+
 func (r *AgentsResource) ClearAgentHistory(id string) (interface{}, error) {
 	return r.client.request("DELETE", fmt.Sprintf("/api/agents/%s/history", id), nil, nil)
 }

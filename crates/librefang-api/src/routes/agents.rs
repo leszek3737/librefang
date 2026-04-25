@@ -124,7 +124,8 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
         )
         .route(
             "/agents/{id}/hand-runtime-config",
-            axum::routing::patch(patch_hand_agent_runtime_config),
+            axum::routing::patch(patch_hand_agent_runtime_config)
+                .delete(delete_hand_agent_runtime_config),
         )
         .route(
             "/agents/{id}/clone",
@@ -4155,7 +4156,73 @@ pub async fn patch_agent_config(
     )
 }
 
+/// Map a DTO `Option<String>` into the `Option<Option<String>>` semantics
+/// required by [`librefang_hands::HandAgentRuntimeOverride`] for nullable
+/// secret-like fields (`api_key_env`, `base_url`).
+///
+/// - `None`            (field absent in JSON)        → `None`            (leave unchanged)
+/// - `Some("")`        (empty string sent in JSON)   → `Some(None)`      (clear the override)
+/// - `Some(non_empty)` (string value sent)           → `Some(Some(_))`   (set the override)
+///
+/// Whitespace is trimmed before the empty-string check so values like `"   "`
+/// are treated as a clear, matching the `/config` endpoint's existing
+/// length-bounded semantics for these fields.
+fn hand_override_nullable_string(raw: Option<String>) -> Option<Option<String>> {
+    raw.map(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+/// Translate a kernel error from `update_hand_agent_runtime_override` or
+/// `clear_hand_agent_runtime_override` into a `(StatusCode, message)` pair.
+///
+/// - [`LibreFangError::AgentNotFound`] → 404
+/// - [`LibreFangError::Internal`] whose message starts with `"Hand role not
+///   found"` → 409 Conflict (the hand instance exists but no role maps to
+///   the requested agent id — kernel has no dedicated variant, so we match
+///   on the single well-known prefix emitted by the kernel)
+/// - everything else → 500
+fn map_hand_runtime_override_err(
+    err: &librefang_kernel::error::KernelError,
+) -> (StatusCode, String) {
+    use librefang_kernel::error::KernelError;
+    use librefang_types::error::LibreFangError;
+    match err {
+        KernelError::LibreFang(LibreFangError::AgentNotFound(_)) => {
+            (StatusCode::NOT_FOUND, err.to_string())
+        }
+        KernelError::LibreFang(LibreFangError::Internal(msg))
+            if msg.starts_with("Hand role not found") =>
+        {
+            (StatusCode::CONFLICT, err.to_string())
+        }
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
 /// PATCH /api/agents/{id}/hand-runtime-config — Runtime-only config override for hand agents.
+#[utoipa::path(
+    patch,
+    path = "/api/agents/{id}/hand-runtime-config",
+    tag = "agents",
+    params(("id" = String, Path, description = "Hand agent ID")),
+    request_body(
+        content = PatchAgentConfigRequest,
+        description = "Runtime override fields; empty strings for `api_key_env` / `base_url` clear the override"
+    ),
+    responses(
+        (status = 200, description = "Runtime override applied to the live manifest and persisted to hand_state.json", body = serde_json::Value),
+        (status = 400, description = "Invalid agent id or target agent is not managed by a hand", body = serde_json::Value),
+        (status = 404, description = "Agent not found", body = serde_json::Value),
+        (status = 409, description = "Hand role not found for the agent (hand registry inconsistency)", body = serde_json::Value),
+        (status = 500, description = "Internal kernel error", body = serde_json::Value),
+    )
+)]
 pub async fn patch_hand_agent_runtime_config(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -4187,11 +4254,21 @@ pub async fn patch_hand_agent_runtime_config(
         );
     }
 
+    // Field semantics:
+    // - `model` / `provider`: plain `Option<String>`. Empty string is
+    //   ignored (dashboard sends empty strings for "leave unchanged" on
+    //   free-text inputs); the kernel merges any `Some(value)` onto the
+    //   existing override.
+    // - `api_key_env` / `base_url`: tri-state via `Option<Option<String>>`.
+    //   See `hand_override_nullable_string` for the empty-string = clear
+    //   convention.
+    // - `max_tokens` / `temperature` / `web_search_augmentation`: pass
+    //   through as-is; `None` means "do not change".
     let override_config = librefang_hands::HandAgentRuntimeOverride {
         model: req.model.filter(|v| !v.is_empty()),
         provider: req.provider.filter(|v| !v.is_empty()),
-        api_key_env: None,
-        base_url: None,
+        api_key_env: hand_override_nullable_string(req.api_key_env),
+        base_url: hand_override_nullable_string(req.base_url),
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         web_search_augmentation: req.web_search_augmentation,
@@ -4205,10 +4282,71 @@ pub async fn patch_hand_agent_runtime_config(
             StatusCode::OK,
             Json(serde_json::json!({"status": "ok", "agent_id": id})),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
+        Err(e) => {
+            let (status, msg) = map_hand_runtime_override_err(&e);
+            (status, Json(serde_json::json!({"error": msg})))
+        }
+    }
+}
+
+/// DELETE /api/agents/{id}/hand-runtime-config — Drop all runtime overrides
+/// for the hand agent's role, restoring the live manifest to the HAND.toml
+/// defaults and persisting the cleared state to `hand_state.json`.
+///
+/// Returns 204 No Content on success (idempotent — a second call against an
+/// already-clean role is also 204).
+#[utoipa::path(
+    delete,
+    path = "/api/agents/{id}/hand-runtime-config",
+    tag = "agents",
+    params(("id" = String, Path, description = "Hand agent ID")),
+    responses(
+        (status = 204, description = "Runtime overrides cleared; manifest restored to HAND.toml defaults"),
+        (status = 400, description = "Invalid agent id or target agent is not managed by a hand", body = serde_json::Value),
+        (status = 404, description = "Agent not found", body = serde_json::Value),
+        (status = 409, description = "Hand role not found for the agent (hand registry inconsistency)", body = serde_json::Value),
+        (status = 500, description = "Internal kernel error", body = serde_json::Value),
+    )
+)]
+pub async fn delete_hand_agent_runtime_config(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid agent id"})),
+            )
+                .into_response();
+        }
+    };
+
+    let entry = match state.kernel.agent_registry().get(agent_id) {
+        Some(entry) => entry,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "agent not found"})),
+            )
+                .into_response();
+        }
+    };
+    if !entry.is_hand {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "agent is not managed by a hand"})),
+        )
+            .into_response();
+    }
+
+    match state.kernel.clear_hand_agent_runtime_override(agent_id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            let (status, msg) = map_hand_runtime_override_err(&e);
+            (status, Json(serde_json::json!({"error": msg}))).into_response()
+        }
     }
 }
 
