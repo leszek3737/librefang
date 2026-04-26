@@ -310,6 +310,14 @@ impl AgentsResource {
         do_req(&self.client, &self.base_url, reqwest::Method::DELETE, &format!("/api/agents/{}/files/{}", id, filename), None, &[]).await
     }
 
+    pub async fn delete_hand_agent_runtime_config(&self, id: &str) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::DELETE, &format!("/api/agents/{}/hand-runtime-config", id), None, &[]).await
+    }
+
+    pub async fn patch_hand_agent_runtime_config(&self, id: &str, data: Value) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::PATCH, &format!("/api/agents/{}/hand-runtime-config", id), Some(data), &[]).await
+    }
+
     pub async fn clear_agent_history(&self, id: &str) -> Result<Value> {
         do_req(&self.client, &self.base_url, reqwest::Method::DELETE, &format!("/api/agents/{}/history", id), None, &[]).await
     }

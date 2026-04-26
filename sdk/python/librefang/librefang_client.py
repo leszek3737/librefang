@@ -193,6 +193,12 @@ class _AgentsResource(_Resource):
     def delete_agent_file(self, id: str, filename: str):
         return self._c._request("DELETE", f"/api/agents/{id}/files/{filename}")
 
+    def delete_hand_agent_runtime_config(self, id: str):
+        return self._c._request("DELETE", f"/api/agents/{id}/hand-runtime-config")
+
+    def patch_hand_agent_runtime_config(self, id: str, **data):
+        return self._c._request("PATCH", f"/api/agents/{id}/hand-runtime-config", data)
+
     def clear_agent_history(self, id: str):
         return self._c._request("DELETE", f"/api/agents/{id}/history")
 

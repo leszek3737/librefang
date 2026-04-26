@@ -81,6 +81,8 @@ use crate::types;
         routes::set_agent_mcp_servers,
         routes::update_agent_identity,
         routes::patch_agent_config,
+        routes::patch_hand_agent_runtime_config,
+        routes::delete_hand_agent_runtime_config,
         routes::clone_agent,
         routes::list_agent_files,
         routes::get_agent_file,

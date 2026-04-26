@@ -152,6 +152,8 @@ export {
   clearAgentHistory,
   patchAgent,
   patchAgentConfig,
+  patchHandAgentRuntimeConfig,
+  clearHandAgentRuntimeConfig,
   createAgentSession,
   switchAgentSession,
   deleteSession,

@@ -1009,8 +1009,100 @@ export async function getAgentDetail(agentId: string): Promise<AgentDetail> {
   return get<AgentDetail>(`/api/agents/${encodeURIComponent(agentId)}`);
 }
 
-export async function patchAgentConfig(agentId: string, config: { max_tokens?: number; model?: string; provider?: string; temperature?: number; web_search_augmentation?: "off" | "auto" | "always" }): Promise<ApiActionResponse> {
-  return patch<ApiActionResponse>(`/api/agents/${encodeURIComponent(agentId)}/config`, config);
+export async function patchAgentConfig(
+  agentId: string,
+  config: {
+    max_tokens?: number;
+    model?: string;
+    provider?: string;
+    temperature?: number;
+    web_search_augmentation?: "off" | "auto" | "always";
+  },
+): Promise<ApiActionResponse> {
+  return patch<ApiActionResponse>(
+    `/api/agents/${encodeURIComponent(agentId)}/config`,
+    config,
+  );
+}
+
+function trimOptionalHandRuntimeString(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return value.trim();
+}
+
+/**
+ * Hand runtime PATCH is the only agent-config write path with tri-state string
+ * semantics: absent leaves the override untouched, empty string clears it.
+ * Keep this serializer scoped to `/hand-runtime-config` so other PATCH payloads
+ * do not silently inherit those semantics.
+ */
+function serializeHandAgentRuntimeConfigPatch(config: {
+  max_tokens?: number;
+  model?: string;
+  provider?: string;
+  temperature?: number;
+  api_key_env?: string;
+  base_url?: string;
+  web_search_augmentation?: "off" | "auto" | "always";
+}): {
+  max_tokens?: number;
+  model?: string;
+  provider?: string;
+  temperature?: number;
+  api_key_env?: string;
+  base_url?: string;
+  web_search_augmentation?: "off" | "auto" | "always";
+} {
+  return {
+    ...config,
+    api_key_env: trimOptionalHandRuntimeString(config.api_key_env),
+    base_url: trimOptionalHandRuntimeString(config.base_url),
+  };
+}
+
+/** PATCH /api/agents/{id}/hand-runtime-config — partial update of per-agent
+ * hand runtime overrides. Empty string for `api_key_env` / `base_url` clears
+ * that specific field (tri-state: absent = leave as-is, empty = clear,
+ * value = set). Distinct from `/agents/{id}/config` which targets the
+ * standalone agent config path. */
+export async function patchHandAgentRuntimeConfig(
+  agentId: string,
+  config: {
+    max_tokens?: number;
+    model?: string;
+    provider?: string;
+    temperature?: number;
+    api_key_env?: string;
+    base_url?: string;
+    web_search_augmentation?: "off" | "auto" | "always";
+  },
+): Promise<ApiActionResponse> {
+  return patch<ApiActionResponse>(
+    `/api/agents/${encodeURIComponent(agentId)}/hand-runtime-config`,
+    serializeHandAgentRuntimeConfigPatch(config),
+  );
+}
+
+/** DELETE /api/agents/{id}/hand-runtime-config — drop all per-agent runtime
+ * overrides for the hand role, restoring the live manifest to the HAND.toml
+ * defaults. The server returns 204 No Content on success, so we bypass the
+ * shared `del<T>` helper (which assumes a JSON body) and handle the empty
+ * response explicitly. */
+export async function clearHandAgentRuntimeConfig(agentId: string): Promise<void> {
+  const response = await fetch(
+    `/api/agents/${encodeURIComponent(agentId)}/hand-runtime-config`,
+    {
+      method: "DELETE",
+      headers: buildHeaders({
+        "Content-Type": "application/json",
+      }),
+    },
+  );
+  if (!response.ok) {
+    throw await parseError(response);
+  }
 }
 
 /** PATCH /api/agents/{id} — manifest-level partial updates (name, description,

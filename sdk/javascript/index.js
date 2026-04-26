@@ -201,6 +201,14 @@ class AgentsResource {
     return this._c._request("DELETE", `/api/agents/${id}/files/${filename}`);
   }
 
+  async deleteHandAgentRuntimeConfig(id) {
+    return this._c._request("DELETE", `/api/agents/${id}/hand-runtime-config`);
+  }
+
+  async patchHandAgentRuntimeConfig(id, data) {
+    return this._c._request("PATCH", `/api/agents/${id}/hand-runtime-config`, data, undefined);
+  }
+
   async clearAgentHistory(id) {
     return this._c._request("DELETE", `/api/agents/${id}/history`);
   }
