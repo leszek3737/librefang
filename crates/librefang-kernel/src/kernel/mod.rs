@@ -8807,7 +8807,14 @@ system_prompt = "You are a helpful assistant."
         agent_id: AgentId,
         allowlist: Option<Vec<String>>,
         blocklist: Option<Vec<String>>,
+        capabilities_tools: Option<Vec<String>>,
     ) -> KernelResult<()> {
+        if let Some(ref ct) = capabilities_tools {
+            self.registry
+                .update_capabilities_tools(agent_id, ct.clone())
+                .map_err(KernelError::LibreFang)?;
+        }
+
         self.registry
             .update_tool_filters(agent_id, allowlist.clone(), blocklist.clone())
             .map_err(KernelError::LibreFang)?;
@@ -8816,6 +8823,8 @@ system_prompt = "You are a helpful assistant."
             let _ = self.memory.save_agent(&entry);
         }
 
+        self.persist_manifest_to_disk(agent_id);
+
         // Invalidate cached tool list — tool filter change affects available tools
         self.prompt_metadata_cache.tools.remove(&agent_id);
 
@@ -8823,6 +8832,7 @@ system_prompt = "You are a helpful assistant."
             agent_id = %agent_id,
             allowlist = ?allowlist,
             blocklist = ?blocklist,
+            capabilities_tools = ?capabilities_tools,
             "Agent tool filters updated"
         );
         Ok(())

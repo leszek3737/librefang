@@ -335,6 +335,21 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Update an agent's declared tools (capabilities.tools).
+    pub fn update_capabilities_tools(
+        &self,
+        id: AgentId,
+        tools: Vec<String>,
+    ) -> LibreFangResult<()> {
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| LibreFangError::AgentNotFound(id.to_string()))?;
+        entry.manifest.capabilities.tools = tools;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
     /// Update an agent's tool allowlist and blocklist.
     pub fn update_tool_filters(
         &self,

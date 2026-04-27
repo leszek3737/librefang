@@ -3304,6 +3304,7 @@ pub async fn get_agent_tools(
     (
         StatusCode::OK,
         Json(serde_json::json!({
+            "capabilities_tools": entry.manifest.capabilities.tools,
             "tool_allowlist": entry.manifest.tool_allowlist,
             "tool_blocklist": entry.manifest.tool_blocklist,
             "disabled": entry.manifest.tools_disabled,
@@ -3354,8 +3355,16 @@ pub async fn set_agent_tools(
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect::<Vec<_>>()
         });
+    let capabilities_tools = body
+        .get("capabilities_tools")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        });
 
-    if allowlist.is_none() && blocklist.is_none() {
+    if allowlist.is_none() && blocklist.is_none() && capabilities_tools.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": t.t("api-error-agent-missing-tools")})),
@@ -3374,7 +3383,7 @@ pub async fn set_agent_tools(
 
     match state
         .kernel
-        .set_agent_tool_filters(agent_id, allowlist, blocklist)
+        .set_agent_tool_filters(agent_id, allowlist, blocklist, capabilities_tools)
     {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))),
         Err(e) => (
