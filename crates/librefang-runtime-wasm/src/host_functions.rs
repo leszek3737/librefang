@@ -630,18 +630,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_fs_read_denied_no_capability() {
+        // The capability gate runs *after* canonicalize, so the test path must
+        // exist or canonicalize fails first with "Cannot resolve path" on
+        // Windows (os error 3) and the assertion never sees the deny error.
+        // Cargo.toml is guaranteed to exist in every crate dir during tests.
         let state = test_state(vec![]);
-        let result = host_fs_read(&state, &json!({"path": "/etc/passwd"}));
+        let result = host_fs_read(&state, &json!({"path": "Cargo.toml"}));
         let err = result["error"].as_str().unwrap();
-        assert!(err.contains("denied"));
+        assert!(err.contains("denied"), "expected denied, got: {err}");
     }
 
     #[tokio::test]
     async fn test_fs_write_denied_no_capability() {
+        // host_fs_write canonicalizes the *parent*, so the parent must exist.
+        // std::env::temp_dir() exists on every supported platform.
         let state = test_state(vec![]);
-        let result = host_fs_write(&state, &json!({"path": "/tmp/test", "content": "hello"}));
+        let target = std::env::temp_dir().join("librefang_wasm_test_denied.txt");
+        let target_str = target.to_string_lossy().to_string();
+        let result = host_fs_write(&state, &json!({"path": target_str, "content": "hello"}));
         let err = result["error"].as_str().unwrap();
-        assert!(err.contains("denied"));
+        assert!(err.contains("denied"), "expected denied, got: {err}");
     }
 
     #[tokio::test]
@@ -874,6 +882,37 @@ mod tests {
         assert_eq!(
             extract_host_from_url("http://example.com"),
             "example.com:80"
+        );
+    }
+
+    /// Regression for #3814: capability check must use the canonical path,
+    /// not the raw path supplied by the guest. A traversal path like
+    /// `../../etc/passwd` must be rejected by path resolution *before* any
+    /// capability comparison can be made — it must never reach the file read.
+    #[tokio::test]
+    async fn test_fs_read_traversal_rejected_before_capability_check() {
+        // Even with a wildcard FileRead grant, traversal paths are rejected.
+        let state = test_state(vec![Capability::FileRead("*".to_string())]);
+        let result = host_fs_read(&state, &json!({"path": "../../etc/passwd"}));
+        let err = result["error"].as_str().unwrap();
+        assert!(
+            err.contains("traversal") || err.contains("forbidden"),
+            "traversal path must be rejected; got: {err}"
+        );
+    }
+
+    /// Regression for #3814: same for fs_write.
+    #[tokio::test]
+    async fn test_fs_write_traversal_rejected_before_capability_check() {
+        let state = test_state(vec![Capability::FileWrite("*".to_string())]);
+        let result = host_fs_write(
+            &state,
+            &json!({"path": "../../tmp/evil.txt", "content": "x"}),
+        );
+        let err = result["error"].as_str().unwrap();
+        assert!(
+            err.contains("traversal") || err.contains("forbidden"),
+            "traversal path must be rejected; got: {err}"
         );
     }
 }
