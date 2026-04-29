@@ -16,7 +16,7 @@ use librefang_types::i18n;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 
 use librefang_telemetry::metrics;
 
@@ -162,17 +162,22 @@ fn user_role_allows_request(role: UserRole, method: &axum::http::Method, path: &
 }
 
 /// Pull a caller-provided token from the standard locations the auth path
-/// understands: `Authorization: Bearer <x>` or `X-API-Key: <x>`. Bearer wins
-/// over X-API-Key — same precedence as the non-loopback flow at
-/// `auth(...)` line ~528. Returns `None` if no shape is present.
+/// understands. Precedence (matches the non-loopback flow at `auth(...)`):
+///   1. `Authorization: Bearer <x>`
+///   2. `X-API-Key: <x>`
+///   3. `Sec-WebSocket-Protocol: bearer.<x>` — WS upgrade fallback.
+///      Browsers cannot set custom headers on the WebSocket handshake, so
+///      the dashboard encodes the token as a sub-protocol entry that starts
+///      with `bearer.`. Without this branch the auth middleware (which runs
+///      before any WS handler) would 401-storm every dashboard ws (terminal,
+///      chat, agent stream). The matching ws handler echoes the protocol
+///      back via `WebSocketUpgrade::protocols(...)` so the browser accepts
+///      the handshake — see `ws::ws_bearer_protocol`.
 ///
-/// SECURITY: `?token=` query-string auth is intentionally NOT supported here.
+/// SECURITY: `?token=` query-string auth is intentionally NOT supported.
 /// Query parameters appear in server access logs, browser history, and HTTP
 /// Referer headers forwarded to third parties, making them unsuitable for
-/// carrying credentials on regular HTTP routes. WebSocket upgrades are the
-/// sole exception — browsers cannot set custom headers on WebSocket
-/// connections — and they handle `?token=` in `crate::ws::ws_auth_token`
-/// rather than going through this middleware path.
+/// carrying credentials.
 fn extract_request_token(request: &Request<Body>) -> Option<String> {
     let bearer = request
         .headers()
@@ -183,11 +188,27 @@ fn extract_request_token(request: &Request<Body>) -> Option<String> {
     if bearer.is_some() {
         return bearer;
     }
-    request
+    if let Some(key) = request
         .headers()
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
+    {
+        return Some(key.to_string());
+    }
+    // WebSocket upgrade: sub-protocol entry of the form `bearer.<token>`.
+    // Multiple sub-protocols may be comma-separated; pick the first that
+    // starts with `bearer.`.
+    request
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.split(',')
+                .map(str::trim)
+                .find(|p| p.starts_with("bearer."))
+                .and_then(|p| p.strip_prefix("bearer."))
+                .map(str::to_string)
+        })
 }
 
 /// Request ID header name (standard).
@@ -238,8 +259,26 @@ pub async fn request_logging(request: Request<Body>, next: Next) -> Response<Bod
     let elapsed = start.elapsed();
     let status = response.status().as_u16();
 
-    // GET 2xx — routine polling, keep out of INFO to reduce noise
-    if method == axum::http::Method::GET && status < 300 {
+    // 4xx/5xx elevated so auth storms and server faults surface; GET successes suppressed to avoid poll noise.
+    if status >= 500 {
+        error!(
+            request_id = %request_id,
+            method = %method,
+            path = %uri,
+            status = status,
+            latency_ms = elapsed.as_millis() as u64,
+            "API request"
+        );
+    } else if status >= 400 {
+        warn!(
+            request_id = %request_id,
+            method = %method,
+            path = %uri,
+            status = status,
+            latency_ms = elapsed.as_millis() as u64,
+            "API request"
+        );
+    } else if method == axum::http::Method::GET {
         debug!(
             request_id = %request_id,
             method = %method,
