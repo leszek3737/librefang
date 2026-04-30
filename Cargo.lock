@@ -4292,6 +4292,7 @@ dependencies = [
  "librefang-channels",
  "librefang-extensions",
  "librefang-hands",
+ "librefang-kernel-handle",
  "librefang-kernel-metering",
  "librefang-kernel-router",
  "librefang-llm-driver",
@@ -4329,6 +4330,7 @@ dependencies = [
  "async-trait",
  "librefang-types",
  "serde_json",
+ "tokio",
  "tracing",
  "uuid",
 ]
