@@ -4,8 +4,10 @@
 
 use crate::mock_kernel::MockKernelBuilder;
 use axum::Router;
+use librefang_api::middleware::ApiUserAuth;
 use librefang_api::routes::AppState;
 use librefang_kernel::LibreFangKernel;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
@@ -27,6 +29,8 @@ pub struct TestAppState {
     pub state: Arc<AppState>,
     /// Temp directory — must hold the reference, otherwise the directory will be deleted.
     _tmp: TempDir,
+    /// Optional path to a config TOML file written to disk (for config-reload tests).
+    _config_path: Option<PathBuf>,
 }
 
 impl TestAppState {
@@ -39,13 +43,21 @@ impl TestAppState {
     pub fn with_builder(builder: MockKernelBuilder) -> Self {
         let (kernel, tmp) = builder.build();
         let state = Self::build_state(kernel, &tmp);
-        Self { state, _tmp: tmp }
+        Self {
+            state,
+            _tmp: tmp,
+            _config_path: None,
+        }
     }
 
     /// Builds from an existing kernel (caller is responsible for holding TempDir).
     pub fn from_kernel(kernel: LibreFangKernel, tmp: TempDir) -> Self {
         let state = Self::build_state(kernel, &tmp);
-        Self { state, _tmp: tmp }
+        Self {
+            state,
+            _tmp: tmp,
+            _config_path: None,
+        }
     }
 
     /// Builds an axum Router with common API routes (suitable for testing).
@@ -116,9 +128,74 @@ impl TestAppState {
             .with_state(self.state.clone())
     }
 
+    /// Returns the path to the temporary directory.
+    pub fn tmp_path(&self) -> &std::path::Path {
+        self._tmp.path()
+    }
+
     /// Returns an Arc reference to the AppState.
     pub fn app_state(&self) -> Arc<AppState> {
         self.state.clone()
+    }
+
+    /// Sets the global API key so auth middleware accepts it.
+    pub fn with_api_key(self, key: &str) -> Self {
+        *self
+            .state
+            .api_key_lock
+            .try_write()
+            .expect("api key lock should be uncontended during test setup") = key.to_string();
+        self
+    }
+
+    /// Pre-populates the per-user API key list for auth middleware.
+    pub fn with_user_api_keys(self, keys: Vec<ApiUserAuth>) -> Self {
+        *self
+            .state
+            .user_api_keys
+            .try_write()
+            .expect("user API key lock should be uncontended during test setup") = keys;
+        self
+    }
+
+    /// Serializes the kernel config to a TOML file at `path`.
+    ///
+    /// Useful for tests that exercise config-reload endpoints which read
+    /// from disk.
+    pub fn with_config_path(mut self, path: PathBuf) -> Self {
+        let config_str =
+            toml::to_string_pretty(&*self.state.kernel.config_ref()).expect("serialize config");
+        std::fs::write(&path, config_str).expect("write config file");
+        self._config_path = Some(path);
+        self
+    }
+
+    /// Consumes `TestAppState`, returning the components a test may need
+    /// to hold onto directly.
+    pub fn into_parts(self) -> (Arc<AppState>, TempDir, Option<PathBuf>) {
+        (self.state, self._tmp, self._config_path)
+    }
+
+    /// Starts a minimal HTTP server on an ephemeral port.
+    ///
+    /// Returns the base URL (e.g. `"http://127.0.0.1:54321"`).
+    /// The server only mounts `/api/health` — tests that need more routes
+    /// should build their own `Router` via [`router()`](Self::router).
+    pub async fn start_tcp(&self) -> String {
+        use axum::routing::get;
+
+        let app = Router::new()
+            .route("/api/health", get(librefang_api::routes::health))
+            .with_state(self.state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        format!("http://127.0.0.1:{}", addr.port())
     }
 
     /// Internal: builds AppState from a kernel.
