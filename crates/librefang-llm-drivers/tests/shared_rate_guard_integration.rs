@@ -114,10 +114,9 @@ async fn shared_rate_guard_short_circuits_second_client() {
     // vars within this process.
     unsafe {
         std::env::set_var("LIBREFANG_HOME", home.path());
-        // Defeat any ambient HTTP proxy on the test runner — without this,
-        // reqwest sends 127.0.0.1 traffic to a real proxy that may hang.
         std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
         std::env::set_var("no_proxy", "127.0.0.1,localhost");
+        std::env::set_var("LIBREFANG_TEST_NO_BACKOFF", "1");
     }
 
     let (base_url, hits) = spawn_stub_429_server().await;

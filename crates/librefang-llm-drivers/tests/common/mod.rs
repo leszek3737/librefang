@@ -48,6 +48,7 @@ pub fn isolated_env() -> TempDir {
         std::env::set_var("LIBREFANG_HOME", dir.path());
         std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
         std::env::set_var("no_proxy", "127.0.0.1,localhost");
+        std::env::set_var("LIBREFANG_TEST_NO_BACKOFF", "1");
     }
     dir
 }

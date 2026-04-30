@@ -57,6 +57,10 @@ pub fn jittered_backoff(
     // happens at exp ~34 for a 2 s base, well below the old cap of 62).
     // We clamp the f64 result against max_delay_secs before constructing a
     // Duration, so the Duration is always in range.
+    if std::env::var("LIBREFANG_TEST_NO_BACKOFF").is_ok() {
+        return floor.min(Duration::from_secs(300));
+    }
+
     let exp = attempt.saturating_sub(1) as i32;
     let base_secs = base_delay.as_secs_f64();
     let max_secs = max_delay.as_secs_f64();
