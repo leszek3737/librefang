@@ -877,16 +877,6 @@ export function buildAuthenticatedWebSocket(path: string): {
   return { url, protocols };
 }
 
-/**
- * @deprecated Use `buildAuthenticatedWebSocket()` to avoid leaking the token
- * via the URL. This shim returns the URL without the token; callers must
- * supply the bearer protocol separately.
- */
-export function buildAuthenticatedWebSocketUrl(path: string): string {
-  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${window.location.host}${path}`;
-}
-
 async function parseError(response: Response): Promise<ApiError> {
   // If 401, trigger global logout (only once to prevent infinite loop)
   if (response.status === 401 && _onUnauthorized && !_unauthorizedFired) {
