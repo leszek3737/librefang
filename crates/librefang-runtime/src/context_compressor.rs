@@ -372,6 +372,8 @@ impl ContextCompressor {
             messages: middle.to_vec(),
             context_window_tokens: 0,
             label: None,
+            messages_generation: 0,
+            last_repaired_generation: 0,
         };
 
         let compaction_config = CompactionConfig {

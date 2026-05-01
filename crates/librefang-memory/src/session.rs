@@ -79,6 +79,41 @@ pub struct Session {
     pub context_window_tokens: u64,
     /// Optional human-readable session label.
     pub label: Option<String>,
+    /// Monotonically incremented on every mutation to `messages`.
+    /// Used to skip redundant repair passes when the history hasn't changed.
+    pub messages_generation: u64,
+    /// The `messages_generation` value at the time of the last successful
+    /// repair pass. When this equals `messages_generation` the next call to
+    /// `prepare_llm_messages` can skip repair entirely.
+    pub last_repaired_generation: u64,
+}
+
+impl Session {
+    /// Append a message and bump the generation counter.
+    pub fn push_message(&mut self, msg: Message) {
+        self.messages.push(msg);
+        self.messages_generation = self.messages_generation.wrapping_add(1);
+    }
+
+    /// Replace the entire message list and bump the generation counter.
+    pub fn set_messages(&mut self, msgs: Vec<Message>) {
+        self.messages = msgs;
+        self.messages_generation = self.messages_generation.wrapping_add(1);
+    }
+
+    /// Extend messages with multiple entries and bump the generation counter.
+    pub fn extend_messages(&mut self, msgs: impl IntoIterator<Item = Message>) {
+        let before = self.messages.len();
+        self.messages.extend(msgs);
+        if self.messages.len() != before {
+            self.messages_generation = self.messages_generation.wrapping_add(1);
+        }
+    }
+
+    /// Mark messages as mutated when code must use Vec APIs directly.
+    pub fn mark_messages_mutated(&mut self) {
+        self.messages_generation = self.messages_generation.wrapping_add(1);
+    }
 }
 
 /// Portable session export for hibernation / session state transfer.
@@ -207,6 +242,8 @@ impl SessionStore {
                     messages,
                     context_window_tokens: tokens as u64,
                     label,
+                    messages_generation: 0,
+                    last_repaired_generation: 0,
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -250,6 +287,8 @@ impl SessionStore {
                         messages,
                         context_window_tokens: tokens as u64,
                         label,
+                        messages_generation: 0,
+                        last_repaired_generation: 0,
                     },
                     created_at,
                 )))
@@ -707,6 +746,8 @@ impl SessionStore {
             messages: Vec::new(),
             context_window_tokens: 0,
             label: None,
+            messages_generation: 0,
+            last_repaired_generation: 0,
         };
         self.save_session(&session)?;
         Ok(session)
@@ -768,6 +809,8 @@ impl SessionStore {
                     messages,
                     context_window_tokens: tokens as u64,
                     label: lbl,
+                    messages_generation: 0,
+                    last_repaired_generation: 0,
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -830,6 +873,8 @@ impl SessionStore {
             messages: Vec::new(),
             context_window_tokens: 0,
             label: label.map(|s| s.to_string()),
+            messages_generation: 0,
+            last_repaired_generation: 0,
         };
         self.save_session(&session)?;
         Ok(session)
