@@ -1302,6 +1302,8 @@ pub fn inject_attachments_into_session(
             messages: Vec::new(),
             context_window_tokens: 0,
             label: None,
+            messages_generation: 0,
+            last_repaired_generation: None,
         },
     };
 
@@ -1319,7 +1321,7 @@ pub fn inject_attachments_into_session(
         })
         .collect();
 
-    session.messages.push(Message {
+    session.push_message(Message {
         role: Role::User,
         content: MessageContent::Blocks(attachment_blocks),
         pinned: false,
