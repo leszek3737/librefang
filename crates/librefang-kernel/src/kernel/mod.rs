@@ -5526,6 +5526,13 @@ system_prompt = "You are a helpful assistant."
                 max_history_messages: self.config.load().max_history_messages,
                 aux_client: Some(self.aux_client.load_full()),
                 parent_session_id: None,
+                // Ephemeral /btw sessions start with empty history so no
+                // stale tool results can accumulate — `None` uses compiled
+                // defaults, which is fine.  The fold helper's length
+                // fast-path exits on short histories.  Layer 2 / Layer 3
+                // byte-budget enforcement (defaults: 16 KB per result,
+                // 50 KB per turn) still applies — only fold no-ops here.
+                tool_results_config: None,
             },
         )
         .await
@@ -6240,6 +6247,7 @@ system_prompt = "You are a helpful assistant."
             max_history_messages: self.config.load().max_history_messages,
             aux_client: Some(self.aux_client.load_full()),
             parent_session_id: None,
+            tool_results_config: Some(self.config.load().tool_results.clone()),
         };
         self.send_message_streaming_with_sender_and_opts(
             effective_id,
@@ -6426,6 +6434,7 @@ system_prompt = "You are a helpful assistant."
             max_history_messages: self.config.load().max_history_messages,
             aux_client: Some(self.aux_client.load_full()),
             parent_session_id: Some(parent_session_id),
+            tool_results_config: Some(self.config.load().tool_results.clone()),
         };
         // INVARIANT: forks must use the canonical session so the parent turn's
         // prompt-cache prefix is reused. Do NOT pass a `session_id_override`
@@ -6499,6 +6508,7 @@ system_prompt = "You are a helpful assistant."
             max_history_messages: self.config.load().max_history_messages,
             aux_client: Some(self.aux_client.load_full()),
             parent_session_id: None,
+            tool_results_config: Some(self.config.load().tool_results.clone()),
         };
         self.send_message_streaming_with_sender_and_opts(
             agent_id,
@@ -8907,6 +8917,7 @@ system_prompt = "You are a helpful assistant."
             max_history_messages: cfg.max_history_messages,
             aux_client: Some(self.aux_client.load_full()),
             parent_session_id: None,
+            tool_results_config: Some(cfg.tool_results.clone()),
         };
 
         // Build a per-execution MCP pool that includes the agent workspace as
@@ -13270,6 +13281,29 @@ system_prompt = "You are a helpful assistant."
         );
 
         let cfg = self.config.load_full();
+
+        // #3347 4/N: artifact-store GC at daemon startup.
+        // Spawns a background task that walks the spill directory once and
+        // deletes any `<hash>.bin` (or orphan `<hash>.<pid>.<nanos>.tmp`)
+        // file with mtime older than `[tool_results] artifact_max_age_days`.
+        // Set to `0` in config to disable.  Idempotent across the lifetime
+        // of the process — repeat calls are no-ops.
+        //
+        // Resolve the directory via `default_artifact_storage_dir()`, not
+        // `self.data_dir_boot`: the spill writers in `librefang-runtime`
+        // use the env-based path (`LIBREFANG_HOME/data/artifacts` or
+        // `~/.librefang/data/artifacts`) and would silently diverge from
+        // `config.data_dir` whenever an operator overrode `[data] data_dir`
+        // in `config.toml` without also setting `LIBREFANG_HOME` — GC
+        // would scan an empty directory while the artifact store grew
+        // unbounded under the env path.
+        let max_age_days = cfg.tool_results.artifact_max_age_days;
+        if max_age_days > 0 {
+            let artifact_dir = librefang_runtime::artifact_store::default_artifact_storage_dir();
+            let max_age = std::time::Duration::from_secs(max_age_days as u64 * 24 * 60 * 60);
+            librefang_runtime::artifact_store::run_startup_gc_once(&artifact_dir, max_age);
+        }
+
         // Restore previously active hands from persisted state
         let state_path = self.home_dir_boot.join("data").join("hand_state.json");
         let saved_hands = librefang_hands::registry::HandRegistry::load_state_detailed(&state_path);
