@@ -81,8 +81,9 @@ export const useUIStore = create<UIState>()(
       toggleTheme: () =>
         set((state) => ({ theme: state.theme === "light" ? "dark" : "light" })),
       setLanguage: (lang) => {
-        void i18n.changeLanguage(lang);
-        set({ language: lang });
+        i18n.changeLanguage(lang).then(() => {
+          set({ language: lang });
+        });
       },
       setMobileMenuOpen: (open) => set({ isMobileMenuOpen: open }),
       toggleSidebar: () => set((state) => ({ isSidebarCollapsed: !state.isSidebarCollapsed })),
@@ -90,7 +91,7 @@ export const useUIStore = create<UIState>()(
       toggleNavGroup: (key) => set((state) => ({ collapsedNavGroups: { ...state.collapsedNavGroups, [key]: !state.collapsedNavGroups[key] } })),
       addToast: (message, type = "info") =>
         set((state) => ({
-          toasts: [...state.toasts, { id: createClientId(), message, type }],
+          toasts: [...state.toasts, { id: createClientId(), message, type }].slice(-5),
         })),
       removeToast: (id) =>
         set((state) => ({
@@ -126,11 +127,14 @@ export const useUIStore = create<UIState>()(
     }),
     {
       name: "librefang-ui-storage",
+      version: 1,
+      migrate: (persisted) => persisted,
       partialize: (state) => ({
         theme: state.theme,
         language: state.language,
         isSidebarCollapsed: state.isSidebarCollapsed,
         navLayout: state.navLayout,
+        collapsedNavGroups: state.collapsedNavGroups,
         hiddenModelKeys: state.hiddenModelKeys,
         modelsAvailableOnly: state.modelsAvailableOnly,
         deepThinking: state.deepThinking,
