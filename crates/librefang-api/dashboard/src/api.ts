@@ -1078,9 +1078,7 @@ async function parseError(response: Response): Promise<ApiError> {
 
 async function get<T>(path: string): Promise<T> {
   const response = await fetch(path, {
-    headers: buildHeaders({
-      "Content-Type": "application/json",
-    })
+    headers: buildHeaders()
   });
   if (!response.ok) {
     throw await parseError(response);
@@ -1173,6 +1171,9 @@ async function del<T>(path: string): Promise<T> {
   });
   if (!response.ok) {
     throw await parseError(response);
+  }
+  if (response.status === 204 || response.headers.get("content-length") === "0") {
+    return undefined as T;
   }
   return (await response.json()) as T;
 }
