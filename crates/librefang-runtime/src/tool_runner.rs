@@ -6930,6 +6930,19 @@ mod tests {
     impl WorkflowRunner for ApprovalKernel {}
     impl GoalControl for ApprovalKernel {}
     impl ToolPolicy for ApprovalKernel {}
+    impl ApiAuth for ApprovalKernel {
+        fn auth_snapshot(&self) -> ApiAuthSnapshot {
+            ApiAuthSnapshot::default()
+        }
+    }
+    impl SessionWriter for ApprovalKernel {
+        fn inject_attachment_blocks(
+            &self,
+            _agent_id: librefang_types::agent::AgentId,
+            _blocks: Vec<librefang_types::message::ContentBlock>,
+        ) {
+        }
+    }
 
     // ---- END role-trait impls (#3746) ----
 
@@ -7141,6 +7154,19 @@ mod tests {
     impl WorkflowRunner for ForceHumanCapturingKernel {}
     impl GoalControl for ForceHumanCapturingKernel {}
     impl ToolPolicy for ForceHumanCapturingKernel {}
+    impl ApiAuth for ForceHumanCapturingKernel {
+        fn auth_snapshot(&self) -> ApiAuthSnapshot {
+            ApiAuthSnapshot::default()
+        }
+    }
+    impl SessionWriter for ForceHumanCapturingKernel {
+        fn inject_attachment_blocks(
+            &self,
+            _agent_id: librefang_types::agent::AgentId,
+            _blocks: Vec<librefang_types::message::ContentBlock>,
+        ) {
+        }
+    }
 
     // ---- END role-trait impls (#3746) ----
 
@@ -7714,6 +7740,19 @@ mod tests {
     impl PromptStore for NamedWsKernel {}
     impl WorkflowRunner for NamedWsKernel {}
     impl GoalControl for NamedWsKernel {}
+    impl ApiAuth for NamedWsKernel {
+        fn auth_snapshot(&self) -> ApiAuthSnapshot {
+            ApiAuthSnapshot::default()
+        }
+    }
+    impl SessionWriter for NamedWsKernel {
+        fn inject_attachment_blocks(
+            &self,
+            _agent_id: librefang_types::agent::AgentId,
+            _blocks: Vec<librefang_types::message::ContentBlock>,
+        ) {
+        }
+    }
 
     // ---- END role-trait impls (#3746) ----
 
@@ -10390,6 +10429,19 @@ mod tests {
     impl WorkflowRunner for SpawnCheckKernel {}
     impl GoalControl for SpawnCheckKernel {}
     impl ToolPolicy for SpawnCheckKernel {}
+    impl ApiAuth for SpawnCheckKernel {
+        fn auth_snapshot(&self) -> ApiAuthSnapshot {
+            ApiAuthSnapshot::default()
+        }
+    }
+    impl SessionWriter for SpawnCheckKernel {
+        fn inject_attachment_blocks(
+            &self,
+            _agent_id: librefang_types::agent::AgentId,
+            _blocks: Vec<librefang_types::message::ContentBlock>,
+        ) {
+        }
+    }
 
     // ---- END role-trait impls (#3746) ----
 
