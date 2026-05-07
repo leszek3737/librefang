@@ -75,8 +75,11 @@ export const ConfirmDialog = React.memo(function ConfirmDialog({
       // Enter confirms — safer on non-destructive dialogs; for destructive
       // we still require a click so users can't accidentally nuke data.
       if (e.key === "Enter" && tone !== "destructive" && !isEditableTarget(e.target)) {
+        if (isConfirming.current) return;
         e.preventDefault();
+        isConfirming.current = true;
         onConfirmRef.current();
+        onCloseRef.current();
       }
     };
     window.addEventListener("keydown", handleKey);

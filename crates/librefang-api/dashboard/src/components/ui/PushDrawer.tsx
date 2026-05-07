@@ -71,7 +71,8 @@ export function PushDrawer() {
     const handleKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return;
       if (e.key !== "Escape") return;
-      const target = e.target as HTMLElement;
+      const target = e.target;
+      if (!(target instanceof HTMLElement)) return;
       if (target.closest("[role='dialog']") && !target.closest("[role='dialog'][data-drawer-root]")) return;
       e.stopImmediatePropagation();
       triggerClose();
