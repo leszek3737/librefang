@@ -1151,6 +1151,18 @@ impl BridgeManager {
             });
         }
 
+        // 24h retention only fires when something accesses a bucket;
+        // groups that go quiet without ever being addressed need an
+        // active ticker to free memory. The evictor is owned by the
+        // process-wide buffer (see `crate::group_history::install_global`),
+        // not by any one BridgeManager — binding its lifetime to a single
+        // bridge would orphan the buffer's TTL on hot-reload (the second
+        // BridgeManager would skip the spawn, leaving the singleton
+        // accumulating entries with no ticker).
+        crate::group_history::install_global(|| {
+            Arc::new(crate::group_history::GroupHistoryBuffer::with_default_retention())
+        });
+
         // Prefer shared webhook routes over adapter-managed HTTP servers.
         // If the adapter provides webhook routes, collect them for mounting
         // on the main API server and use the returned stream for dispatch.
@@ -2553,9 +2565,44 @@ async fn dispatch_message(
     // --- DM/Group policy check ---
     if let Some(ref ov) = overrides {
         if message.is_group {
+            // capture the group_jid before the gating call so
+            // both branches (record-on-skip, drain-on-pass) can use the
+            // same key without re-deriving it. The bridge keys group
+            // messages by `sender.platform_id` (= chat JID for groups).
+            let group_id = message.sender.platform_id.clone();
+
             if !should_process_group_message(ct_str, ov, message) {
+                // Record the skipped message into the per-group buffer so
+                // the next addressed turn on this group can recover its
+                // text. Only plain-text content reaches `dispatch_message`
+                // (media goes through `dispatch_with_blocks` which doesn't
+                // gate); recording empty text would just bloat the
+                // buffer, so we skip when nothing useful is extractable.
+                if let Some(buffer) = crate::group_history::global() {
+                    if let Some(text) = text_content(message) {
+                        if !text.is_empty() {
+                            let entry = crate::group_history::HistoryEntry {
+                                sender_display_name: message.sender.display_name.clone(),
+                                text: text.to_string(),
+                                captured_at: std::time::Instant::now(),
+                            };
+                            buffer
+                                .record(&crate::group_history::group_key(ct_str, &group_id), entry)
+                                .await;
+                        }
+                    }
+                }
                 return;
             }
+            // Gating pass: the drain is deferred to the dispatch site
+            // (just before the journal record) so per-channel rate-limit,
+            // per-user rate-limit, reply-intent precheck, command-policy,
+            // thread-ownership, RBAC, and auto-reply early-returns can
+            // each take their turn first. Draining here would empty the
+            // buffer even when one of those gates suppresses the message,
+            // erasing the very context the next addressed turn was meant
+            // to recover. See `dispatch_message` near the journal-record
+            // call for the actual drain.
             // Reply-intent precheck: lightweight LLM classification for group
             // messages when group_policy is "all" and precheck is enabled.
             // Skipped for mentions and commands (already filtered above).
@@ -3464,6 +3511,30 @@ async fn dispatch_message(
             )
             .await;
         return;
+    }
+
+    // --- Group-history drain (gating pass survived all early-return gates) ---
+    //
+    // Done here, after rate-limit / reply-intent / command-policy /
+    // thread-ownership / RBAC / auto-reply have all let the message
+    // through — earlier in the gating block we'd erase the buffer even
+    // when one of these suppressed the dispatch, costing the very
+    // context the next addressed turn was meant to recover. The drained
+    // count is log-only in v1; the kernel-side prompt enrichment that
+    // consumes `drained` is the follow-up PR.
+    if message.is_group {
+        if let Some(buffer) = crate::group_history::global() {
+            let key = crate::group_history::group_key(ct_str, &message.sender.platform_id);
+            if let Some(drained) = buffer.drain(&key).await {
+                info!(
+                    event = "group_history_drained",
+                    channel = ct_str,
+                    group = %message.sender.platform_id,
+                    entries = drained.len(),
+                    "drained prior group entries on gating pass",
+                );
+            }
+        }
     }
 
     // --- Message journal: record before dispatch for crash recovery ---
