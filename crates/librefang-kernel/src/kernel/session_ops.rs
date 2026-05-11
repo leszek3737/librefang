@@ -775,78 +775,780 @@ impl LibreFangKernel {
         false
     }
 
-    /// Save a summary of the current session to agent memory before reset.
+    /// Save a summary of the about-to-be-deleted session to agent memory (#4869).
+    ///
+    /// The fire-and-forget summary path on `reset_session` had three
+    /// independent defects before this rewrite:
+    ///
+    /// 1. **Last-10-messages window** — for any non-trivial session, the
+    ///    trailing 10 turns are dominated by closing pleasantries
+    ///    ("thanks", "sure", "you too") or mid-tool-loop plumbing. Real
+    ///    user goals from earlier in the session were never visible.
+    /// 2. **Text-only user messages** — `MessageContent::Text` was the
+    ///    only variant considered; sessions that ended on a tool-result
+    ///    turn produced **no summary at all**, because the early-return
+    ///    on `topics.is_empty()` fired before anything was written.
+    /// 3. **Collision-prone key** — `session_{date}_{slug}` overwrote
+    ///    itself across same-day sessions whose first user message
+    ///    slugged identically ("Thanks", "OK", "Sure").
+    ///
+    /// The fix: route the summary through the auxiliary LLM
+    /// (`AuxTask::SessionSummary`) over the **entire** session message
+    /// vector, then key the resulting `kv_store` entry by the session
+    /// id (collision-free). When no auxiliary chain is configured, log
+    /// a WARN and fall back to the historical trivial summary so the
+    /// path remains graceful — operators get a visible degraded-mode
+    /// signal instead of silent quality loss.
     fn save_session_summary(
         &self,
         agent_id: AgentId,
         entry: &AgentEntry,
         session: &librefang_memory::session::Session,
     ) {
-        use librefang_types::message::{MessageContent, Role};
+        let memory = Arc::clone(&self.memory.substrate);
+        let aux = self.llm.aux_client.load_full();
+        let catalog = self.llm.model_catalog.load_full();
+        let agent_name = entry.name.clone();
+        let workspace = entry.manifest.workspace.clone();
+        let messages = session.messages.clone();
+        let session_id = session.id;
 
-        // Take last 10 messages (or all if fewer)
-        let recent = &session.messages[session.messages.len().saturating_sub(10)..];
-
-        // Extract key topics from user messages
-        let topics: Vec<&str> = recent
-            .iter()
-            .filter(|m| m.role == Role::User)
-            .filter_map(|m| match &m.content {
-                MessageContent::Text(t) => Some(t.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        if topics.is_empty() {
-            return;
+        // Every production caller of `reset_session` runs inside an axum
+        // handler so a tokio runtime is present, but `reset_session` itself
+        // is sync (`pub fn`); a future sync caller would crash the daemon
+        // if we used `Handle::current()`. `try_current()` lets us spawn the
+        // aux-LLM path when a runtime is available and degrade to a
+        // synchronous trivial-digest write when it is not.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let summary = build_session_summary(
+                        aux.as_ref(),
+                        catalog.as_ref(),
+                        agent_id,
+                        session_id,
+                        &agent_name,
+                        &messages,
+                    )
+                    .await;
+                    persist_session_summary(
+                        memory.as_ref(),
+                        agent_id,
+                        session_id,
+                        workspace.as_deref(),
+                        &summary,
+                    );
+                });
+            }
+            Err(_) => {
+                warn!(
+                    agent_id = %agent_id,
+                    session_id = %session_id.0,
+                    "save_session_summary called outside a tokio runtime; \
+                     writing trivial digest synchronously (aux-LLM path skipped)"
+                );
+                let summary = build_trivial_session_summary(&messages);
+                persist_session_summary(
+                    memory.as_ref(),
+                    agent_id,
+                    session_id,
+                    workspace.as_deref(),
+                    &summary,
+                );
+            }
         }
+    }
+}
 
-        // Generate a slug from first user message (first 6 words, slugified)
-        let slug: String = topics[0]
-            .split_whitespace()
-            .take(6)
-            .collect::<Vec<_>>()
-            .join("-")
-            .to_lowercase()
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-')
-            .take(60)
-            .collect();
+/// Maximum byte length of conversation text fed to the aux LLM. Keeps
+/// the prompt within a haiku-class context window even on very long
+/// sessions; when the transcript exceeds this, content is dropped
+/// from the **head** so the most-recent context (the load-bearing
+/// part for a summary) survives. Named in bytes — not characters —
+/// because `String::len` is the unit we actually measure against.
+const MAX_SUMMARY_INPUT_BYTES: usize = 48_000;
 
-        let date = chrono::Utc::now().format("%Y-%m-%d");
-        let summary = format!(
-            "Session on {date}: {slug}\n\nKey exchanges:\n{}",
-            topics
-                .iter()
-                .take(5)
-                .enumerate()
-                .map(|(i, t)| {
-                    let truncated = librefang_types::truncate_str(t, 200);
-                    format!("{}. {}", i + 1, truncated)
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+/// Cap on the bytes we write to `kv_store` / `memory/*.md`. Aux models
+/// rarely emit more than a few kB of summary, but a misbehaving model
+/// can produce a runaway response — bound the disk + DB cost.
+const MAX_SUMMARY_OUTPUT_BYTES: usize = 16_384;
+
+/// Hard cap on the wall-clock time the aux LLM has to produce a summary.
+/// The summary is fire-and-forget so a slow path doesn't block
+/// `reset_session`, but we still want the spawned task to terminate.
+const SESSION_SUMMARY_LLM_TIMEOUT_SECS: u64 = 30;
+
+/// Build the session summary, preferring the auxiliary LLM and falling
+/// back to a trivial digest if no aux chain resolves or the call fails.
+async fn build_session_summary(
+    aux: &librefang_runtime::aux_client::AuxClient,
+    catalog: &librefang_runtime::model_catalog::ModelCatalog,
+    agent_id: AgentId,
+    session_id: SessionId,
+    agent_name: &str,
+    messages: &[librefang_types::message::Message],
+) -> String {
+    use librefang_runtime::llm_driver::CompletionRequest;
+    use librefang_types::config::AuxTask;
+    use librefang_types::message::Message;
+
+    let resolution = aux.resolve(AuxTask::SessionSummary);
+
+    if resolution.used_primary {
+        // No aux chain resolved — keep the on-reset write useful but
+        // log loudly so operators see the degraded mode.
+        warn!(
+            agent_id = %agent_id,
+            session_id = %session_id.0,
+            "Session-summary aux chain unconfigured (or all entries skipped); falling back to trivial summary. \
+             Configure [llm.auxiliary] session_summary in config.toml for high-quality summaries."
         );
+        return build_trivial_session_summary(messages);
+    }
 
-        // Save to structured memory store (key = "session_{date}_{slug}")
-        let key = format!("session_{date}_{slug}");
-        let _ = self.memory.substrate.structured_set(
-            agent_id,
-            &key,
-            serde_json::Value::String(summary.clone()),
-        );
+    let transcript = render_session_transcript(messages, MAX_SUMMARY_INPUT_BYTES);
+    if transcript.is_empty() {
+        return build_trivial_session_summary(messages);
+    }
 
-        // Also write to workspace memory/ dir if workspace exists
-        if let Some(ref workspace) = entry.manifest.workspace {
-            let mem_dir = workspace.join("memory");
-            let filename = format!("{date}-{slug}.md");
-            let _ = std::fs::write(mem_dir.join(&filename), &summary);
+    let model = resolution
+        .resolved
+        .first()
+        .map(|(_, m)| m.clone())
+        .unwrap_or_default();
+    let echo_policy = catalog
+        .find_model(&model)
+        .map(|e| e.reasoning_echo_policy)
+        .unwrap_or_default();
+
+    let system = "You summarise agent sessions. Output plain markdown only — no preamble, no \
+                  meta-commentary, no code fences. Aim for 5–10 bullets covering the user's goal, \
+                  the work actually performed (including tool calls), entities or files written, \
+                  decisions taken, and the final state of the session.";
+    let user_prompt = format!(
+        "Agent: {agent_name}\n\
+         Session: {session_id}\n\
+         \n\
+         Conversation transcript follows. Summarise it per the instructions.\n\
+         \n\
+         {transcript}",
+        session_id = session_id.0,
+    );
+
+    let req = CompletionRequest {
+        model,
+        messages: std::sync::Arc::new(vec![Message::user(user_prompt)]),
+        tools: std::sync::Arc::new(vec![]),
+        max_tokens: 1024,
+        temperature: 0.2,
+        system: Some(system.to_string()),
+        thinking: None,
+        prompt_caching: false,
+        cache_ttl: None,
+        response_format: None,
+        timeout_secs: Some(SESSION_SUMMARY_LLM_TIMEOUT_SECS),
+        extra_body: None,
+        agent_id: Some(agent_id.to_string()),
+        session_id: Some(session_id.0.to_string()),
+        step_id: None,
+        reasoning_echo_policy: echo_policy,
+    };
+
+    invoke_summary_driver(
+        resolution.driver.as_ref(),
+        req,
+        std::time::Duration::from_secs(SESSION_SUMMARY_LLM_TIMEOUT_SECS),
+        agent_id,
+        session_id,
+        messages,
+    )
+    .await
+}
+
+/// Drive the aux LLM call for a session summary and translate the four
+/// terminal states (ok-text, ok-empty, driver error, timeout) into
+/// either the model's text or the trivial fallback. Extracted from
+/// [`build_session_summary`] so tests can inject a `MockLlmDriver`
+/// without standing up an `AuxClient`.
+async fn invoke_summary_driver(
+    driver: &dyn librefang_runtime::llm_driver::LlmDriver,
+    req: librefang_runtime::llm_driver::CompletionRequest,
+    timeout: std::time::Duration,
+    agent_id: AgentId,
+    session_id: SessionId,
+    fallback_messages: &[librefang_types::message::Message],
+) -> String {
+    let outcome = tokio::time::timeout(timeout, driver.complete(req)).await;
+
+    match outcome {
+        Ok(Ok(resp)) => {
+            let text = resp.text().trim().to_string();
+            if text.is_empty() {
+                warn!(
+                    agent_id = %agent_id,
+                    session_id = %session_id.0,
+                    "Session-summary aux LLM returned empty text; falling back to trivial summary"
+                );
+                build_trivial_session_summary(fallback_messages)
+            } else {
+                text
+            }
         }
+        Ok(Err(e)) => {
+            warn!(
+                agent_id = %agent_id,
+                session_id = %session_id.0,
+                error = %e,
+                "Session-summary aux LLM call failed; falling back to trivial summary"
+            );
+            build_trivial_session_summary(fallback_messages)
+        }
+        Err(_) => {
+            warn!(
+                agent_id = %agent_id,
+                session_id = %session_id.0,
+                timeout_ms = timeout.as_millis() as u64,
+                "Session-summary aux LLM call timed out; falling back to trivial summary"
+            );
+            build_trivial_session_summary(fallback_messages)
+        }
+    }
+}
 
+/// Render every message in the session as plain text — including
+/// tool-use and tool-result blocks — capped at `max_bytes` of UTF-8
+/// (matches `String::len`). The **head** is dropped when the
+/// transcript overflows, because the most recent turns are usually
+/// the most load-bearing for a summary (final decisions, last file
+/// edits). `ContentBlock::Thinking` is intentionally excluded so
+/// private chain-of-thought never reaches the on-disk summary.
+fn render_session_transcript(
+    messages: &[librefang_types::message::Message],
+    max_bytes: usize,
+) -> String {
+    use librefang_types::message::{ContentBlock, MessageContent, Role};
+
+    let mut rendered: Vec<String> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let role = match msg.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::System => "system",
+        };
+        let body = match &msg.content {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Blocks(blocks) => {
+                let mut parts: Vec<String> = Vec::new();
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text { text, .. } => parts.push(text.clone()),
+                        ContentBlock::ToolUse { name, input, .. } => {
+                            parts.push(format!("[tool_use: {name}({input})]"));
+                        }
+                        ContentBlock::ToolResult { content, .. } => {
+                            parts.push(format!("[tool_result: {content}]"));
+                        }
+                        ContentBlock::Thinking { .. } => {
+                            // Internal model reasoning is intentionally
+                            // dropped: a session summary lands in
+                            // `kv_store` and `{workspace}/memory/*.md`,
+                            // both of which persist across sessions.
+                            // Chain-of-thought traces are private to
+                            // the originating turn and must not leak
+                            // there.
+                        }
+                        ContentBlock::Image { .. } | ContentBlock::ImageFile { .. } => {
+                            parts.push("[image]".to_string());
+                        }
+                        ContentBlock::Unknown => {}
+                    }
+                }
+                parts.join(" ")
+            }
+        };
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        rendered.push(format!("{role}: {trimmed}"));
+    }
+
+    let mut out = rendered.join("\n\n");
+    if out.len() > max_bytes {
+        // Drop from the head — keep the recent context the summary cares about.
+        let overflow = out.len() - max_bytes;
+        let mut split = overflow;
+        while split < out.len() && !out.is_char_boundary(split) {
+            split += 1;
+        }
+        out = out.split_off(split);
+    }
+    out
+}
+
+/// Fallback summary used when the aux LLM is unavailable. Captures the
+/// session length, first / last substantive user turn, and the rough
+/// shape of the work — enough to identify the session later when
+/// browsing `kv_store`, but explicitly degraded relative to the aux-
+/// LLM path. Replaces the pre-#4869 "last-10-messages" digest which
+/// produced "thanks / sure / you too" on long sessions.
+fn build_trivial_session_summary(messages: &[librefang_types::message::Message]) -> String {
+    use librefang_types::message::{ContentBlock, MessageContent, Role};
+
+    let mut user_turns: Vec<String> = Vec::new();
+    let mut tool_use_count: usize = 0;
+    let mut tool_result_count: usize = 0;
+    let mut assistant_turns: usize = 0;
+
+    for msg in messages {
+        match msg.role {
+            Role::User => {
+                let body = msg.content.text_content();
+                let trimmed = body.trim();
+                if !trimmed.is_empty() {
+                    user_turns.push(trimmed.to_string());
+                }
+                if let MessageContent::Blocks(blocks) = &msg.content {
+                    for b in blocks {
+                        if matches!(b, ContentBlock::ToolResult { .. }) {
+                            tool_result_count += 1;
+                        }
+                    }
+                }
+            }
+            Role::Assistant => {
+                assistant_turns += 1;
+                if let MessageContent::Blocks(blocks) = &msg.content {
+                    for b in blocks {
+                        if matches!(b, ContentBlock::ToolUse { .. }) {
+                            tool_use_count += 1;
+                        }
+                    }
+                }
+            }
+            Role::System => {}
+        }
+    }
+
+    let date = chrono::Utc::now().format("%Y-%m-%d");
+    let mut out = format!("Session on {date} (auto-summary, aux LLM unavailable)\n\n");
+    out.push_str(&format!(
+        "- Turns: {} user / {} assistant\n",
+        user_turns.len(),
+        assistant_turns
+    ));
+    out.push_str(&format!(
+        "- Tool activity: {tool_use_count} tool calls, {tool_result_count} tool results\n"
+    ));
+    if let Some(first) = user_turns.first() {
+        out.push_str(&format!(
+            "- First user goal: {}\n",
+            librefang_types::truncate_str(first, 240)
+        ));
+    }
+    if user_turns.len() > 1 {
+        if let Some(last) = user_turns.last() {
+            out.push_str(&format!(
+                "- Last user turn: {}\n",
+                librefang_types::truncate_str(last, 240)
+            ));
+        }
+    }
+    out
+}
+
+/// Write the summary to `kv_store` (keyed by session id) and, if a
+/// workspace is configured, to a per-session markdown file. Both
+/// writes are best-effort — failures log and continue.
+fn persist_session_summary(
+    memory: &librefang_memory::MemorySubstrate,
+    agent_id: AgentId,
+    session_id: SessionId,
+    workspace: Option<&std::path::Path>,
+    raw_summary: &str,
+) {
+    let summary = if raw_summary.len() > MAX_SUMMARY_OUTPUT_BYTES {
+        // Truncate at a UTF-8 boundary so the JSON value stays valid.
+        let mut cutoff = MAX_SUMMARY_OUTPUT_BYTES;
+        while cutoff > 0 && !raw_summary.is_char_boundary(cutoff) {
+            cutoff -= 1;
+        }
+        let mut t = raw_summary[..cutoff].to_string();
+        t.push_str("\n\n…[truncated]");
+        t
+    } else {
+        raw_summary.to_string()
+    };
+
+    if summary.trim().is_empty() {
         debug!(
             agent_id = %agent_id,
+            session_id = %session_id.0,
+            "Skipping empty session summary"
+        );
+        return;
+    }
+
+    // Collision-free key: session id is unique per session. Pre-#4869
+    // this was `session_{date}_{slug}` which silently overwrote across
+    // sessions ending with the same slugified user message.
+    let key = format!("session_{}", session_id.0);
+    if let Err(e) =
+        memory.structured_set(agent_id, &key, serde_json::Value::String(summary.clone()))
+    {
+        warn!(
+            agent_id = %agent_id,
+            session_id = %session_id.0,
+            error = %e,
+            "Failed to persist session summary to kv_store"
+        );
+    } else {
+        debug!(
+            agent_id = %agent_id,
+            session_id = %session_id.0,
             key = %key,
+            bytes = summary.len(),
             "Saved session summary to memory before reset"
+        );
+    }
+
+    if let Some(workspace) = workspace {
+        let mem_dir = workspace.join("memory");
+        if mem_dir.exists() {
+            let filename = format!("session-{}.md", session_id.0);
+            let path = mem_dir.join(&filename);
+            if let Err(e) = std::fs::write(&path, &summary) {
+                debug!(
+                    agent_id = %agent_id,
+                    session_id = %session_id.0,
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to write session summary file to workspace"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_summary_tests {
+    use super::{build_trivial_session_summary, render_session_transcript};
+    use librefang_types::message::{ContentBlock, Message, Role};
+
+    fn tool_use(name: &str, input_text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: librefang_types::message::MessageContent::Blocks(vec![
+                ContentBlock::ToolUse {
+                    id: "id-1".to_string(),
+                    name: name.to_string(),
+                    input: serde_json::json!({ "text": input_text }),
+                    provider_metadata: None,
+                },
+            ]),
+            pinned: false,
+            timestamp: None,
+        }
+    }
+
+    fn tool_result(content: &str) -> Message {
+        Message::user_with_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "id-1".to_string(),
+            tool_name: String::new(),
+            content: content.to_string(),
+            is_error: false,
+            status: librefang_types::tool::ToolExecutionStatus::default(),
+            approval_request_id: None,
+        }])
+    }
+
+    #[test]
+    fn trivial_summary_survives_tool_result_only_tail() {
+        // Pre-#4869 defect 2: a session ending mid-tool-loop produced
+        // *no* summary at all because the filter found zero Text
+        // user messages. The trivial summary must still produce output.
+        let messages = vec![
+            Message::user("Plan meals for the week"),
+            Message::assistant("Sure — fetching your pantry"),
+            tool_use("read_pantry", "/"),
+            tool_result("eggs, rice, garlic"),
+        ];
+        let summary = build_trivial_session_summary(&messages);
+        assert!(
+            !summary.trim().is_empty(),
+            "tool-result-only tail must still produce a summary"
+        );
+        assert!(
+            summary.contains("Plan meals for the week"),
+            "first user goal should appear in trivial summary"
+        );
+        assert!(
+            summary.contains("Tool activity"),
+            "trivial summary should mention tool activity"
+        );
+    }
+
+    #[test]
+    fn trivial_summary_reports_turn_counts() {
+        let messages = vec![
+            Message::user("first"),
+            Message::assistant("a1"),
+            Message::user("second"),
+            Message::assistant("a2"),
+            Message::user("third"),
+        ];
+        let summary = build_trivial_session_summary(&messages);
+        assert!(summary.contains("3 user / 2 assistant"));
+    }
+
+    #[test]
+    fn render_transcript_includes_tool_calls() {
+        let messages = vec![
+            Message::user("Read the pantry"),
+            tool_use("read_pantry", "/"),
+            tool_result("eggs, rice"),
+        ];
+        let rendered = render_session_transcript(&messages, 10_000);
+        assert!(rendered.contains("user: Read the pantry"));
+        assert!(rendered.contains("[tool_use: read_pantry"));
+        assert!(rendered.contains("[tool_result: eggs, rice]"));
+    }
+
+    #[test]
+    fn render_transcript_truncates_head_preserves_tail() {
+        // Build a long synthetic transcript; verify the cap drops the
+        // head (oldest content) and keeps the tail (most-recent context,
+        // which is the load-bearing part for a summary).
+        let mut messages = Vec::new();
+        for i in 0..200 {
+            messages.push(Message::user(format!("user turn {i:03}: padding text")));
+            messages.push(Message::assistant(format!(
+                "assistant turn {i:03}: more padding"
+            )));
+        }
+        let rendered = render_session_transcript(&messages, 1_000);
+        assert!(rendered.len() <= 1_000);
+        assert!(
+            !rendered.contains("user turn 000:"),
+            "head should be dropped when over cap"
+        );
+        assert!(
+            rendered.contains("turn 199:"),
+            "tail (recent context) must survive the cap"
+        );
+    }
+
+    #[test]
+    fn render_transcript_omits_thinking_blocks() {
+        // Internal chain-of-thought must not reach kv_store or the
+        // workspace markdown — the session summary persists across
+        // sessions and would leak private reasoning otherwise.
+        let messages = vec![
+            Message::user("What's 2+2?"),
+            Message {
+                role: Role::Assistant,
+                content: librefang_types::message::MessageContent::Blocks(vec![
+                    ContentBlock::Thinking {
+                        thinking: "SECRET_REASONING_should_not_leak".to_string(),
+                        provider_metadata: None,
+                    },
+                    ContentBlock::Text {
+                        text: "Four.".to_string(),
+                        provider_metadata: None,
+                    },
+                ]),
+                pinned: false,
+                timestamp: None,
+            },
+        ];
+        let rendered = render_session_transcript(&messages, 10_000);
+        assert!(
+            !rendered.contains("SECRET_REASONING_should_not_leak"),
+            "thinking text must never appear in the rendered transcript"
+        );
+        assert!(
+            !rendered.contains("[thinking"),
+            "no thinking placeholder either — the block is dropped entirely"
+        );
+        assert!(
+            rendered.contains("Four."),
+            "visible assistant text still survives"
+        );
+    }
+
+    // --- aux-LLM driver invocation path ---------------------------------
+    //
+    // The four terminal states of `invoke_summary_driver`:
+    //   ok-text  → return the model's text verbatim
+    //   ok-empty → warn + fall back to trivial digest
+    //   error    → warn + fall back to trivial digest
+    //   timeout  → warn + fall back to trivial digest
+    //
+    // Pre-#4869 there was no aux call at all, so these are the load-
+    // bearing new branches.
+
+    use super::invoke_summary_driver;
+    use async_trait::async_trait;
+    use librefang_runtime::llm_driver::{
+        CompletionRequest, CompletionResponse, LlmDriver, LlmError, StreamEvent,
+    };
+    use librefang_testing::{FailingLlmDriver, MockLlmDriver};
+    use librefang_types::agent::{AgentId, SessionId};
+    use librefang_types::message::{StopReason, TokenUsage};
+    use std::time::Duration;
+
+    fn dummy_request() -> CompletionRequest {
+        CompletionRequest {
+            model: "test-model".to_string(),
+            messages: std::sync::Arc::new(vec![Message::user("hi")]),
+            tools: std::sync::Arc::new(vec![]),
+            max_tokens: 256,
+            temperature: 0.2,
+            system: Some("system".to_string()),
+            thinking: None,
+            prompt_caching: false,
+            cache_ttl: None,
+            response_format: None,
+            timeout_secs: Some(5),
+            extra_body: None,
+            agent_id: None,
+            session_id: None,
+            step_id: None,
+            reasoning_echo_policy: Default::default(),
+        }
+    }
+
+    fn trivial_signal_messages() -> Vec<Message> {
+        // Trivial summary should be recognisable so tests can tell
+        // "the fallback ran" from "the driver text was used".
+        vec![
+            Message::user("FALLBACK_FIRST_GOAL_MARKER"),
+            Message::assistant("ok"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn invoke_summary_driver_returns_aux_text_when_ok() {
+        let driver = MockLlmDriver::with_response("- bullet one\n- bullet two");
+        let messages = trivial_signal_messages();
+        let out = invoke_summary_driver(
+            &driver,
+            dummy_request(),
+            Duration::from_secs(5),
+            AgentId::new(),
+            SessionId::new(),
+            &messages,
+        )
+        .await;
+        assert_eq!(out, "- bullet one\n- bullet two");
+        assert!(
+            !out.contains("FALLBACK_FIRST_GOAL_MARKER"),
+            "trivial fallback must not run on the happy path"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_summary_driver_falls_back_when_text_empty() {
+        let driver = MockLlmDriver::with_response("");
+        let messages = trivial_signal_messages();
+        let out = invoke_summary_driver(
+            &driver,
+            dummy_request(),
+            Duration::from_secs(5),
+            AgentId::new(),
+            SessionId::new(),
+            &messages,
+        )
+        .await;
+        assert!(
+            out.contains("FALLBACK_FIRST_GOAL_MARKER"),
+            "empty aux response should produce the trivial fallback (got: {out:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_summary_driver_falls_back_on_driver_error() {
+        let driver = FailingLlmDriver::new("simulated 500");
+        let messages = trivial_signal_messages();
+        let out = invoke_summary_driver(
+            &driver,
+            dummy_request(),
+            Duration::from_secs(5),
+            AgentId::new(),
+            SessionId::new(),
+            &messages,
+        )
+        .await;
+        assert!(
+            out.contains("FALLBACK_FIRST_GOAL_MARKER"),
+            "driver error should produce the trivial fallback (got: {out:?})"
+        );
+    }
+
+    /// Driver whose `complete` future never resolves within the test
+    /// timeout — pins the `tokio::time::timeout` arm.
+    struct SleepyDriver {
+        sleep_for: Duration,
+    }
+
+    #[async_trait]
+    impl LlmDriver for SleepyDriver {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            tokio::time::sleep(self.sleep_for).await;
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "too-late".to_string(),
+                    provider_metadata: None,
+                }],
+                stop_reason: StopReason::EndTurn,
+                tool_calls: vec![],
+                usage: TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+            })
+        }
+
+        async fn stream(
+            &self,
+            request: CompletionRequest,
+            _tx: tokio::sync::mpsc::Sender<StreamEvent>,
+        ) -> Result<CompletionResponse, LlmError> {
+            self.complete(request).await
+        }
+
+        fn is_configured(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn invoke_summary_driver_falls_back_on_timeout() {
+        let driver = SleepyDriver {
+            sleep_for: Duration::from_secs(60),
+        };
+        let messages = trivial_signal_messages();
+        let out = invoke_summary_driver(
+            &driver,
+            dummy_request(),
+            Duration::from_millis(50),
+            AgentId::new(),
+            SessionId::new(),
+            &messages,
+        )
+        .await;
+        assert!(
+            out.contains("FALLBACK_FIRST_GOAL_MARKER"),
+            "timeout should produce the trivial fallback (got: {out:?})"
+        );
+        assert!(
+            !out.contains("too-late"),
+            "the never-resolving driver text must not leak through"
         );
     }
 }
