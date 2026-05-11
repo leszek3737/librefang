@@ -23,6 +23,32 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+/// Error type returned by [`WorkflowEngine::cancel_run`].
+#[derive(Debug, Clone)]
+pub enum CancelRunError {
+    /// No run with that id exists in the engine.
+    NotFound(WorkflowRunId),
+    /// The run is already in a terminal state and cannot be cancelled.
+    AlreadyTerminal {
+        run_id: WorkflowRunId,
+        /// One of `"completed"`, `"failed"`, or `"cancelled"`.
+        state: &'static str,
+    },
+}
+
+impl std::fmt::Display for CancelRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CancelRunError::NotFound(id) => write!(f, "Workflow run not found: {id}"),
+            CancelRunError::AlreadyTerminal { run_id, state } => {
+                write!(f, "Cannot cancel workflow run {run_id}: already {state}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CancelRunError {}
+
 /// Unique identifier for a workflow definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkflowId(pub Uuid);
@@ -85,6 +111,12 @@ pub struct Workflow {
     /// Optional canvas layout data (nodes, edges, positions) for the visual editor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<serde_json::Value>,
+    /// Maximum wall-clock time for the entire workflow run, in seconds.
+    /// `None` means fall back to the kernel-level default
+    /// (`KernelConfig::workflow_default_total_timeout_secs`). When that is
+    /// also `None` the workflow runs unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_timeout_secs: Option<u64>,
 }
 
 /// A single step in a workflow.
@@ -162,7 +194,22 @@ pub enum ErrorMode {
     /// Skip this step on error and continue.
     Skip,
     /// Retry the step up to N times before failing.
-    Retry { max_retries: u32 },
+    ///
+    /// `backoff_ms`: base delay in milliseconds before attempt 2 (doubled each
+    /// attempt, capped at 60 000 ms). `None` preserves the historical
+    /// immediate-retry behaviour.
+    ///
+    /// `jitter_pct`: if set, the backoff is perturbed by ±`jitter_pct`%
+    /// (clamped to 0–100) using a uniform random draw. `None` means no
+    /// jitter. Both fields default to `None` so old persisted workflows
+    /// (`{"retry": {"max_retries": 3}}`) deserialize cleanly.
+    Retry {
+        max_retries: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backoff_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        jitter_pct: Option<u8>,
+    },
 }
 
 /// The current state of a workflow run.
@@ -193,6 +240,8 @@ pub enum WorkflowRunState {
     },
     Completed,
     Failed,
+    /// The run was explicitly cancelled via [`WorkflowEngine::cancel_run`].
+    Cancelled,
 }
 
 impl WorkflowRunState {
@@ -358,6 +407,14 @@ pub struct WorkflowEngine {
     /// through SQLite instead of the JSON file. The JSON path is still
     /// kept for the one-time migration (`migrate_from_json`).
     store: Option<WorkflowStore>,
+    /// Kernel-level default total timeout for workflow runs (seconds).
+    /// Individual workflows can override this via `Workflow::total_timeout_secs`.
+    /// `None` means unbounded.
+    pub(crate) default_total_timeout_secs: Option<u64>,
+    /// Per-run cancellation notifiers. `cancel_run` calls `notify_waiters()`
+    /// on the entry for `run_id` so that retry sleeps can wake up immediately
+    /// instead of blocking for the full backoff duration.
+    cancel_notify: Arc<DashMap<WorkflowRunId, Arc<tokio::sync::Notify>>>,
 }
 
 /// Evaluate a conditional expression against the previous step output.
@@ -519,6 +576,57 @@ fn classify_backoff(err: &str, attempt: u32) -> std::time::Duration {
     std::time::Duration::from_secs(2u64.saturating_pow(attempt).min(60))
 }
 
+/// Compute the sleep duration between retry attempts.
+///
+/// Resolution order:
+/// 1. If `backoff_ms` is `Some(b)`, the base delay is `b * 2^attempt`
+///    (exponential doubling), capped at 60 000 ms.
+///    Optional `jitter_pct` (0–100) perturbs the base by ±j% using a
+///    uniform random draw so simultaneous retries of multiple steps do not
+///    all pile up at the same instant.
+/// 2. If `backoff_ms` is `None`, fall through to `classify_backoff` which
+///    handles rate-limit hints and the historical exponential default.
+fn compute_retry_backoff(
+    err: &str,
+    attempt: u32,
+    backoff_ms: Option<u64>,
+    jitter_pct: Option<u8>,
+) -> std::time::Duration {
+    const MAX_BACKOFF_MS: u64 = 60_000;
+
+    if let Some(base_ms) = backoff_ms {
+        // Exponential: base * 2^attempt, capped.
+        let raw_ms = base_ms
+            .saturating_mul(2u64.saturating_pow(attempt))
+            .min(MAX_BACKOFF_MS);
+
+        let final_ms = if let Some(pct) = jitter_pct {
+            // Apply ±pct% jitter. Clamp pct to [0, 100].
+            let pct_clamped = pct.min(100) as u64;
+            let delta = raw_ms.saturating_mul(pct_clamped) / 100;
+            if delta == 0 {
+                raw_ms
+            } else {
+                // Draw a uniform value in [0, 2*delta] and subtract delta to get
+                // a value in [-delta, +delta] relative to raw_ms.
+                let range = delta.saturating_mul(2).saturating_add(1);
+                let jitter = rand::random::<u64>() % range;
+                raw_ms
+                    .saturating_add(jitter)
+                    .saturating_sub(delta)
+                    .min(MAX_BACKOFF_MS)
+            }
+        } else {
+            raw_ms
+        };
+
+        std::time::Duration::from_millis(final_ms)
+    } else {
+        // No configured backoff — use the existing classifier.
+        classify_backoff(err, attempt)
+    }
+}
+
 impl WorkflowEngine {
     /// Create a new workflow engine (no persistence).
     pub fn new() -> Self {
@@ -528,6 +636,8 @@ impl WorkflowEngine {
             persist_path: None,
             persist_lock: Arc::new(std::sync::Mutex::new(())),
             store: None,
+            default_total_timeout_secs: None,
+            cancel_notify: Arc::new(DashMap::new()),
         }
     }
 
@@ -541,6 +651,8 @@ impl WorkflowEngine {
             persist_path: Some(home_dir.join("data").join("workflow_runs.json")),
             persist_lock: Arc::new(std::sync::Mutex::new(())),
             store: None,
+            default_total_timeout_secs: None,
+            cancel_notify: Arc::new(DashMap::new()),
         }
     }
 
@@ -556,6 +668,8 @@ impl WorkflowEngine {
             persist_path: Some(home_dir.join("data").join("workflow_runs.json")),
             persist_lock: Arc::new(std::sync::Mutex::new(())),
             store: Some(store),
+            default_total_timeout_secs: None,
+            cancel_notify: Arc::new(DashMap::new()),
         }
     }
 
@@ -978,8 +1092,14 @@ impl WorkflowEngine {
         }
 
         self.runs.insert(run_id, run);
+        // Seat a fresh Notify so retry sleeps can be woken on cancellation.
+        self.cancel_notify
+            .insert(run_id, Arc::new(tokio::sync::Notify::new()));
 
-        // Evict oldest completed/failed runs when we exceed the cap
+        // Evict oldest terminal runs (Completed / Failed / Cancelled) when
+        // we exceed the cap. Cancelled must be included here, otherwise a
+        // burst of user-initiated cancels would pin those records in the
+        // DashMap forever and push out evictable Completed/Failed runs.
         if self.runs.len() > Self::MAX_RETAINED_RUNS {
             let mut evictable: Vec<(WorkflowRunId, DateTime<Utc>)> = self
                 .runs
@@ -987,7 +1107,9 @@ impl WorkflowEngine {
                 .filter(|r| {
                     matches!(
                         r.state,
-                        WorkflowRunState::Completed | WorkflowRunState::Failed
+                        WorkflowRunState::Completed
+                            | WorkflowRunState::Failed
+                            | WorkflowRunState::Cancelled
                     )
                 })
                 .map(|r| (*r.key(), r.started_at))
@@ -1142,6 +1264,7 @@ impl WorkflowEngine {
                         "running" => matches!(r.state, WorkflowRunState::Running),
                         "completed" => matches!(r.state, WorkflowRunState::Completed),
                         "failed" => matches!(r.state, WorkflowRunState::Failed),
+                        "cancelled" => matches!(r.state, WorkflowRunState::Cancelled),
                         _ => true,
                     })
                     .unwrap_or(true)
@@ -1207,6 +1330,8 @@ impl WorkflowEngine {
         agent_id: AgentId,
         prompt: String,
         send_message: &F,
+        run_id: WorkflowRunId,
+        cancel_notify: &Arc<DashMap<WorkflowRunId, Arc<tokio::sync::Notify>>>,
     ) -> Result<Option<(String, u64, u64)>, String>
     where
         F: Fn(AgentId, String) -> Fut,
@@ -1243,7 +1368,11 @@ impl WorkflowEngine {
                     }
                 }
             }
-            ErrorMode::Retry { max_retries } => {
+            ErrorMode::Retry {
+                max_retries,
+                backoff_ms,
+                jitter_pct,
+            } => {
                 let mut last_err = String::new();
                 for attempt in 0..=*max_retries {
                     match tokio::time::timeout(timeout_dur, send_message(agent_id, prompt.clone()))
@@ -1253,27 +1382,61 @@ impl WorkflowEngine {
                         Ok(Err(e)) => {
                             last_err = e.to_string();
                             if attempt < *max_retries {
-                                let backoff = classify_backoff(&last_err, attempt);
+                                let sleep_dur = compute_retry_backoff(
+                                    &last_err,
+                                    attempt,
+                                    *backoff_ms,
+                                    *jitter_pct,
+                                );
                                 warn!(
                                     "Step '{}' attempt {} failed: {e}, retrying in {:?}",
                                     step.name,
                                     attempt + 1,
-                                    backoff
+                                    sleep_dur
                                 );
-                                tokio::time::sleep(backoff).await;
+                                let notify = cancel_notify.get(&run_id).map(|n| Arc::clone(&*n));
+                                tokio::select! {
+                                    _ = tokio::time::sleep(sleep_dur) => {}
+                                    _ = async {
+                                        match notify {
+                                            Some(n) => n.notified().await,
+                                            None => std::future::pending::<()>().await,
+                                        }
+                                    } => {
+                                        // Cancellation observed during retry sleep.
+                                        return Err("workflow run cancelled".into());
+                                    }
+                                }
                             }
                         }
                         Err(_) => {
                             last_err = format!("timed out after {}s", step.timeout_secs);
                             if attempt < *max_retries {
-                                let backoff = classify_backoff(&last_err, attempt);
+                                let sleep_dur = compute_retry_backoff(
+                                    &last_err,
+                                    attempt,
+                                    *backoff_ms,
+                                    *jitter_pct,
+                                );
                                 warn!(
                                     "Step '{}' attempt {} timed out, retrying in {:?}",
                                     step.name,
                                     attempt + 1,
-                                    backoff
+                                    sleep_dur
                                 );
-                                tokio::time::sleep(backoff).await;
+                                let notify = cancel_notify.get(&run_id).map(|n| Arc::clone(&*n));
+                                tokio::select! {
+                                    _ = tokio::time::sleep(sleep_dur) => {}
+                                    _ = async {
+                                        match notify {
+                                            Some(n) => n.notified().await,
+                                            None => std::future::pending::<()>().await,
+                                        }
+                                    } => {
+                                        // Cancellation observed during retry sleep.
+                                        return Err("workflow run cancelled".into());
+                                    }
+                                }
                             }
                         }
                     }
@@ -1412,7 +1575,9 @@ impl WorkflowEngine {
                 run.pause_request.as_ref().map(|r| r.resume_token)
             }
             WorkflowRunState::Paused { resume_token, .. } => return Ok(*resume_token),
-            WorkflowRunState::Completed | WorkflowRunState::Failed => {
+            WorkflowRunState::Completed
+            | WorkflowRunState::Failed
+            | WorkflowRunState::Cancelled => {
                 return Err(format!(
                     "Cannot pause workflow run {run_id}: state is terminal"
                 ))
@@ -1427,6 +1592,88 @@ impl WorkflowEngine {
             resume_token: token,
         });
         Ok(token)
+    }
+
+    /// Cancel a workflow run.
+    ///
+    /// Transitions `Pending`, `Running`, or `Paused` runs to
+    /// [`WorkflowRunState::Cancelled`] atomically under the DashMap shard
+    /// guard and persists the change immediately so a crash after this call
+    /// does not revert the run to a non-terminal state on restart.
+    ///
+    /// Returns `Err(`[`CancelRunError`]`)` if the run is not found or is
+    /// already in a terminal state (`Completed`, `Failed`, or `Cancelled`).
+    ///
+    /// After the state transition the per-run [`tokio::sync::Notify`] is
+    /// signalled so any retry sleep currently waiting on the notifier wakes
+    /// up immediately rather than sleeping for the full backoff duration.
+    ///
+    /// The executor also observes cancellation at every step boundary: it
+    /// peeks the run state at the top of each iteration and exits early if
+    /// it finds `Cancelled`.
+    pub async fn cancel_run(&self, run_id: WorkflowRunId) -> Result<(), CancelRunError> {
+        let already_paused = {
+            let mut run = self
+                .runs
+                .get_mut(&run_id)
+                .ok_or(CancelRunError::NotFound(run_id))?;
+            match &run.state {
+                WorkflowRunState::Pending
+                | WorkflowRunState::Running
+                | WorkflowRunState::Paused { .. } => {
+                    let was_paused = run.state.is_paused();
+                    run.state = WorkflowRunState::Cancelled;
+                    run.completed_at = Some(Utc::now());
+                    // Clear any pending pause request so the executor cannot
+                    // re-pause a cancelled run.
+                    run.pause_request = None;
+                    was_paused
+                }
+                WorkflowRunState::Completed => {
+                    return Err(CancelRunError::AlreadyTerminal {
+                        run_id,
+                        state: "completed",
+                    })
+                }
+                WorkflowRunState::Failed => {
+                    return Err(CancelRunError::AlreadyTerminal {
+                        run_id,
+                        state: "failed",
+                    })
+                }
+                WorkflowRunState::Cancelled => {
+                    return Err(CancelRunError::AlreadyTerminal {
+                        run_id,
+                        state: "cancelled",
+                    })
+                }
+            }
+            // shard guard dropped here
+        };
+
+        // Wake any retry sleep that is parked on this run's notifier.
+        if let Some(n) = self.cancel_notify.get(&run_id) {
+            n.notify_waiters();
+        }
+
+        // Clear pause snapshot outside the shard guard (clear_pause_state
+        // takes a separate get_mut).
+        if already_paused {
+            if let Some(mut run) = self.runs.get_mut(&run_id) {
+                run.clear_pause_state();
+            }
+        }
+
+        // Persist immediately so a restart does not revert to Running/Pending.
+        if let Some(run) = self.runs.get(&run_id) {
+            self.upsert_run_to_store(&run);
+        }
+        if let Err(e) = self.persist_runs_async().await {
+            warn!(run_id = %run_id, error = %e, "Failed to persist cancelled run state");
+        }
+
+        info!(run_id = %run_id, "Workflow run cancelled");
+        Ok(())
     }
 
     /// Resume a paused workflow run from where it stopped.
@@ -1571,15 +1818,50 @@ impl WorkflowEngine {
             "Starting workflow execution"
         );
 
+        // Resolve total-timeout: workflow field wins over kernel default.
+        let total_timeout = workflow
+            .total_timeout_secs
+            .or(self.default_total_timeout_secs);
+
         // Check if any step has non-empty depends_on — if so, use DAG execution
         let has_dag_deps = workflow.steps.iter().any(|s| !s.depends_on.is_empty());
-        let result = if has_dag_deps {
-            self.execute_run_dag(run_id, &workflow, &input, &agent_resolver, &send_message)
+
+        let inner_fut = async {
+            if has_dag_deps {
+                self.execute_run_dag(run_id, &workflow, &input, &agent_resolver, &send_message)
+                    .await
+            } else {
+                self.execute_run_sequential(
+                    run_id,
+                    &workflow,
+                    &input,
+                    &agent_resolver,
+                    &send_message,
+                )
                 .await
-        } else {
-            self.execute_run_sequential(run_id, &workflow, &input, &agent_resolver, &send_message)
-                .await
+            }
         };
+
+        let result = if let Some(secs) = total_timeout {
+            match tokio::time::timeout(std::time::Duration::from_secs(secs), inner_fut).await {
+                Ok(r) => r,
+                Err(_elapsed) => {
+                    let msg = format!("workflow exceeded total_timeout of {secs}s");
+                    // Only overwrite state if not already Cancelled.
+                    if let Some(mut run) = self.runs.get_mut(&run_id) {
+                        if !matches!(run.state, WorkflowRunState::Cancelled) {
+                            run.state = WorkflowRunState::Failed;
+                            run.error = Some(msg.clone());
+                            run.completed_at = Some(Utc::now());
+                        }
+                    }
+                    Err(msg)
+                }
+            }
+        } else {
+            inner_fut.await
+        };
+
         self.cleanup_terminal_pause_state(run_id).await;
         // Surface persist panics instead of swallowing them (#3753).
         if let Err(persist_err) = self.persist_runs_async().await {
@@ -1602,9 +1884,15 @@ impl WorkflowEngine {
         if let Some(mut run) = self.runs.get_mut(&run_id) {
             if matches!(
                 run.state,
-                WorkflowRunState::Completed | WorkflowRunState::Failed
+                WorkflowRunState::Completed
+                    | WorkflowRunState::Failed
+                    | WorkflowRunState::Cancelled
             ) {
                 run.clear_pause_state();
+                // Drop the per-run notifier — the run is terminal and no
+                // retry sleep will ever need to be woken again.
+                drop(run);
+                self.cancel_notify.remove(&run_id);
             }
         }
     }
@@ -1708,6 +1996,20 @@ impl WorkflowEngine {
                 return Ok(current_input);
             }
 
+            // Cancellation gate — checked after the pause gate so a
+            // concurrent cancel_run() is always observable at every step
+            // boundary. `cancel_run` already set state=Cancelled; we just
+            // need to exit the loop cleanly without overwriting that state.
+            if self
+                .runs
+                .get(&run_id)
+                .map(|r| matches!(r.state, WorkflowRunState::Cancelled))
+                .unwrap_or(false)
+            {
+                info!(run_id = %run_id, step = i, "Workflow run cancelled at step boundary");
+                return Err("workflow run cancelled".into());
+            }
+
             let step = &workflow.steps[i];
 
             debug!(
@@ -1741,9 +2043,15 @@ impl WorkflowEngine {
 
                     let prompt_sent = prompt.clone();
                     let start = std::time::Instant::now();
-                    let result =
-                        Self::execute_step_with_error_mode(step, agent_id, prompt, &send_message)
-                            .await;
+                    let result = Self::execute_step_with_error_mode(
+                        step,
+                        agent_id,
+                        prompt,
+                        &send_message,
+                        run_id,
+                        &self.cancel_notify,
+                    )
+                    .await;
                     let duration_ms = start.elapsed().as_millis() as u64;
 
                     match result {
@@ -1776,9 +2084,11 @@ impl WorkflowEngine {
                         }
                         Err(e) => {
                             if let Some(mut r) = self.runs.get_mut(&run_id) {
-                                r.state = WorkflowRunState::Failed;
-                                r.error = Some(e.clone());
-                                r.completed_at = Some(Utc::now());
+                                if !matches!(r.state, WorkflowRunState::Cancelled) {
+                                    r.state = WorkflowRunState::Failed;
+                                    r.error = Some(e.clone());
+                                    r.completed_at = Some(Utc::now());
+                                }
                             }
                             return Err(e);
                         }
@@ -1872,9 +2182,11 @@ impl WorkflowEngine {
                                     format!("FanOut step '{}' failed: {}", step_name, e);
                                 warn!(%error_msg);
                                 if let Some(mut r) = self.runs.get_mut(&run_id) {
-                                    r.state = WorkflowRunState::Failed;
-                                    r.error = Some(error_msg.clone());
-                                    r.completed_at = Some(Utc::now());
+                                    if !matches!(r.state, WorkflowRunState::Cancelled) {
+                                        r.state = WorkflowRunState::Failed;
+                                        r.error = Some(error_msg.clone());
+                                        r.completed_at = Some(Utc::now());
+                                    }
                                 }
                                 return Err(error_msg);
                             }
@@ -1885,9 +2197,11 @@ impl WorkflowEngine {
                                 );
                                 warn!(%error_msg);
                                 if let Some(mut r) = self.runs.get_mut(&run_id) {
-                                    r.state = WorkflowRunState::Failed;
-                                    r.error = Some(error_msg.clone());
-                                    r.completed_at = Some(Utc::now());
+                                    if !matches!(r.state, WorkflowRunState::Cancelled) {
+                                        r.state = WorkflowRunState::Failed;
+                                        r.error = Some(error_msg.clone());
+                                        r.completed_at = Some(Utc::now());
+                                    }
                                 }
                                 return Err(error_msg);
                             }
@@ -1980,9 +2294,15 @@ impl WorkflowEngine {
 
                     let prompt_sent = prompt.clone();
                     let start = std::time::Instant::now();
-                    let result =
-                        Self::execute_step_with_error_mode(step, agent_id, prompt, &send_message)
-                            .await;
+                    let result = Self::execute_step_with_error_mode(
+                        step,
+                        agent_id,
+                        prompt,
+                        &send_message,
+                        run_id,
+                        &self.cancel_notify,
+                    )
+                    .await;
                     let duration_ms = start.elapsed().as_millis() as u64;
 
                     match result {
@@ -2009,9 +2329,11 @@ impl WorkflowEngine {
                         Ok(None) => {}
                         Err(e) => {
                             if let Some(mut r) = self.runs.get_mut(&run_id) {
-                                r.state = WorkflowRunState::Failed;
-                                r.error = Some(e.clone());
-                                r.completed_at = Some(Utc::now());
+                                if !matches!(r.state, WorkflowRunState::Cancelled) {
+                                    r.state = WorkflowRunState::Failed;
+                                    r.error = Some(e.clone());
+                                    r.completed_at = Some(Utc::now());
+                                }
                             }
                             return Err(e);
                         }
@@ -2055,6 +2377,8 @@ impl WorkflowEngine {
                             agent_id,
                             prompt,
                             &send_message,
+                            run_id,
+                            &self.cancel_notify,
                         )
                         .await;
                         let duration_ms = start.elapsed().as_millis() as u64;
@@ -2098,9 +2422,11 @@ impl WorkflowEngine {
                             Ok(None) => break,
                             Err(e) => {
                                 if let Some(mut r) = self.runs.get_mut(&run_id) {
-                                    r.state = WorkflowRunState::Failed;
-                                    r.error = Some(e.clone());
-                                    r.completed_at = Some(Utc::now());
+                                    if !matches!(r.state, WorkflowRunState::Cancelled) {
+                                        r.state = WorkflowRunState::Failed;
+                                        r.error = Some(e.clone());
+                                        r.completed_at = Some(Utc::now());
+                                    }
                                 }
                                 return Err(e);
                             }
@@ -2244,8 +2570,15 @@ impl WorkflowEngine {
                 let prompt = Self::expand_variables(&step.prompt_template, input, &variables);
                 let prompt_sent = prompt.clone();
                 let start = std::time::Instant::now();
-                let result =
-                    Self::execute_step_with_error_mode(step, agent_id, prompt, send_message).await;
+                let result = Self::execute_step_with_error_mode(
+                    step,
+                    agent_id,
+                    prompt,
+                    send_message,
+                    run_id,
+                    &self.cancel_notify,
+                )
+                .await;
                 let duration_ms = start.elapsed().as_millis() as u64;
 
                 match result {
@@ -2674,6 +3007,7 @@ impl From<WorkflowFile> for Workflow {
             steps: f.steps,
             created_at: f.created_at.unwrap_or_else(Utc::now),
             layout: None,
+            total_timeout_secs: None,
         }
     }
 }
@@ -3058,6 +3392,7 @@ impl WorkflowTemplateRegistry {
             steps,
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         })
     }
 }
@@ -3089,6 +3424,7 @@ fn workflow_run_to_row(run: &WorkflowRun) -> WorkflowRunRow {
         ),
         WorkflowRunState::Completed => ("completed".to_string(), None, None, None),
         WorkflowRunState::Failed => ("failed".to_string(), None, None, None),
+        WorkflowRunState::Cancelled => ("cancelled".to_string(), None, None, None),
     };
 
     let step_results_json =
@@ -3261,6 +3597,7 @@ mod tests {
             ],
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         }
     }
 
@@ -3385,6 +3722,7 @@ mod tests {
             ],
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         };
         let wf_id = engine.register(wf).await;
         let run_id = engine
@@ -3442,6 +3780,7 @@ mod tests {
             ],
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         };
         let wf_id = engine.register(wf).await;
         let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
@@ -3484,6 +3823,7 @@ mod tests {
             }],
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         };
         let wf_id = engine.register(wf).await;
         let run_id = engine.create_run(wf_id, "draft".to_string()).await.unwrap();
@@ -3533,6 +3873,7 @@ mod tests {
             }],
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         };
         let wf_id = engine.register(wf).await;
         let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
@@ -3585,6 +3926,7 @@ mod tests {
             ],
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         };
         let wf_id = engine.register(wf).await;
         let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
@@ -3627,13 +3969,18 @@ mod tests {
                 prompt_template: "{{input}}".to_string(),
                 mode: StepMode::Sequential,
                 timeout_secs: 10,
-                error_mode: ErrorMode::Retry { max_retries: 2 },
+                error_mode: ErrorMode::Retry {
+                    max_retries: 2,
+                    backoff_ms: None,
+                    jitter_pct: None,
+                },
                 output_var: None,
                 inherit_context: None,
                 depends_on: vec![],
             }],
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         };
         let wf_id = engine.register(wf).await;
         let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
@@ -3709,6 +4056,7 @@ mod tests {
             ],
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         };
         let wf_id = engine.register(wf).await;
         let run_id = engine.create_run(wf_id, "start".to_string()).await.unwrap();
@@ -3785,6 +4133,7 @@ mod tests {
             ],
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         };
         let wf_id = engine.register(wf).await;
         let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
@@ -3824,9 +4173,14 @@ mod tests {
         let skip_json = serde_json::to_string(&ErrorMode::Skip).unwrap();
         assert_eq!(skip_json, "\"skip\"");
 
-        let retry_json = serde_json::to_string(&ErrorMode::Retry { max_retries: 3 }).unwrap();
+        let retry_json = serde_json::to_string(&ErrorMode::Retry {
+            max_retries: 3,
+            backoff_ms: None,
+            jitter_pct: None,
+        })
+        .unwrap();
         let retry: ErrorMode = serde_json::from_str(&retry_json).unwrap();
-        assert!(matches!(retry, ErrorMode::Retry { max_retries: 3 }));
+        assert!(matches!(retry, ErrorMode::Retry { max_retries: 3, .. }));
     }
 
     #[tokio::test]
@@ -4282,6 +4636,7 @@ prompt_template = "do {{x}}"
             ],
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         };
         let wf_id = engine.register(wf).await;
         let run_id = engine
@@ -4415,6 +4770,7 @@ prompt_template = "do {{x}}"
             ],
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         };
         let wf_id = engine.register(wf).await;
         let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
@@ -4688,6 +5044,7 @@ prompt_template = "do {{x}}"
             ],
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         };
 
         let template = WorkflowEngine::workflow_to_template(&workflow);
@@ -4738,6 +5095,7 @@ prompt_template = "do {{x}}"
             ],
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         };
 
         let wf_id = engine.register(wf).await;
@@ -5417,6 +5775,7 @@ prompt_template = "do {{x}}"
             ],
             created_at: Utc::now(),
             layout: None,
+            total_timeout_secs: None,
         };
         let wf_id = engine.register(wf).await;
         let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
@@ -5750,6 +6109,447 @@ prompt_template = "do {{x}}"
         assert_eq!(
             classify_backoff("some other error", 10),
             std::time::Duration::from_secs(60)
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // R1 Tests: behavioral executor tests (cancel, timeout, backoff math)
+    // -------------------------------------------------------------------------
+
+    /// Test 1: cancel mid-step stops execution and leaves state = Cancelled.
+    ///
+    /// - 3 sequential steps
+    /// - Step 1 returns immediately
+    /// - Step 2 waits on a Notify (simulating a long-running agent call)
+    /// - Step 3 would return immediately
+    /// - After step 1 completes (confirmed via a separate Notify), we cancel
+    ///   the run. Then we unblock step 2 to return.
+    /// - Asserts: executor returns Err("cancelled"), state is Cancelled,
+    ///   step_results.len() < 3 (step 3 never fired)
+    ///
+    /// Uses an atomic call counter to tell apart step 1 (call 0) from
+    /// step 2 (call 1) regardless of how the prompt template expands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_mid_step_stops_execution_and_state_is_cancelled() {
+        use std::sync::{
+            atomic::{AtomicU32, Ordering},
+            Arc,
+        };
+        use tokio::sync::Notify;
+
+        let engine = Arc::new(WorkflowEngine::new());
+        // step2_gate: blocks inside the step-2 send_message until notified.
+        let step2_gate = Arc::new(Notify::new());
+        // step1_done_signal: fires as soon as step 1 returns, before step 2
+        // is even called. Lets the test-driver know it's safe to cancel.
+        let step1_done_signal = Arc::new(Notify::new());
+        let call_count = Arc::new(AtomicU32::new(0));
+
+        let wf = Workflow {
+            id: WorkflowId::new(),
+            name: "cancel-mid-test".to_string(),
+            description: "".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    name: "step1".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "a".to_string(),
+                    },
+                    prompt_template: "s1".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
+                },
+                WorkflowStep {
+                    name: "step2".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "a".to_string(),
+                    },
+                    prompt_template: "s2".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
+                },
+                WorkflowStep {
+                    name: "step3".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "a".to_string(),
+                    },
+                    prompt_template: "s3".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 10,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
+                },
+            ],
+            created_at: Utc::now(),
+            layout: None,
+            total_timeout_secs: None,
+        };
+
+        let wf_id = engine.register(wf).await;
+        let run_id = engine.create_run(wf_id, "input".to_string()).await.unwrap();
+
+        let gate = step2_gate.clone();
+        let s1_done = step1_done_signal.clone();
+        let counter = call_count.clone();
+        let engine_exec = engine.clone();
+
+        // Spawn execute_run so cancel can race it.
+        let handle = tokio::spawn(async move {
+            engine_exec
+                .execute_run(run_id, mock_resolver, move |_id: AgentId, _msg: String| {
+                    let gate = gate.clone();
+                    let s1_done = s1_done.clone();
+                    let counter = counter.clone();
+                    async move {
+                        let call = counter.fetch_add(1, Ordering::SeqCst);
+                        if call == 0 {
+                            // step 1: return immediately, signal the driver.
+                            s1_done.notify_one();
+                            Ok(("step1_done".to_string(), 1u64, 1u64))
+                        } else {
+                            // step 2 (or 3): block until the gate opens.
+                            gate.notified().await;
+                            Ok(("step_done".to_string(), 1u64, 1u64))
+                        }
+                    }
+                })
+                .await
+        });
+
+        // Wait until step 1 has signalled completion.
+        step1_done_signal.notified().await;
+        // Give the executor a brief moment to record the step result and
+        // reach the step-2 send_message call before we cancel.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Cancel while executor is parked inside step-2's send_message.
+        engine
+            .cancel_run(run_id)
+            .await
+            .expect("cancel must succeed");
+
+        // Unblock step 2's send_message so the executor can observe the
+        // cancellation at the next step boundary.
+        step2_gate.notify_waiters();
+
+        // Await the spawned task.
+        let result = handle.await.expect("task must not panic");
+        assert!(
+            result.is_err(),
+            "execute_run must return Err after cancel, got Ok"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("cancel"),
+            "error must mention 'cancel', got: {err_msg}"
+        );
+
+        // State must be Cancelled.
+        let run = engine.get_run(run_id).await.unwrap();
+        assert!(
+            matches!(run.state, WorkflowRunState::Cancelled),
+            "state must be Cancelled, got {:?}",
+            run.state
+        );
+        // Step 3 must never have fired.
+        assert!(
+            run.step_results.len() < 3,
+            "step 3 must not have executed, got {} step_results",
+            run.step_results.len()
+        );
+    }
+
+    /// Test 2: total_timeout fires and transitions the run to Failed.
+    ///
+    /// Uses `tokio::time::pause()` + `advance()` so the test completes
+    /// instantly without sleeping real time.
+    #[tokio::test(flavor = "current_thread")]
+    async fn total_timeout_fires_and_sets_state_to_failed() {
+        tokio::time::pause();
+
+        let engine = WorkflowEngine::new();
+        let wf = Workflow {
+            id: WorkflowId::new(),
+            name: "timeout-test".to_string(),
+            description: "".to_string(),
+            steps: vec![WorkflowStep {
+                name: "slow-step".to_string(),
+                agent: StepAgent::ByName {
+                    name: "a".to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 300, // per-step timeout: longer than workflow timeout
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+                inherit_context: None,
+                depends_on: vec![],
+            }],
+            created_at: Utc::now(),
+            layout: None,
+            total_timeout_secs: Some(1), // 1 second total timeout
+        };
+
+        let wf_id = engine.register(wf).await;
+        let run_id = engine.create_run(wf_id, "input".to_string()).await.unwrap();
+
+        // execute_run will tokio::time::timeout(1s, inner_fut). The sender
+        // sleeps for 3s. We advance time by 2s to fire the timeout.
+        let exec_fut =
+            engine.execute_run(run_id, mock_resolver, |_id: AgentId, _msg: String| async {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                Ok(("done".to_string(), 0u64, 0u64))
+            });
+
+        // Drive execute_run and advance time concurrently. With time paused
+        // the sleep inside the sender won't advance unless we explicitly
+        // advance. We need to poll the future a bit first to get it parked
+        // in the sleep, then advance.
+        let result = tokio::select! {
+            r = exec_fut => r,
+            _ = async {
+                // Let the executor get parked in the sleep first.
+                tokio::task::yield_now().await;
+                tokio::time::advance(std::time::Duration::from_secs(2)).await;
+                std::future::pending::<()>().await
+            } => unreachable!(),
+        };
+
+        assert!(
+            result.is_err(),
+            "execute_run must return Err on timeout, got Ok"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("workflow exceeded total_timeout"),
+            "error must mention timeout, got: {err_msg}"
+        );
+
+        let run = engine.get_run(run_id).await.unwrap();
+        assert!(
+            matches!(run.state, WorkflowRunState::Failed),
+            "state must be Failed after timeout, got {:?}",
+            run.state
+        );
+        let error_field = run.error.as_deref().unwrap_or("");
+        assert!(
+            error_field.contains("workflow exceeded total_timeout"),
+            "run.error must contain timeout message, got: {error_field}"
+        );
+    }
+
+    /// Test 3: compute_retry_backoff math — pure unit test.
+    #[test]
+    fn compute_retry_backoff_math() {
+        use std::time::Duration;
+
+        // Fixed base, no jitter: exponential doubling.
+        assert_eq!(
+            compute_retry_backoff("err", 0, Some(100), None),
+            Duration::from_millis(100),
+            "attempt 0: base_ms * 2^0"
+        );
+        assert_eq!(
+            compute_retry_backoff("err", 1, Some(100), None),
+            Duration::from_millis(200),
+            "attempt 1: base_ms * 2^1"
+        );
+        assert_eq!(
+            compute_retry_backoff("err", 2, Some(100), None),
+            Duration::from_millis(400),
+            "attempt 2: base_ms * 2^2"
+        );
+        // Very high attempt — must cap at MAX_BACKOFF_MS = 60_000 ms.
+        assert_eq!(
+            compute_retry_backoff("err", 20, Some(100), None),
+            Duration::from_millis(60_000),
+            "attempt 20: must be capped at 60_000 ms"
+        );
+
+        // With jitter_pct = 25 at attempt 1 (raw = 200ms):
+        // delta = 200 * 25 / 100 = 50ms, range = 201
+        // result in [200 - 50, 200 + 50] = [150ms, 250ms]
+        let mut values = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let d = compute_retry_backoff("err", 1, Some(100), Some(25));
+            let ms = d.as_millis();
+            assert!(
+                (150..=250).contains(&ms),
+                "jitter result {ms}ms must be in [150, 250]"
+            );
+            values.insert(ms);
+        }
+        assert!(
+            values.len() >= 2,
+            "jitter must produce variation over 20 calls, got unique values: {values:?}"
+        );
+
+        // No backoff_ms → falls through to classify_backoff.
+        assert_eq!(
+            compute_retry_backoff("err", 0, None, None),
+            classify_backoff("err", 0),
+            "None backoff_ms must delegate to classify_backoff"
+        );
+    }
+
+    /// Test 4: cancel_run returns NotFound for an unknown run id.
+    #[tokio::test]
+    async fn cancel_run_returns_not_found_for_unknown_id() {
+        let engine = WorkflowEngine::new();
+        let unknown = WorkflowRunId(uuid::Uuid::new_v4());
+        let result = engine.cancel_run(unknown).await;
+        assert!(
+            matches!(result, Err(CancelRunError::NotFound(_))),
+            "expected NotFound, got: {:?}",
+            result
+        );
+    }
+
+    /// Test 5: cancel_during_retry_sleep_aborts_promptly.
+    ///
+    /// Step fails every time; backoff is 30s. We cancel during the sleep
+    /// and verify the executor returns well before the sleep would have
+    /// expired.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_during_retry_sleep_aborts_promptly() {
+        use std::sync::Arc;
+        tokio::time::pause();
+
+        let engine = Arc::new(WorkflowEngine::new());
+        let wf = Workflow {
+            id: WorkflowId::new(),
+            name: "retry-cancel-test".to_string(),
+            description: "".to_string(),
+            steps: vec![WorkflowStep {
+                name: "always-fail".to_string(),
+                agent: StepAgent::ByName {
+                    name: "a".to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 5,
+                error_mode: ErrorMode::Retry {
+                    max_retries: 5,
+                    backoff_ms: Some(30_000), // 30 second backoff
+                    jitter_pct: None,
+                },
+                output_var: None,
+                inherit_context: None,
+                depends_on: vec![],
+            }],
+            created_at: Utc::now(),
+            layout: None,
+            total_timeout_secs: None,
+        };
+
+        let wf_id = engine.register(wf).await;
+        let run_id = engine.create_run(wf_id, "input".to_string()).await.unwrap();
+
+        let engine_exec = engine.clone();
+        // Spawn execute_run. The step always fails, so it enters the retry
+        // sleep (30s) after the first attempt.
+        let handle = tokio::spawn(async move {
+            engine_exec
+                .execute_run(run_id, mock_resolver, |_id: AgentId, _msg: String| async {
+                    Err("forced failure".to_string())
+                })
+                .await
+        });
+
+        // Advance time by 100ms — enough for the first attempt to fail and
+        // the executor to enter the retry sleep, but nowhere near the 30s backoff.
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+
+        // Cancel the run — this notifies the retry sleep's select branch.
+        engine
+            .cancel_run(run_id)
+            .await
+            .expect("cancel must succeed");
+
+        // The handle should resolve promptly (well under 500ms of real time).
+        // We use a real-time timeout here to guard against the test hanging.
+        tokio::time::resume();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), handle)
+            .await
+            .expect("execute_run must return promptly after cancel, not wait 30s")
+            .expect("task must not panic");
+
+        assert!(
+            result.is_err(),
+            "execute_run must return Err after cancel, got Ok"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("cancel"),
+            "error must mention cancel, got: {err}"
+        );
+
+        let run = engine.get_run(run_id).await.unwrap();
+        assert!(
+            matches!(run.state, WorkflowRunState::Cancelled),
+            "state must be Cancelled, got {:?}",
+            run.state
+        );
+    }
+
+    /// Regression: Cancelled runs must be evictable when the total exceeds
+    /// the retention cap (`MAX_RETAINED_RUNS`). Without this, a burst of
+    /// cancels would pin those records in the DashMap forever and push out
+    /// evictable Completed/Failed runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_runs_are_evictable_when_over_cap() {
+        let engine = WorkflowEngine::new();
+        let wf = Workflow {
+            id: WorkflowId::new(),
+            name: "evict-test".to_string(),
+            description: "".to_string(),
+            steps: vec![WorkflowStep {
+                name: "s".to_string(),
+                agent: StepAgent::ByName {
+                    name: "a".to_string(),
+                },
+                prompt_template: "x".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 1,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+                inherit_context: None,
+                depends_on: vec![],
+            }],
+            created_at: Utc::now(),
+            layout: None,
+            total_timeout_secs: None,
+        };
+        let wf_id = engine.register(wf).await;
+
+        // Create + immediately cancel well past the retention cap (200).
+        // Without Cancelled in the eviction filter, this loop grows the
+        // `runs` map unboundedly.
+        for _ in 0..250usize {
+            let run_id = engine
+                .create_run(wf_id, "x".to_string())
+                .await
+                .expect("create_run");
+            engine.cancel_run(run_id).await.expect("cancel_run");
+        }
+
+        let all_runs = engine.list_runs(None).await;
+        assert!(
+            all_runs.len() <= 200,
+            "cancelled runs over the cap must be evictable, retained {} (cap 200)",
+            all_runs.len()
         );
     }
 }
