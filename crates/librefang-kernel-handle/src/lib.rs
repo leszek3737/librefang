@@ -188,6 +188,7 @@ pub trait MemoryAccess: Send + Sync {
     /// Store a value in shared memory (cross-agent accessible).
     /// When `agent_id` is `Some`, scopes memory to that specific agent.
     /// When `None`, uses the shared memory namespace (backward compatible).
+    /// `agent_id` must be a valid UUID string — invalid values return an error.
     /// When `peer_id` is `Some`, the key is further scoped to that peer so
     /// different users of the same agent get isolated memory namespaces.
     fn memory_store(
@@ -201,6 +202,7 @@ pub trait MemoryAccess: Send + Sync {
     /// Recall a value from shared memory.
     /// When `agent_id` is `Some`, scopes memory to that specific agent.
     /// When `None`, uses the shared memory namespace (backward compatible).
+    /// `agent_id` must be a valid UUID string — invalid values return an error.
     /// When `peer_id` is `Some`, only returns values stored under that peer's namespace.
     fn memory_recall(
         &self,
@@ -212,7 +214,10 @@ pub trait MemoryAccess: Send + Sync {
     /// List all keys in shared memory.
     /// When `agent_id` is `Some`, scopes memory to that specific agent.
     /// When `None`, uses the shared memory namespace (backward compatible).
+    /// `agent_id` must be a valid UUID string — invalid values return an error.
     /// When `peer_id` is `Some`, only returns keys within that peer's namespace.
+    /// When `peer_id` is `None`, peer-scoped keys (peer:*) are always filtered
+    /// out to maintain per-user isolation regardless of agent_id.
     fn memory_list(
         &self,
         agent_id: Option<&str>,

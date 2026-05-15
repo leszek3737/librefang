@@ -10,20 +10,14 @@ use librefang_types::event::*;
 use super::super::PUBLISH_EVENT_DEPTH;
 use super::super::{peer_scoped_key, shared_memory_agent_id, spawn_logged, LibreFangKernel};
 
-fn resolve_agent_id(agent_id: Option<&str>) -> AgentId {
-    agent_id
-        .and_then(|s| {
-            let parsed = uuid::Uuid::parse_str(s).ok();
-            if parsed.is_none() && !s.is_empty() {
-                tracing::warn!(
-                    "memory_access: invalid agent_id '{}', falling back to shared namespace",
-                    s
-                );
-            }
-            parsed
-        })
-        .map(AgentId)
-        .unwrap_or_else(shared_memory_agent_id)
+fn resolve_agent_id(agent_id: Option<&str>) -> Result<AgentId, kernel_handle::KernelOpError> {
+    match agent_id {
+        None => Ok(shared_memory_agent_id()),
+        Some(s) if s.is_empty() => Ok(shared_memory_agent_id()),
+        Some(s) => uuid::Uuid::parse_str(s).map(AgentId).map_err(|e| {
+            kernel_handle::KernelOpError::Internal(format!("invalid agent_id '{s}': {e}"))
+        }),
+    }
 }
 
 impl kernel_handle::MemoryAccess for LibreFangKernel {
@@ -35,7 +29,7 @@ impl kernel_handle::MemoryAccess for LibreFangKernel {
         peer_id: Option<&str>,
     ) -> Result<(), kernel_handle::KernelOpError> {
         use kernel_handle::KernelOpError;
-        let agent_id = resolve_agent_id(agent_id);
+        let agent_id = resolve_agent_id(agent_id)?;
         let scoped = peer_scoped_key(key, peer_id);
         // Check whether key already exists to determine Created vs Updated
         let had_old = self
@@ -97,7 +91,7 @@ impl kernel_handle::MemoryAccess for LibreFangKernel {
         peer_id: Option<&str>,
     ) -> Result<Option<serde_json::Value>, kernel_handle::KernelOpError> {
         use kernel_handle::KernelOpError;
-        let agent_id = resolve_agent_id(agent_id);
+        let agent_id = resolve_agent_id(agent_id)?;
         let scoped = peer_scoped_key(key, peer_id);
         self.memory
             .substrate
@@ -111,7 +105,7 @@ impl kernel_handle::MemoryAccess for LibreFangKernel {
         peer_id: Option<&str>,
     ) -> Result<Vec<String>, kernel_handle::KernelOpError> {
         use kernel_handle::KernelOpError;
-        let agent_id = resolve_agent_id(agent_id);
+        let agent_id = resolve_agent_id(agent_id)?;
         let all_keys = self
             .memory
             .substrate
@@ -125,16 +119,10 @@ impl kernel_handle::MemoryAccess for LibreFangKernel {
                     .filter_map(|k| k.strip_prefix(&prefix).map(|s| s.to_string()))
                     .collect())
             }
-            None => {
-                if agent_id != shared_memory_agent_id() {
-                    Ok(all_keys)
-                } else {
-                    Ok(all_keys
-                        .into_iter()
-                        .filter(|k| !k.starts_with("peer:"))
-                        .collect())
-                }
-            }
+            None => Ok(all_keys
+                .into_iter()
+                .filter(|k| !k.starts_with("peer:"))
+                .collect()),
         }
     }
 
