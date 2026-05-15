@@ -80,6 +80,7 @@ impl MemoryAccess for CapturingKernel {
         &self,
         _: &str,
         _: serde_json::Value,
+        _agent_id: Option<&str>,
         _: Option<&str>,
     ) -> Result<(), librefang_kernel_handle::KernelOpError> {
         Err("not implemented".into())
@@ -87,12 +88,14 @@ impl MemoryAccess for CapturingKernel {
     fn memory_recall(
         &self,
         _: &str,
+        _agent_id: Option<&str>,
         _: Option<&str>,
     ) -> Result<Option<serde_json::Value>, librefang_kernel_handle::KernelOpError> {
         Err("not implemented".into())
     }
     fn memory_list(
         &self,
+        _agent_id: Option<&str>,
         _: Option<&str>,
     ) -> Result<Vec<String>, librefang_kernel_handle::KernelOpError> {
         Err("not implemented".into())

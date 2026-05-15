@@ -186,26 +186,38 @@ pub trait AgentControl: Send + Sync {
 
 pub trait MemoryAccess: Send + Sync {
     /// Store a value in shared memory (cross-agent accessible).
-    /// When `peer_id` is `Some`, the key is scoped to that peer so different
-    /// users of the same agent get isolated memory namespaces.
+    /// When `agent_id` is `Some`, scopes memory to that specific agent.
+    /// When `None`, uses the shared memory namespace (backward compatible).
+    /// When `peer_id` is `Some`, the key is further scoped to that peer so
+    /// different users of the same agent get isolated memory namespaces.
     fn memory_store(
         &self,
         key: &str,
         value: serde_json::Value,
+        agent_id: Option<&str>,
         peer_id: Option<&str>,
     ) -> Result<(), KernelOpError>;
 
     /// Recall a value from shared memory.
+    /// When `agent_id` is `Some`, scopes memory to that specific agent.
+    /// When `None`, uses the shared memory namespace (backward compatible).
     /// When `peer_id` is `Some`, only returns values stored under that peer's namespace.
     fn memory_recall(
         &self,
         key: &str,
+        agent_id: Option<&str>,
         peer_id: Option<&str>,
     ) -> Result<Option<serde_json::Value>, KernelOpError>;
 
     /// List all keys in shared memory.
+    /// When `agent_id` is `Some`, scopes memory to that specific agent.
+    /// When `None`, uses the shared memory namespace (backward compatible).
     /// When `peer_id` is `Some`, only returns keys within that peer's namespace.
-    fn memory_list(&self, peer_id: Option<&str>) -> Result<Vec<String>, KernelOpError>;
+    fn memory_list(
+        &self,
+        agent_id: Option<&str>,
+        peer_id: Option<&str>,
+    ) -> Result<Vec<String>, KernelOpError>;
 
     /// Resolve the per-user memory ACL for the given sender + channel
     /// pair (RBAC M3, #3054 Phase 2). Returns the resolved
@@ -1510,6 +1522,7 @@ mod tests {
             &self,
             _key: &str,
             _value: serde_json::Value,
+            _agent_id: Option<&str>,
             _peer_id: Option<&str>,
         ) -> Result<(), super::KernelOpError> {
             Err("stub".into())
@@ -1517,11 +1530,16 @@ mod tests {
         fn memory_recall(
             &self,
             _key: &str,
+            _agent_id: Option<&str>,
             _peer_id: Option<&str>,
         ) -> Result<Option<serde_json::Value>, super::KernelOpError> {
             Ok(None)
         }
-        fn memory_list(&self, _peer_id: Option<&str>) -> Result<Vec<String>, super::KernelOpError> {
+        fn memory_list(
+            &self,
+            _agent_id: Option<&str>,
+            _peer_id: Option<&str>,
+        ) -> Result<Vec<String>, super::KernelOpError> {
             Ok(vec![])
         }
     }

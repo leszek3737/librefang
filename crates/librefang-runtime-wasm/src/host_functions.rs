@@ -788,7 +788,7 @@ fn host_kv_get(state: &GuestState, params: &serde_json::Value) -> serde_json::Va
     // isolated KV namespace (Bug #3837). Without this prefix all agents share
     // a flat key space, so agent A can read or overwrite agent B's keys.
     let namespaced_key = format!("{}:{key}", state.agent_id);
-    match kernel.memory_recall(&namespaced_key, None) {
+    match kernel.memory_recall(&namespaced_key, None, None) {
         Ok(Some(val)) => {
             // SECURITY (#3866): cap the value returned to the guest so a
             // value stored before this cap existed cannot be used to push
@@ -864,7 +864,7 @@ fn host_kv_set(state: &GuestState, params: &serde_json::Value) -> serde_json::Va
     // live in a separate namespace and cannot be accessed by other agents
     // (Bug #3837).
     let namespaced_key = format!("{}:{key}", state.agent_id);
-    match kernel.memory_store(&namespaced_key, value, None) {
+    match kernel.memory_store(&namespaced_key, value, None, None) {
         Ok(()) => json!({"ok": true}),
         Err(e) => json!({"error": e.to_string()}),
     }
@@ -1262,6 +1262,7 @@ mod tests {
             &self,
             key: &str,
             value: serde_json::Value,
+            _agent_id: Option<&str>,
             _peer_id: Option<&str>,
         ) -> Result<(), librefang_kernel_handle::KernelOpError> {
             self.stored.lock().unwrap().push((key.to_string(), value));
@@ -1270,6 +1271,7 @@ mod tests {
         fn memory_recall(
             &self,
             key: &str,
+            _agent_id: Option<&str>,
             _peer_id: Option<&str>,
         ) -> Result<Option<serde_json::Value>, librefang_kernel_handle::KernelOpError> {
             self.recalled.lock().unwrap().push(key.to_string());
@@ -1277,6 +1279,7 @@ mod tests {
         }
         fn memory_list(
             &self,
+            _: Option<&str>,
             _: Option<&str>,
         ) -> Result<Vec<String>, librefang_kernel_handle::KernelOpError> {
             Ok(vec![])

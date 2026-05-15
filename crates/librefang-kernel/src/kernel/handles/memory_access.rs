@@ -2,21 +2,40 @@
 //! the SQLite memory substrate, plus the per-user RBAC ACL resolver. Writes
 //! publish a `MemoryUpdate` event so triggers can fan out without polling.
 
+use librefang_types::agent::AgentId;
+
 use librefang_runtime::kernel_handle;
 use librefang_types::event::*;
 
 use super::super::PUBLISH_EVENT_DEPTH;
 use super::super::{peer_scoped_key, shared_memory_agent_id, spawn_logged, LibreFangKernel};
 
+fn resolve_agent_id(agent_id: Option<&str>) -> AgentId {
+    agent_id
+        .and_then(|s| {
+            let parsed = uuid::Uuid::parse_str(s).ok();
+            if parsed.is_none() && !s.is_empty() {
+                tracing::warn!(
+                    "memory_access: invalid agent_id '{}', falling back to shared namespace",
+                    s
+                );
+            }
+            parsed
+        })
+        .map(AgentId)
+        .unwrap_or_else(shared_memory_agent_id)
+}
+
 impl kernel_handle::MemoryAccess for LibreFangKernel {
     fn memory_store(
         &self,
         key: &str,
         value: serde_json::Value,
+        agent_id: Option<&str>,
         peer_id: Option<&str>,
     ) -> Result<(), kernel_handle::KernelOpError> {
         use kernel_handle::KernelOpError;
-        let agent_id = shared_memory_agent_id();
+        let agent_id = resolve_agent_id(agent_id);
         let scoped = peer_scoped_key(key, peer_id);
         // Check whether key already exists to determine Created vs Updated
         let had_old = self
@@ -74,10 +93,11 @@ impl kernel_handle::MemoryAccess for LibreFangKernel {
     fn memory_recall(
         &self,
         key: &str,
+        agent_id: Option<&str>,
         peer_id: Option<&str>,
     ) -> Result<Option<serde_json::Value>, kernel_handle::KernelOpError> {
         use kernel_handle::KernelOpError;
-        let agent_id = shared_memory_agent_id();
+        let agent_id = resolve_agent_id(agent_id);
         let scoped = peer_scoped_key(key, peer_id);
         self.memory
             .substrate
@@ -87,10 +107,11 @@ impl kernel_handle::MemoryAccess for LibreFangKernel {
 
     fn memory_list(
         &self,
+        agent_id: Option<&str>,
         peer_id: Option<&str>,
     ) -> Result<Vec<String>, kernel_handle::KernelOpError> {
         use kernel_handle::KernelOpError;
-        let agent_id = shared_memory_agent_id();
+        let agent_id = resolve_agent_id(agent_id);
         let all_keys = self
             .memory
             .substrate
@@ -105,11 +126,14 @@ impl kernel_handle::MemoryAccess for LibreFangKernel {
                     .collect())
             }
             None => {
-                // When no peer context, return only non-peer-scoped keys
-                Ok(all_keys
-                    .into_iter()
-                    .filter(|k| !k.starts_with("peer:"))
-                    .collect())
+                if agent_id != shared_memory_agent_id() {
+                    Ok(all_keys)
+                } else {
+                    Ok(all_keys
+                        .into_iter()
+                        .filter(|k| !k.starts_with("peer:"))
+                        .collect())
+                }
             }
         }
     }
