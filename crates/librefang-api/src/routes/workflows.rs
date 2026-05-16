@@ -109,8 +109,8 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
 }
 use crate::triggers::{Trigger, TriggerId, TriggerPatch, TriggerPattern};
 use crate::workflow::{
-    CancelRunError, ErrorMode, PauseRunError, StepAgent, StepMode, Workflow, WorkflowId,
-    WorkflowRun, WorkflowRunId, WorkflowRunState, WorkflowStep,
+    BranchArm, CancelRunError, ErrorMode, GateCondition, GateOp, PauseRunError, StepAgent,
+    StepMode, Workflow, WorkflowId, WorkflowRun, WorkflowRunId, WorkflowRunState, WorkflowStep,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -210,6 +210,91 @@ fn parse_step_mode(val: &serde_json::Value, step: &serde_json::Value) -> StepMod
                     max_iterations,
                     until,
                 }
+            }
+            // Operator nodes (#4980). The flat-string forms read their
+            // configuration from sibling fields on the step object —
+            // mirrors the legacy `"conditional"` / `"loop"` shape, so
+            // the dashboard / TOML examples in the issue body can keep
+            // `mode = "wait"` with siblings `duration_secs = 5` etc.
+            "wait" => {
+                let duration_secs = step["duration_secs"].as_u64().unwrap_or_else(|| {
+                    warn!("wait step missing 'duration_secs' field, defaulting to 0");
+                    0
+                });
+                StepMode::Wait { duration_secs }
+            }
+            "gate" => {
+                // The `condition` field is a typed comparator AST
+                // (#4980 step 2). Parse it through serde so a malformed
+                // shape (missing `op`, unknown operator, wrong types)
+                // surfaces as a structured warn rather than silently
+                // defaulting to a passing gate. We fail-closed on error
+                // — `Eq` against `Value::Null` will fail any real input,
+                // making the misconfiguration loud rather than silent.
+                let condition: GateCondition = match step.get("condition") {
+                    Some(c) => match serde_json::from_value(c.clone()) {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            warn!(
+                                "gate step 'condition' failed to parse: {e}; failing closed with Eq=null"
+                            );
+                            GateCondition {
+                                field: None,
+                                op: GateOp::Eq,
+                                value: serde_json::Value::Null,
+                            }
+                        }
+                    },
+                    None => {
+                        warn!("gate step missing 'condition' field; failing closed with Eq=null");
+                        GateCondition {
+                            field: None,
+                            op: GateOp::Eq,
+                            value: serde_json::Value::Null,
+                        }
+                    }
+                };
+                StepMode::Gate { condition }
+            }
+            "approval" => {
+                let recipients: Vec<String> = step["recipients"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let timeout_secs = step["timeout_secs"].as_u64();
+                StepMode::Approval {
+                    recipients,
+                    timeout_secs,
+                }
+            }
+            "transform" => {
+                let code = step["code"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        warn!("transform step missing 'code' field, defaulting to empty");
+                        ""
+                    })
+                    .to_string();
+                StepMode::Transform { code }
+            }
+            "branch" => {
+                let arms: Vec<BranchArm> = step["arms"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| {
+                                let then = v["then"].as_str()?.to_string();
+                                let match_value = v.get("match_value").cloned()?;
+                                Some(BranchArm { match_value, then })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                StepMode::Branch { arms }
             }
             _ => StepMode::Sequential,
         };
@@ -438,6 +523,22 @@ pub async fn create_workflow(
         layout,
         total_timeout_secs,
     };
+
+    // Pre-flight validation: reject manifests with empty Transform code,
+    // unparseable Tera templates, zero / over-cap Wait durations, the
+    // Gate parser's fail-closed sentinel, and empty Branch arms. Without
+    // this, operators only discovered the typo when a real run reached
+    // the bad step.
+    let validation_errs = workflow.validate();
+    if !validation_errs.is_empty() {
+        let detail = validation_errs
+            .iter()
+            .map(|(step, reason)| format!("step '{step}': {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return ApiErrorResponse::bad_request(format!("invalid workflow: {detail}"))
+            .into_json_tuple();
+    }
 
     let id = state.kernel.register_workflow(workflow).await;
     (
@@ -728,6 +829,20 @@ pub async fn update_workflow(
         layout,
         total_timeout_secs,
     };
+
+    // Same pre-flight validation as `create_workflow` — a PATCH that
+    // introduces a bad Transform template / empty Branch arms / etc.
+    // must fail at the route boundary, not silently at run time.
+    let validation_errs = updated.validate();
+    if !validation_errs.is_empty() {
+        let detail = validation_errs
+            .iter()
+            .map(|(step, reason)| format!("step '{step}': {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return ApiErrorResponse::bad_request(format!("invalid workflow: {detail}"))
+            .into_json_tuple();
+    }
 
     if !state
         .kernel
@@ -2961,6 +3076,23 @@ pub async fn instantiate_template(
             return ApiErrorResponse::bad_request(e).into_json_tuple();
         }
     };
+
+    // Same pre-flight validation as the direct /workflows endpoints —
+    // an instantiated template can produce a workflow whose Transform
+    // code / Wait duration / etc. is invalid (template-author error),
+    // surface that here rather than at run time.
+    let validation_errs = workflow.validate();
+    if !validation_errs.is_empty() {
+        let detail = validation_errs
+            .iter()
+            .map(|(step, reason)| format!("step '{step}': {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return ApiErrorResponse::bad_request(format!(
+            "template '{id}' instantiated to an invalid workflow: {detail}"
+        ))
+        .into_json_tuple();
+    }
 
     let workflow_id = state.kernel.register_workflow(workflow).await;
     (

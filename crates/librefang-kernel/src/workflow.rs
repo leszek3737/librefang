@@ -331,6 +331,22 @@ impl<'de> Deserialize<'de> for StepAgent {
 }
 
 /// Execution mode for a workflow step.
+///
+/// Variants split into two families:
+///
+/// * **Agent-dispatching** — `Sequential`, `FanOut`, `Collect`, `Conditional`,
+///   `Loop` — route their step body to a registered agent via the
+///   workflow's `agent_resolver`. These are the legacy modes and always
+///   consume the step's `agent` field.
+/// * **Operator nodes** (#4980) — `Wait`, `Gate`, `Approval`, `Transform`,
+///   `Branch` — never call an agent. The step's `agent` field is ignored
+///   for these variants (today it's still required syntactically; a
+///   follow-up may relax that at the HTTP layer). Only `Wait` is fully
+///   wired in the current PR — the others log a structured `warn!` and
+///   return success so the wire format is usable from day one while the
+///   open design questions on their bodies (Gate.condition syntax,
+///   Approval operator-identity, Transform.code shape) are still being
+///   sorted out. See #4980.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepMode {
@@ -345,6 +361,432 @@ pub enum StepMode {
     Conditional { condition: String },
     /// Loop — repeat this step until output contains `until` or `max_iterations` reached.
     Loop { max_iterations: u32, until: String },
+    /// Operator node: pause execution for `duration_secs` seconds, then
+    /// continue. Burns zero LLM tokens. Cancellation- and shutdown-aware
+    /// via `tokio::time::sleep` interleaved with the run's
+    /// `cancel_notify`. The previous step's output flows through
+    /// unchanged so downstream `{{input}}` substitutions still work.
+    Wait { duration_secs: u64 },
+    /// Operator node: short-circuit-style condition over the previous
+    /// step's output. The condition is a declarative comparator AST
+    /// (`field`, `op`, `value`) — deliberately not a string DSL, so the
+    /// wire format is the same shape that the dashboard editor and any
+    /// future linter would consume. The executor evaluates the
+    /// comparator against the previous step's output; if the condition
+    /// passes, execution continues to the next step. If it fails, the
+    /// run halts (`WorkflowRunState::Failed`) with a human-readable
+    /// reason naming the gate, the field, and the operator. See
+    /// [`GateCondition`] for the shape and [`GateOp`] for the operator
+    /// vocabulary.
+    ///
+    /// Design decision (deferred from step 1, locked in step 2 of
+    /// #4980): we picked a typed comparator over a string-DSL evaluator
+    /// because a string DSL forces a one-shot wire-format commitment —
+    /// callers would persist arbitrary expression strings that a later
+    /// richer DSL would have to either reparse or break. The comparator
+    /// shape is additive: future operators (regex, range, in-set) land
+    /// as new [`GateOp`] variants without touching anything else.
+    Gate { condition: GateCondition },
+    /// Operator node: human-in-the-loop pause. `recipients` is a
+    /// free-form `Vec<String>` like `["telegram:@pakman",
+    /// "email:foo@bar"]` for V1; the operator-identity model question
+    /// (per-channel UUIDs vs free-form strings vs Approval `Recipient`
+    /// type from #4977) is deferred to a follow-up. `timeout_secs` is
+    /// the wall-clock budget before a configurable timeout action
+    /// fires (also deferred — the current shape carries only the
+    /// timeout value, not the action). Executor is no-op-with-warn in
+    /// this PR (#4980).
+    Approval {
+        recipients: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
+    },
+    /// Operator node: data transform / template expansion against the
+    /// previous step's output. `code` is a Tera template string. The
+    /// renderer exposes the previous step's output under two names:
+    /// `prev` is always the raw string; when the output parses as JSON
+    /// it is *also* exposed under `prev_json` so templates can index
+    /// into objects / arrays directly (`{{ prev_json.score }}`).
+    /// Workflow variables bound by earlier `output_var` steps are
+    /// exposed under `vars.<name>`.
+    ///
+    /// Design decision (deferred from step 1, locked in step 3 of
+    /// #4980): Tera was picked over a hand-rolled DSL, `mlua`, and
+    /// `rhai`. The discriminator: Tera is sandboxed by default (no
+    /// I/O, no shell escape, bounded recursion), MIT-licensed,
+    /// well-maintained, and adds a tree-of-five small crates. `mlua`
+    /// drags `liblua` in via FFI and would have to be sandboxed
+    /// manually; `rhai` is heavier and would force callers to learn a
+    /// bespoke scripting language for what is structurally a template
+    /// expansion. A future operator that wants real scripting can land
+    /// as a separate `Script` variant — it is not in scope here. Shell
+    /// exec is explicitly NOT considered.
+    Transform { code: String },
+    /// Operator node: conditional routing on the previous step's
+    /// output. Each `arm.match_value` is exact-matched against the
+    /// previous step's output (parsed as JSON when possible, raw
+    /// string otherwise); the first matching arm's `then` field is
+    /// the name of a *later* step to jump to. The dispatcher seeks
+    /// forward to that step and resumes sequential execution from
+    /// there. If no arm matches, the run halts with
+    /// `WorkflowRunState::Failed` and a reason naming the unmatched
+    /// output. If the named target step is missing or at-or-before
+    /// the current index, the run halts with a typed reason.
+    ///
+    /// Design decision (deferred from step 1, locked in step 4 of
+    /// #4980): exact equality on V1, matching the proposal in step
+    /// 1's PR body. Range / regex / in-set matchers can land as
+    /// additive `BranchArm` fields later (`match_range`, `match_regex`
+    /// with exactly-one-of validation) so the V1 shape does not paint
+    /// future evolution into a corner. Forward jumps only — backward
+    /// jumps would let an unbounded loop hide inside a Branch when
+    /// steps already have `Loop` semantics for that.
+    Branch { arms: Vec<BranchArm> },
+}
+
+/// Whether `mode` is one of the #4980 operator-node variants
+/// (`Wait` / `Gate` / `Approval` / `Transform` / `Branch`). Used by
+/// [`Workflow::validate`] to fail-closed on operator-node + DAG
+/// combinations, since the DAG executor (`execute_run_dag`) does not
+/// match on `StepMode` and would otherwise route operator nodes
+/// through `agent_resolver`.
+fn is_operator_step_mode(mode: &StepMode) -> bool {
+    matches!(
+        mode,
+        StepMode::Wait { .. }
+            | StepMode::Gate { .. }
+            | StepMode::Approval { .. }
+            | StepMode::Transform { .. }
+            | StepMode::Branch { .. }
+    )
+}
+
+/// Short label used in [`Workflow::validate`] error messages. Returns
+/// the snake-case wire tag for operator-node variants and `"agent"`
+/// for the dispatch variants (which never appear in operator-node
+/// rejection messages today but keep the helper total).
+fn operator_step_mode_label(mode: &StepMode) -> &'static str {
+    match mode {
+        StepMode::Wait { .. } => "wait",
+        StepMode::Gate { .. } => "gate",
+        StepMode::Approval { .. } => "approval",
+        StepMode::Transform { .. } => "transform",
+        StepMode::Branch { .. } => "branch",
+        StepMode::Sequential => "sequential",
+        StepMode::FanOut => "fan_out",
+        StepMode::Collect => "collect",
+        StepMode::Conditional { .. } => "conditional",
+        StepMode::Loop { .. } => "loop",
+    }
+}
+
+/// One arm of a [`StepMode::Branch`]. The shape is declarative on
+/// purpose: a `serde_json::Value` match value is analysable by the
+/// dashboard, by `dry_run`, and by future workflow linters; an opaque
+/// `String` expression would not be. The matching semantics (exact
+/// equality? regex? jsonpath?) are deliberately not pinned in this PR;
+/// the variant exists so downstream tooling can persist branch trees
+/// across the deferred-design follow-up without a schema migration.
+/// See #4980.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchArm {
+    /// Value to match the previous step's output against. Free-form
+    /// JSON so structural matches (`{"status":"ok"}`) and primitive
+    /// matches (`"approved"`, `0.8`, `true`) both round-trip without
+    /// stringification at the API boundary.
+    pub match_value: serde_json::Value,
+    /// Name of the step to jump to when this arm matches.
+    pub then: String,
+}
+
+/// Comparator AST consumed by [`StepMode::Gate`]. Picked over a string
+/// DSL because the typed shape is analysable end-to-end (dashboard
+/// editor, dry-run preview, future workflow linter) without inventing a
+/// parser. Each field is required on the wire — there is no default —
+/// so a manifest that omits any of them fails deserialization at load
+/// time rather than silently defaulting to a passing gate. See #4980.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateCondition {
+    /// JSON Pointer (RFC 6901) into the previous step's output. `None`
+    /// (or the root pointer `""`) compares against the whole output. A
+    /// missing pointer target causes the gate to fail with a reason
+    /// naming the missing field — never silently pass.
+    ///
+    /// If the previous step's output is not parseable as JSON the
+    /// pointer is ignored and the comparison happens against the raw
+    /// string (only `Eq`, `Ne`, `Contains` are meaningful on raw
+    /// strings; ordering ops on strings use lexicographic order).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// Comparison operator.
+    pub op: GateOp,
+    /// Right-hand-side value. JSON-typed so numbers, booleans, strings,
+    /// objects, and arrays all round-trip from TOML/JSON without a
+    /// stringification round-trip at the API boundary.
+    pub value: serde_json::Value,
+}
+
+/// Operators understood by [`GateCondition`]. Deliberately small: the
+/// step-2 surface area is the boring eq/ne/ord/contains set, which is
+/// enough for the issue's "score > 0.8" / "status == approved" /
+/// "tags contains beta" cases and trivially extensible later
+/// (`Regex`, `In`, `NotIn`, `Between`, …). Snake-case on the wire so
+/// the TOML shape matches the issue body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateOp {
+    /// Strict equality on JSON values. Mixed-type (e.g. `"0.8"` vs
+    /// `0.8`) does NOT coerce — explicit by design so an editor mistake
+    /// surfaces as a failed gate, not a silent type coercion.
+    Eq,
+    /// Strict inequality.
+    Ne,
+    /// Numeric `>`. Both sides must coerce to f64; otherwise the gate
+    /// fails with a typed reason. For non-JSON output, lexicographic
+    /// string comparison applies.
+    Gt,
+    /// Numeric `<` (or lexicographic for strings).
+    Lt,
+    /// Numeric `>=` (or lexicographic for strings).
+    Gte,
+    /// Numeric `<=` (or lexicographic for strings).
+    Lte,
+    /// Substring check: `value` (as string) is a substring of the
+    /// resolved field (rendered as a string). Case-sensitive — the
+    /// existing `evaluate_condition` already case-folds for
+    /// `StepMode::Conditional`; we keep the contracts distinct so an
+    /// operator who explicitly picks `Gate` gets predictable behaviour.
+    Contains,
+}
+
+impl std::fmt::Display for GateOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            GateOp::Eq => "eq",
+            GateOp::Ne => "ne",
+            GateOp::Gt => "gt",
+            GateOp::Lt => "lt",
+            GateOp::Gte => "gte",
+            GateOp::Lte => "lte",
+            GateOp::Contains => "contains",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Render a [`StepMode::Transform`] template against the previous
+/// step's output and the workflow's bound variables.
+///
+/// The Tera context is:
+///
+/// * `prev` — the previous step's raw output (always a string).
+/// * `prev_json` — the parsed JSON value, when `prev` parses as JSON.
+///   Missing from the context when the parse fails, so a template
+///   that references `prev_json` against a non-JSON predecessor surfaces
+///   a clear Tera "variable not found" error rather than silently
+///   rendering an empty string.
+/// * `vars` — a `BTreeMap<String, String>` of `output_var`-bound
+///   workflow variables. `BTreeMap` for deterministic iteration order
+///   in templates that iterate the map (`{% for k, v in vars %}`),
+///   matching the determinism contract from #3298.
+///
+/// Returns `Ok(rendered)` on success and `Err(reason)` when Tera
+/// either fails to parse the template (syntax error) or fails to
+/// render (missing variable, type mismatch). The reason string is
+/// surfaced verbatim in the workflow's `error` field; Tera's own
+/// errors carry line / column information, so the operator can pin
+/// the bad placeholder without re-running the workflow.
+///
+/// Templates are parsed via `Tera::one_off` rather than registered into
+/// a long-lived `Tera` instance. The Transform executor is rare
+/// (operator-node, not hot-path) and `one_off` keeps the runner
+/// stateless — no per-engine template registry to keep coherent
+/// across hot reloads, no shared mutable state to lock around.
+///
+/// Hard upper bound on Wait `duration_secs` so a manifest typo
+/// (`duration_secs: 99999999999`) cannot park a run for ~30 years until
+/// `Instant::now() + dur` saturates inside `tokio::time::sleep`. Seven
+/// days matches the longest reasonable wait the dashboard surfaces and
+/// is well under the `Duration` saturation threshold on every platform.
+pub const MAX_WAIT_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Hard cap on Transform-rendered output size. Without this a Tera
+/// template like `{% for i in range(end=10000000) %}x{% endfor %}` can
+/// expand to tens of MiB and pollute `current_input` (consumed by every
+/// downstream `{{input}}` agent step) and the persisted
+/// `step_result.output`. 1 MiB matches the workflow file size cap
+/// (`MAX_WORKFLOW_FILE_SIZE`) so the in-memory and on-disk budgets stay
+/// consistent.
+pub const MAX_TRANSFORM_OUTPUT_BYTES: usize = 1024 * 1024;
+
+pub fn render_transform_template(
+    template: &str,
+    prev: &str,
+    vars: &std::collections::BTreeMap<String, String>,
+) -> Result<String, String> {
+    let mut ctx = tera::Context::new();
+    ctx.insert("prev", prev);
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(prev) {
+        ctx.insert("prev_json", &parsed);
+    }
+    ctx.insert("vars", vars);
+
+    // `one_off(autoescape=false)` — Tera's HTML autoescape is off
+    // because Transform output flows back into the workflow's
+    // `current_input` (downstream consumers may be CSV, Markdown, or
+    // raw text). HTML escaping of those payloads is foot-gun, not
+    // safety; if a future workflow surface needs HTML escaping it
+    // should opt in at the consumer boundary.
+    tera::Tera::one_off(template, &ctx, false).map_err(|e| format!("transform render failed: {e}"))
+}
+
+/// Validate that a Tera template parses cleanly, without rendering it.
+///
+/// Surface used by `Workflow::validate` to fail at manifest-load time
+/// when a template contains a syntax error (`{% if %}` without
+/// `{% endif %}`, an unterminated `{{ expression`, etc.). Distinct
+/// from `render_transform_template` because parse-time errors should be
+/// caught before any run starts — operators do not want to discover a
+/// typo on production input.
+pub fn validate_transform_template(template: &str) -> Result<(), String> {
+    let mut t = tera::Tera::default();
+    t.add_raw_template("__transform_validate__", template)
+        .map_err(|e| format!("transform template parse failed: {e}"))?;
+    Ok(())
+}
+
+/// Evaluate a [`GateCondition`] against the previous step's output.
+///
+/// Returns `Ok(())` when the gate passes, `Err(reason)` when it fails
+/// (caller halts the workflow with the reason). The reason string is
+/// deliberately verbose: it surfaces in `workflow_runs.json` and in the
+/// dashboard run history, where the operator wants enough information
+/// to fix the manifest or the producing step without re-running the
+/// workflow.
+///
+/// Resolution order:
+///
+/// 1. If `cond.field` is `Some(ptr)`, try to parse `output` as JSON and
+///    look up `ptr` via [`serde_json::Value::pointer`]. A missing
+///    pointer or a non-JSON output fails the gate with a typed reason
+///    — silently defaulting to "no field, pass" would defeat the gate.
+/// 2. If `cond.field` is `None`, the comparison runs against the whole
+///    output. If `output` parses as JSON, the comparison is JSON-typed
+///    (`Eq`/`Ne` use JSON deep equality); otherwise it falls back to
+///    string comparison.
+pub fn evaluate_gate_condition(cond: &GateCondition, output: &str) -> Result<(), String> {
+    let parsed_root: Option<serde_json::Value> = serde_json::from_str(output).ok();
+
+    // Fail-closed on JSON null at the root. A predecessor that returned
+    // bare `null` cannot meaningfully satisfy a positive gate condition,
+    // and treating `Null == Null` as a pass would silently let through
+    // degenerate outputs (e.g. a step that returned `null` instead of its
+    // documented result shape). Doc-level contract: "missing pointer or
+    // non-JSON output fails the gate" — we extend the same fail-closed
+    // policy to root-level JSON null, which is neither missing nor
+    // structurally a value the gate can compare against.
+    if matches!(parsed_root, Some(serde_json::Value::Null)) {
+        return Err("previous step output is JSON null — gate fails closed".to_string());
+    }
+
+    // Resolve the left-hand side. `lhs_json` is `Some` when the resolved
+    // value parses as JSON (which lets us do JSON-typed equality and
+    // numeric ordering); `lhs_str` is always present as a fallback for
+    // contains / string ordering on non-JSON inputs.
+    let (lhs_json, lhs_str): (Option<serde_json::Value>, String) = match &cond.field {
+        Some(ptr) if !ptr.is_empty() => match parsed_root.as_ref() {
+            Some(root) => match root.pointer(ptr) {
+                Some(v) if v.is_null() => {
+                    // Same fail-closed policy as the root-null branch:
+                    // a pointer that resolves to JSON null is
+                    // semantically empty for the purposes of gate
+                    // evaluation. Distinguishing `missing` from
+                    // `present-but-null` here would invite drift from
+                    // the root-level behaviour.
+                    return Err(format!(
+                        "field '{ptr}' resolves to JSON null — gate fails closed"
+                    ));
+                }
+                Some(v) => {
+                    let s = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    (Some(v.clone()), s)
+                }
+                None => {
+                    return Err(format!("field '{ptr}' not found in previous step output"));
+                }
+            },
+            None => {
+                return Err(format!(
+                    "previous step output is not JSON; cannot resolve field '{ptr}'"
+                ));
+            }
+        },
+        _ => {
+            let s = output.to_string();
+            (parsed_root.clone(), s)
+        }
+    };
+
+    let rhs_str = match &cond.value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+
+    let passes = match cond.op {
+        GateOp::Eq => match &lhs_json {
+            Some(l) => l == &cond.value,
+            None => lhs_str == rhs_str,
+        },
+        GateOp::Ne => match &lhs_json {
+            Some(l) => l != &cond.value,
+            None => lhs_str != rhs_str,
+        },
+        GateOp::Contains => {
+            // Always string-domain: "does the rendered LHS contain the
+            // rendered RHS as a substring". The JSON path is not
+            // meaningful for `contains` since arrays/objects don't have
+            // a universally agreed-on "contains" semantics.
+            lhs_str.contains(&rhs_str)
+        }
+        GateOp::Gt | GateOp::Lt | GateOp::Gte | GateOp::Lte => {
+            // Numeric path when both sides parse as f64; otherwise
+            // lexicographic string compare.
+            let lhs_num = lhs_json
+                .as_ref()
+                .and_then(|v| v.as_f64())
+                .or_else(|| lhs_str.parse::<f64>().ok());
+            let rhs_num = cond.value.as_f64().or_else(|| rhs_str.parse::<f64>().ok());
+            match (lhs_num, rhs_num) {
+                (Some(l), Some(r)) => match cond.op {
+                    GateOp::Gt => l > r,
+                    GateOp::Lt => l < r,
+                    GateOp::Gte => l >= r,
+                    GateOp::Lte => l <= r,
+                    _ => unreachable!(),
+                },
+                _ => match cond.op {
+                    GateOp::Gt => lhs_str.as_str() > rhs_str.as_str(),
+                    GateOp::Lt => lhs_str.as_str() < rhs_str.as_str(),
+                    GateOp::Gte => lhs_str.as_str() >= rhs_str.as_str(),
+                    GateOp::Lte => lhs_str.as_str() <= rhs_str.as_str(),
+                    _ => unreachable!(),
+                },
+            }
+        }
+    };
+
+    if passes {
+        Ok(())
+    } else {
+        let field_repr = cond.field.as_deref().unwrap_or("<root>");
+        Err(format!(
+            "gate condition failed: field '{field_repr}' {} {}",
+            cond.op, rhs_str
+        ))
+    }
 }
 
 /// Error handling mode for a workflow step.
@@ -1585,6 +2027,95 @@ impl WorkflowEngine {
         }
     }
 
+    /// Record a synthetic [`StepResult`] for an operator-node step whose
+    /// executor is intentionally a no-op. After steps 2–4 of #4980 only
+    /// `Approval` still routes through here; `Gate`, `Transform`, and
+    /// `Branch` build their own `StepResult` inline with operator-specific
+    /// trace data in the `prompt` field. Preserves `current_input` by
+    /// echoing it as the step's `output`, so downstream
+    /// `{{input}}` / `output_var` substitutions keep working as if the
+    /// operator step were absent.
+    ///
+    /// Pulled out as a static helper rather than a closure so the
+    /// Approval callsite stays one line; will remain the no-op surface for
+    /// any future operator-node variant whose body lands in a follow-up.
+    fn record_operator_noop_step_result(
+        runs: &Arc<DashMap<WorkflowRunId, WorkflowRun>>,
+        run_id: WorkflowRunId,
+        step: &WorkflowStep,
+        agent_name: &str,
+        current_input: &str,
+        variables: &mut HashMap<String, String>,
+        all_outputs: &mut Vec<String>,
+    ) {
+        let output = current_input.to_string();
+        let step_result = StepResult {
+            step_name: step.name.clone(),
+            agent_id: String::new(),
+            agent_name: agent_name.to_string(),
+            prompt: String::new(),
+            output: output.clone(),
+            input_tokens: 0,
+            output_tokens: 0,
+            duration_ms: 0,
+        };
+        if let Some(mut r) = runs.get_mut(&run_id) {
+            r.step_results.push(step_result);
+        }
+        if let Some(ref var) = step.output_var {
+            variables.insert(var.clone(), output.clone());
+        }
+        all_outputs.push(output);
+    }
+
+    /// Max prefix of an operator-node's decision input that gets folded
+    /// into the synthetic `StepResult.prompt` JSON trace. Keeps a
+    /// multi-MB predecessor output from inflating the persisted step
+    /// trace (matches the existing 200-char cap on the Branch no-match
+    /// error path).
+    const OPERATOR_INPUT_TRACE_CAP: usize = 200;
+
+    /// Truncate `input` to at most [`Self::OPERATOR_INPUT_TRACE_CAP`]
+    /// characters, appending an ellipsis when truncation actually
+    /// happened. Char-boundary aware so a multibyte glyph cannot get
+    /// split across the cap.
+    fn truncate_operator_input_trace(input: &str) -> String {
+        let cap = Self::OPERATOR_INPUT_TRACE_CAP;
+        if input.len() <= cap {
+            return input.to_string();
+        }
+        // Walk forward to the largest char boundary <= cap so a UTF-8
+        // codepoint never gets sliced.
+        let mut end = cap;
+        while end > 0 && !input.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut out = input[..end].to_string();
+        out.push('…');
+        out
+    }
+
+    /// Build the synthetic `StepResult.prompt` trace value for an
+    /// operator-node step. The shape is always a JSON object keyed by
+    /// `op` so a future dashboard renderer can dispatch on the operator
+    /// kind without a per-variant string parser. `extra` carries the
+    /// operator-specific fields (Wait → `duration_secs`, Gate →
+    /// `condition` + `input`, Transform → `code`, Branch → `arms`,
+    /// `target`, `arm_idx`, `input`). Pre-#4980-step-5 the four arms
+    /// each stored a different shape (raw string, format!-string, JSON,
+    /// JSON-of-comparator); pinning the JSON-object shape now keeps the
+    /// dashboard renderer from having to learn the legacy formats.
+    fn operator_prompt_trace(op: &str, extra: serde_json::Value) -> String {
+        let mut obj = serde_json::Map::new();
+        obj.insert("op".to_string(), serde_json::Value::String(op.to_string()));
+        if let serde_json::Value::Object(extra_obj) = extra {
+            for (k, v) in extra_obj {
+                obj.insert(k, v);
+            }
+        }
+        serde_json::Value::Object(obj).to_string()
+    }
+
     /// Replace `{{var_name}}` references in a template with stored variable values.
     fn expand_variables(template: &str, input: &str, vars: &HashMap<String, String>) -> String {
         let mut result = template.replace("{{input}}", input);
@@ -2809,6 +3340,554 @@ impl WorkflowEngine {
                     }
                     all_outputs.push(current_input.clone());
                 }
+
+                // -- Operator nodes (#4980) ----------------------------------
+                //
+                // Operator-node arms never call `agent_resolver`. They
+                // record a `StepResult` with an empty `agent_id` / a
+                // synthetic `agent_name` so the run history surfaces the
+                // step uniformly, leave `current_input` untouched (so
+                // downstream `{{input}}` substitutions still see the
+                // previous step's output), and emit a structured log so
+                // operators can see what happened in the daemon log
+                // without diffing run records.
+                //
+                // `Wait` is the only one with real semantics in this PR;
+                // the other four log a `warn!` and return success so the
+                // wire format is usable from day one while the deferred
+                // design questions (Gate.condition syntax,
+                // Approval operator-identity, Transform.code shape,
+                // Branch jump semantics) are still open. See #4980.
+                StepMode::Wait { duration_secs } => {
+                    let start = std::time::Instant::now();
+                    // Reject the step before we sleep when the manifest
+                    // requested longer than the documented cap. The
+                    // validator already rejects this on workflow
+                    // registration, but defensive double-checking here
+                    // covers persisted-pre-cap workflows reloaded after
+                    // an upgrade.
+                    if *duration_secs > MAX_WAIT_SECS {
+                        let err = format!(
+                            "Wait step '{}' duration_secs={duration_secs} exceeds cap {MAX_WAIT_SECS}",
+                            step.name
+                        );
+                        warn!(error = %err, "Wait step rejected by cap");
+                        if let Some(mut r) = self.runs.get_mut(&run_id) {
+                            if !matches!(r.state, WorkflowRunState::Cancelled) {
+                                r.state = WorkflowRunState::Failed;
+                                r.error = Some(err.clone());
+                                r.completed_at = Some(Utc::now());
+                            }
+                        }
+                        return Err(err);
+                    }
+                    let dur = std::time::Duration::from_secs(*duration_secs);
+                    let notify = self.cancel_notify.get(&run_id).map(|n| Arc::clone(&*n));
+
+                    // Race the sleep against a cancellation signal so a
+                    // long Wait honours `cancel_run` at sub-step
+                    // granularity. Without this, a `Wait { 86400 }`
+                    // would ignore cancellation for a full day before
+                    // the step boundary observed the Cancelled state.
+                    let cancelled = if let Some(n) = notify {
+                        tokio::select! {
+                            _ = tokio::time::sleep(dur) => false,
+                            _ = n.notified() => true,
+                        }
+                    } else {
+                        tokio::time::sleep(dur).await;
+                        false
+                    };
+
+                    if cancelled {
+                        info!(
+                            run_id = %run_id,
+                            step = i + 1,
+                            name = %step.name,
+                            "Wait step cancelled mid-sleep"
+                        );
+                        return Err("workflow run cancelled".into());
+                    }
+
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let output = current_input.clone();
+                    let step_result = StepResult {
+                        step_name: step.name.clone(),
+                        agent_id: String::new(),
+                        agent_name: "_operator:wait".to_string(),
+                        prompt: Self::operator_prompt_trace(
+                            "wait",
+                            serde_json::json!({ "duration_secs": duration_secs }),
+                        ),
+                        output: output.clone(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        duration_ms,
+                    };
+                    if let Some(mut r) = self.runs.get_mut(&run_id) {
+                        r.step_results.push(step_result);
+                    }
+                    if let Some(ref var) = step.output_var {
+                        variables.insert(var.clone(), output.clone());
+                    }
+                    all_outputs.push(output);
+                    info!(
+                        step = i + 1,
+                        name = %step.name,
+                        duration_secs,
+                        duration_ms,
+                        "Wait step completed"
+                    );
+                }
+
+                StepMode::Gate { condition } => {
+                    let start = std::time::Instant::now();
+                    let eval = evaluate_gate_condition(condition, &current_input);
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let condition_json =
+                        serde_json::to_value(condition).unwrap_or(serde_json::Value::Null);
+                    let input_trace = Self::truncate_operator_input_trace(&current_input);
+                    match eval {
+                        Ok(()) => {
+                            let output = current_input.clone();
+                            let step_result = StepResult {
+                                step_name: step.name.clone(),
+                                agent_id: String::new(),
+                                agent_name: "_operator:gate".to_string(),
+                                // Unified operator-prompt-trace JSON
+                                // shape (#4980 follow-up nit #4): every
+                                // operator records `{op,...}` so a future
+                                // dashboard renderer dispatches on `op`
+                                // alone. Carries the truncated decision
+                                // input so a debugger can see *what* the
+                                // comparator saw (nit #5).
+                                prompt: Self::operator_prompt_trace(
+                                    "gate",
+                                    serde_json::json!({
+                                        "condition": condition_json,
+                                        "passed": true,
+                                        "input": input_trace,
+                                    }),
+                                ),
+                                output: output.clone(),
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                duration_ms,
+                            };
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
+                                r.step_results.push(step_result);
+                            }
+                            if let Some(ref var) = step.output_var {
+                                variables.insert(var.clone(), output.clone());
+                            }
+                            all_outputs.push(output);
+                            info!(
+                                step = i + 1,
+                                name = %step.name,
+                                field = ?condition.field,
+                                op = %condition.op,
+                                duration_ms,
+                                "Gate step passed"
+                            );
+                        }
+                        Err(reason) => {
+                            // A failed gate halts the run with a recorded
+                            // reason. We surface a synthetic StepResult so
+                            // the operator can see *which* step blocked the
+                            // workflow in the dashboard run history; the
+                            // run itself transitions to Failed via the
+                            // standard error path below.
+                            let step_result = StepResult {
+                                step_name: step.name.clone(),
+                                agent_id: String::new(),
+                                agent_name: "_operator:gate".to_string(),
+                                prompt: Self::operator_prompt_trace(
+                                    "gate",
+                                    serde_json::json!({
+                                        "condition": condition_json,
+                                        "passed": false,
+                                        "input": input_trace,
+                                    }),
+                                ),
+                                output: reason.clone(),
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                duration_ms,
+                            };
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
+                                r.step_results.push(step_result);
+                            }
+                            let err =
+                                format!("Gate step '{}' blocked workflow: {reason}", step.name);
+                            warn!(
+                                step = i + 1,
+                                name = %step.name,
+                                field = ?condition.field,
+                                op = %condition.op,
+                                reason = %reason,
+                                "Gate step blocked workflow"
+                            );
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
+                                if !matches!(r.state, WorkflowRunState::Cancelled) {
+                                    r.state = WorkflowRunState::Failed;
+                                    r.error = Some(err.clone());
+                                    r.completed_at = Some(Utc::now());
+                                }
+                            }
+                            return Err(err);
+                        }
+                    }
+                }
+
+                StepMode::Approval {
+                    recipients,
+                    timeout_secs,
+                } => {
+                    // Cross-issue dependency marker, not a vanilla TODO:
+                    // the Approval executor needs the async-task-tracker
+                    // landing in #4983 to suspend the run on a channel
+                    // and resume it when a human replies. Until #4983
+                    // lands the stub stays a structured warn-and-noop so
+                    // a workflow that includes Approval still completes
+                    // visibly rather than failing closed.
+                    // TODO(#4983): wire real Approval executor once the
+                    // long-pending async-task tracker is available.
+                    warn!(
+                        step = i + 1,
+                        name = %step.name,
+                        recipients = ?recipients,
+                        timeout_secs = ?timeout_secs,
+                        "Approval executor not yet implemented — blocked on async-task-tracker landing in #4983 (refs #4980)"
+                    );
+                    Self::record_operator_noop_step_result(
+                        &self.runs,
+                        run_id,
+                        step,
+                        "_operator:approval",
+                        &current_input,
+                        &mut variables,
+                        &mut all_outputs,
+                    );
+                }
+
+                StepMode::Transform { code } => {
+                    let start = std::time::Instant::now();
+                    // Tera's context iterates its insertion order, so
+                    // copy `variables` into a `BTreeMap` for
+                    // determinism (#3298). The Tera renderer never
+                    // reaches an LLM prompt directly today, but the
+                    // rendered output flows into `current_input` and
+                    // is consumed by downstream agent steps via
+                    // `{{input}}` expansion — a non-deterministic iteration
+                    // order through `vars` would silently change
+                    // prompts across processes and invalidate the
+                    // provider prompt cache.
+                    let bt_vars: std::collections::BTreeMap<String, String> = variables
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    let result = render_transform_template(code, &current_input, &bt_vars);
+                    let duration_ms = start.elapsed().as_millis() as u64;
+
+                    match result {
+                        Ok(rendered) => {
+                            // Cap the rendered payload size: a template
+                            // like `{% for i in range(end=1e7) %}x{% endfor %}`
+                            // expands to tens of MiB, which pollutes
+                            // `current_input` (read by every downstream
+                            // `{{input}}` agent step) and the persisted
+                            // `step_result.output`. Halt with a typed
+                            // reason rather than silently propagating a
+                            // huge blob.
+                            if rendered.len() > MAX_TRANSFORM_OUTPUT_BYTES {
+                                let err = format!(
+                                    "Transform step '{}' rendered {} bytes (cap {MAX_TRANSFORM_OUTPUT_BYTES})",
+                                    step.name,
+                                    rendered.len()
+                                );
+                                warn!(
+                                    step = i + 1,
+                                    name = %step.name,
+                                    rendered_bytes = rendered.len(),
+                                    cap = MAX_TRANSFORM_OUTPUT_BYTES,
+                                    "Transform step exceeded output cap"
+                                );
+                                if let Some(mut r) = self.runs.get_mut(&run_id) {
+                                    if !matches!(r.state, WorkflowRunState::Cancelled) {
+                                        r.state = WorkflowRunState::Failed;
+                                        r.error = Some(err.clone());
+                                        r.completed_at = Some(Utc::now());
+                                    }
+                                }
+                                return Err(err);
+                            }
+                            let step_result = StepResult {
+                                step_name: step.name.clone(),
+                                agent_id: String::new(),
+                                agent_name: "_operator:transform".to_string(),
+                                prompt: Self::operator_prompt_trace(
+                                    "transform",
+                                    serde_json::json!({ "code": code }),
+                                ),
+                                output: rendered.clone(),
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                duration_ms,
+                            };
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
+                                r.step_results.push(step_result);
+                            }
+                            if let Some(ref var) = step.output_var {
+                                variables.insert(var.clone(), rendered.clone());
+                            }
+                            all_outputs.push(rendered.clone());
+                            current_input = rendered;
+                            info!(
+                                step = i + 1,
+                                name = %step.name,
+                                duration_ms,
+                                "Transform step rendered"
+                            );
+                        }
+                        Err(reason) => {
+                            let err = format!("Transform step '{}' failed: {reason}", step.name);
+                            warn!(
+                                step = i + 1,
+                                name = %step.name,
+                                reason = %reason,
+                                "Transform step failed"
+                            );
+                            // Record a synthetic StepResult so the
+                            // operator can see which transform step
+                            // blew up in the run history; the
+                            // `output` slot carries the Tera error
+                            // (line + column included by Tera).
+                            let step_result = StepResult {
+                                step_name: step.name.clone(),
+                                agent_id: String::new(),
+                                agent_name: "_operator:transform".to_string(),
+                                prompt: Self::operator_prompt_trace(
+                                    "transform",
+                                    serde_json::json!({ "code": code }),
+                                ),
+                                output: reason.clone(),
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                duration_ms,
+                            };
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
+                                r.step_results.push(step_result);
+                            }
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
+                                if !matches!(r.state, WorkflowRunState::Cancelled) {
+                                    r.state = WorkflowRunState::Failed;
+                                    r.error = Some(err.clone());
+                                    r.completed_at = Some(Utc::now());
+                                }
+                            }
+                            return Err(err);
+                        }
+                    }
+                }
+
+                StepMode::Branch { arms } => {
+                    let start = std::time::Instant::now();
+                    // Resolve the value to match against. Parse as JSON
+                    // when possible — that lets numeric and structural
+                    // match values (`0.8`, `{"status":"ok"}`) compare
+                    // by JSON deep-equality rather than string form. A
+                    // non-JSON predecessor compares its raw output
+                    // against the string form of each arm's
+                    // `match_value`.
+                    let parsed_input: Option<serde_json::Value> =
+                        serde_json::from_str(&current_input).ok();
+                    let matched_arm_idx = arms.iter().position(|arm| match &parsed_input {
+                        Some(parsed) => parsed == &arm.match_value,
+                        None => {
+                            let rhs = match &arm.match_value {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            current_input == rhs
+                        }
+                    });
+                    let duration_ms = start.elapsed().as_millis() as u64;
+
+                    match matched_arm_idx {
+                        Some(arm_idx) => {
+                            let arm = &arms[arm_idx];
+                            // Resolve the target step name to its
+                            // index. The dispatcher only honours
+                            // FORWARD jumps — a backward jump would
+                            // let an unbounded loop hide inside a
+                            // Branch when `Loop` already exists for
+                            // that semantic.
+                            //
+                            // Defensive uniqueness check: duplicate
+                            // step-name detection lives in
+                            // `build_dependency_graph`, which is only
+                            // reached via `topological_sort`. Sequential
+                            // workflows that have no `depends_on` edges
+                            // can skip that path entirely, so we refuse
+                            // an ambiguous target here rather than let
+                            // `iter().position` pick the silent first
+                            // match.
+                            let mut target_iter = workflow
+                                .steps
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, s)| s.name == arm.then);
+                            let first = target_iter.next();
+                            let second = target_iter.next();
+                            let target_idx = match (first, second) {
+                                (Some((idx, _)), None) => Some(idx),
+                                (None, _) => None,
+                                (Some(_), Some(_)) => {
+                                    let err = format!(
+                                        "Branch step '{}' target name '{}' is ambiguous: \
+                                         multiple steps share that name",
+                                        step.name, arm.then
+                                    );
+                                    warn!(
+                                        error = %err,
+                                        "Branch step blocked workflow on ambiguous target"
+                                    );
+                                    if let Some(mut r) = self.runs.get_mut(&run_id) {
+                                        if !matches!(r.state, WorkflowRunState::Cancelled) {
+                                            r.state = WorkflowRunState::Failed;
+                                            r.error = Some(err.clone());
+                                            r.completed_at = Some(Utc::now());
+                                        }
+                                    }
+                                    return Err(err);
+                                }
+                            };
+                            match target_idx {
+                                Some(t) if t > i => {
+                                    let output = current_input.clone();
+                                    // Carry the truncated decision input
+                                    // into the trace so an operator
+                                    // debugging a "wrong arm fired"
+                                    // report can see the value the
+                                    // comparator saw, not just the arm
+                                    // index (#4980 review nit #5).
+                                    let input_trace =
+                                        Self::truncate_operator_input_trace(&current_input);
+                                    let step_result = StepResult {
+                                        step_name: step.name.clone(),
+                                        agent_id: String::new(),
+                                        agent_name: "_operator:branch".to_string(),
+                                        prompt: Self::operator_prompt_trace(
+                                            "branch",
+                                            serde_json::json!({
+                                                "target": arm.then,
+                                                "arm_idx": arm_idx,
+                                                "arms": arms.len(),
+                                                "matched": true,
+                                                "input": input_trace,
+                                            }),
+                                        ),
+                                        output: output.clone(),
+                                        input_tokens: 0,
+                                        output_tokens: 0,
+                                        duration_ms,
+                                    };
+                                    if let Some(mut r) = self.runs.get_mut(&run_id) {
+                                        r.step_results.push(step_result);
+                                    }
+                                    if let Some(ref var) = step.output_var {
+                                        variables.insert(var.clone(), output.clone());
+                                    }
+                                    all_outputs.push(output);
+                                    info!(
+                                        step = i + 1,
+                                        name = %step.name,
+                                        target = %arm.then,
+                                        target_idx = t,
+                                        duration_ms,
+                                        "Branch jumped to target step"
+                                    );
+                                    i = t;
+                                    continue;
+                                }
+                                Some(t) => {
+                                    let err = format!(
+                                        "Branch step '{}' target '{}' (index {}) is at or before current step (index {}) — backward jumps not allowed",
+                                        step.name, arm.then, t, i
+                                    );
+                                    warn!(error = %err, "Branch step blocked workflow");
+                                    if let Some(mut r) = self.runs.get_mut(&run_id) {
+                                        if !matches!(r.state, WorkflowRunState::Cancelled) {
+                                            r.state = WorkflowRunState::Failed;
+                                            r.error = Some(err.clone());
+                                            r.completed_at = Some(Utc::now());
+                                        }
+                                    }
+                                    return Err(err);
+                                }
+                                None => {
+                                    let err = format!(
+                                        "Branch step '{}' target step '{}' not found in workflow",
+                                        step.name, arm.then
+                                    );
+                                    warn!(error = %err, "Branch step blocked workflow");
+                                    if let Some(mut r) = self.runs.get_mut(&run_id) {
+                                        if !matches!(r.state, WorkflowRunState::Cancelled) {
+                                            r.state = WorkflowRunState::Failed;
+                                            r.error = Some(err.clone());
+                                            r.completed_at = Some(Utc::now());
+                                        }
+                                    }
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        None => {
+                            // No arm matched. We could fall through
+                            // (treating Branch as a no-op when nothing
+                            // matches) but that hides operator
+                            // mistakes — they almost certainly meant
+                            // for *some* arm to match. Halt with a
+                            // typed reason; a future additive shape
+                            // (`default_then: Option<String>`) can
+                            // relax this when explicitly opted into.
+                            let input_trace = Self::truncate_operator_input_trace(&current_input);
+                            let reason = format!(
+                                "Branch step '{}' had no matching arm for output: {}",
+                                step.name, input_trace
+                            );
+                            warn!(reason = %reason, "Branch step blocked workflow");
+                            let step_result = StepResult {
+                                step_name: step.name.clone(),
+                                agent_id: String::new(),
+                                agent_name: "_operator:branch".to_string(),
+                                prompt: Self::operator_prompt_trace(
+                                    "branch",
+                                    serde_json::json!({
+                                        "arms": arms.len(),
+                                        "matched": false,
+                                        "input": input_trace,
+                                    }),
+                                ),
+                                output: reason.clone(),
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                duration_ms,
+                            };
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
+                                r.step_results.push(step_result);
+                            }
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
+                                if !matches!(r.state, WorkflowRunState::Cancelled) {
+                                    r.state = WorkflowRunState::Failed;
+                                    r.error = Some(reason.clone());
+                                    r.completed_at = Some(Utc::now());
+                                }
+                            }
+                            return Err(reason);
+                        }
+                    }
+                }
             }
 
             i += 1;
@@ -3208,6 +4287,142 @@ impl WorkflowEngine {
                     });
                     // In dry-run, don't advance current_input for skipped steps
                 }
+                // Operator-node variants never reach `agent_resolver` at
+                // run time (#4980), so the dashboard dry-run preview
+                // must report them as "agent_found = true" with a
+                // synthetic `_operator:<kind>` name and a
+                // mode-specific resolved_prompt — not fall through to
+                // the agent-shaped branch below, which would surface
+                // them as broken-agent steps even though they execute
+                // correctly.
+                StepMode::Wait { duration_secs: _ } => {
+                    // Pass-through operator: `current_input` flows
+                    // through unchanged at run time, so downstream
+                    // previews must see the same value (post-Transform
+                    // if a Transform preceded). Use the expanded
+                    // `prompt_template` so the dashboard's
+                    // `resolved_prompt` column reflects what `{{input}}`
+                    // resolves to here. Validate rejects non-default
+                    // `prompt_template` on Wait, so in production this
+                    // is `""` or `current_input`; the test path that
+                    // bypasses validate via `engine.register` exercises
+                    // the general case. The operator kind + duration is
+                    // already on the row via `agent_name` and on the
+                    // step's `mode` field, so no info is lost.
+                    preview.push(DryRunStep {
+                        step_name: step.name.clone(),
+                        agent_name: Some("_operator:wait".to_string()),
+                        agent_found: true,
+                        resolved_prompt: raw_prompt,
+                        skipped: false,
+                        skip_reason: None,
+                    });
+                }
+                StepMode::Gate { .. } => {
+                    // Pass-through on gate-open at run time; same
+                    // contract as Wait — surface the expanded
+                    // `prompt_template` so downstream-step `{{input}}`
+                    // previews remain meaningful through a preceding
+                    // Transform. Condition is on `step.mode` for any
+                    // caller that needs it.
+                    preview.push(DryRunStep {
+                        step_name: step.name.clone(),
+                        agent_name: Some("_operator:gate".to_string()),
+                        agent_found: true,
+                        resolved_prompt: raw_prompt,
+                        skipped: false,
+                        skip_reason: None,
+                    });
+                }
+                StepMode::Approval { .. } => {
+                    // Pass-through on approve at run time. Recipients
+                    // and timeout are on `step.mode`.
+                    preview.push(DryRunStep {
+                        step_name: step.name.clone(),
+                        agent_name: Some("_operator:approval".to_string()),
+                        agent_found: true,
+                        resolved_prompt: raw_prompt,
+                        skipped: false,
+                        skip_reason: None,
+                    });
+                }
+                StepMode::Transform { code } => {
+                    // Re-run the parse-time validator so an
+                    // unparseable template surfaces on the dry-run
+                    // preview as a `skipped` step with a typed reason,
+                    // matching the run-time failure shape. The same
+                    // check runs in `Workflow::validate` at register
+                    // time, but dry-run is also reachable for
+                    // workflows loaded from disk that bypassed the
+                    // HTTP gate, so we re-check here for safety.
+                    let (skipped, skip_reason) = match validate_transform_template(code) {
+                        Ok(()) => (false, None),
+                        Err(reason) => (true, Some(reason)),
+                    };
+                    preview.push(DryRunStep {
+                        step_name: step.name.clone(),
+                        agent_name: Some("_operator:transform".to_string()),
+                        agent_found: true,
+                        resolved_prompt: format!("transform: {code}"),
+                        skipped,
+                        skip_reason,
+                    });
+                    // Advance `current_input` with the rendered output
+                    // so downstream steps' `{{input}}` previews reflect
+                    // the post-Transform value the run-time executor
+                    // will see (the run-time arm sets
+                    // `current_input = rendered`). Wait / Gate /
+                    // Approval / Branch are pass-through at run time,
+                    // so they intentionally leave `current_input`
+                    // alone — only Transform diverges. If the template
+                    // is unparseable we already marked the step
+                    // `skipped`; leave `current_input` unchanged in
+                    // that case so downstream previews match the
+                    // run-time failure mode (the workflow would have
+                    // halted here). Deterministic `BTreeMap`
+                    // conversion mirrors the run-time arm (#3298):
+                    // Tera context iteration order must not depend on
+                    // HashMap hash seeding.
+                    if !skipped {
+                        let bt_vars: BTreeMap<String, String> = variables
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        if let Ok(rendered) =
+                            render_transform_template(code, &current_input, &bt_vars)
+                        {
+                            // Apply the run-time output cap so the
+                            // dry-run preview never propagates a
+                            // payload the executor would have
+                            // rejected mid-run. Without this an
+                            // unbounded `{% for %}` loop would
+                            // silently inflate `current_input` for
+                            // every downstream step's preview even
+                            // though the real run would have failed
+                            // on the first Transform.
+                            if rendered.len() <= MAX_TRANSFORM_OUTPUT_BYTES {
+                                if let Some(ref var) = step.output_var {
+                                    variables.insert(var.clone(), rendered.clone());
+                                }
+                                current_input = rendered;
+                            }
+                        }
+                    }
+                }
+                StepMode::Branch { .. } => {
+                    // Pass-through at run time (Branch jumps based on
+                    // current_input without rewriting it). Surface the
+                    // expanded `prompt_template`; arm list is on
+                    // `step.mode` for callers that need it.
+                    preview.push(DryRunStep {
+                        step_name: step.name.clone(),
+                        agent_name: Some("_operator:branch".to_string()),
+                        agent_found: true,
+                        resolved_prompt: raw_prompt,
+                        skipped: false,
+                        skip_reason: None,
+                    });
+                }
                 _ => {
                     let (agent_name, agent_found) = match agent_resolver(&step.agent) {
                         Some((_, name, _)) => (Some(name), true),
@@ -3558,6 +4773,164 @@ impl Workflow {
             created_at: Some(chrono::Utc::now().to_rfc3339()),
             i18n: Default::default(),
         }
+    }
+
+    /// Validate workflow definition before execution.
+    ///
+    /// Surfaces the misconfigurations that the executors would
+    /// otherwise discover at run time — manifest load is the right
+    /// place to fail because a workflow that serialises, persists, and
+    /// only blows up mid-run is much harder to debug than one that
+    /// refuses registration with a typed reason.
+    ///
+    /// Checks performed:
+    ///
+    /// * `Transform` — empty `code`, unparseable Tera template.
+    /// * `Wait` — zero `duration_secs` (parser's warn-and-default
+    ///   sentinel) and durations above [`MAX_WAIT_SECS`].
+    /// * `Gate` — the parser's fail-closed sentinel
+    ///   (`op=Eq, value=Null, field=None`).
+    /// * `Branch` — empty arms.
+    /// * **Operator-node + DAG combination** — any workflow that
+    ///   combines a `depends_on` edge with an operator-node `StepMode`
+    ///   (Wait / Gate / Approval / Transform / Branch) is rejected.
+    ///   The DAG executor calls `agent_resolver` unconditionally and
+    ///   does not match on `StepMode`, so an operator node in a DAG
+    ///   workflow attempts an agent dispatch and surfaces
+    ///   `format_missing_agent_error` at run time — not the operator's
+    ///   wait / gate / transform / branch behaviour. Catching this at
+    ///   register time keeps the silent run-time failure from
+    ///   reaching SQLite + pause/resume round-tripping. Wiring the
+    ///   operators *into* the DAG executor is a follow-up; the V1
+    ///   guard is the safer landing because Branch's forward-jump
+    ///   semantics interact non-trivially with DAG layer ordering.
+    /// * **Non-default `prompt_template` on operator nodes** — Wait /
+    ///   Gate / Approval / Branch ignore `prompt_template` entirely
+    ///   at run time, so a manifest author who writes a template on
+    ///   one of those variants sees their value silently discarded.
+    ///   Surface the typo at register time. `Transform` is exempt
+    ///   because Transform legitimately uses its `code` field, not
+    ///   `prompt_template`, and `Conditional` / `Loop` / `FanOut` /
+    ///   `Collect` / `Sequential` all dispatch to an agent and so
+    ///   legitimately use `prompt_template`.
+    ///
+    /// Other validations (DAG cycles, missing agent refs) live in
+    /// [`WorkflowEngine::topological_sort`] and the executor's
+    /// `agent_resolver` callback respectively; this method
+    /// intentionally covers only what cannot already be detected
+    /// elsewhere.
+    ///
+    /// Returns a vector of `(step_name, reason)` pairs — one per
+    /// failing step. Empty vec means the workflow is valid. Callers
+    /// that want a single error string can map / join.
+    pub fn validate(&self) -> Vec<(String, String)> {
+        let mut errs = Vec::new();
+        for step in &self.steps {
+            // Fail-closed: operator-node variants don't have DAG
+            // semantics today. `execute_run_dag` calls `agent_resolver`
+            // for every step in every layer, so an operator node in a
+            // DAG workflow silently attempts an agent dispatch and
+            // surfaces `format_missing_agent_error` at run time. Reject
+            // the combination at register time with a reason naming
+            // the step and the operator kind. See #4980 follow-up.
+            if !step.depends_on.is_empty() && is_operator_step_mode(&step.mode) {
+                errs.push((
+                    step.name.clone(),
+                    format!(
+                        "operator-node step (mode={}) combined with DAG \
+                         `depends_on` is not supported — operator nodes \
+                         currently only execute via the sequential path; \
+                         remove `depends_on` or change the step mode",
+                        operator_step_mode_label(&step.mode)
+                    ),
+                ));
+            }
+
+            // Reject a non-default `prompt_template` on operator-node
+            // variants that ignore the field at run time. The accepted
+            // "default" set is the empty string (manifest omission) and
+            // `{{input}}` (the HTTP layer's parse-time fallback in
+            // `routes/workflows.rs`); anything else means the manifest
+            // author wrote a template that will be silently discarded.
+            // Transform is exempt — it carries its own `code` field
+            // and `prompt_template` is unused for that variant but is
+            // not load-bearing for the manifest author either.
+            if matches!(
+                &step.mode,
+                StepMode::Wait { .. }
+                    | StepMode::Gate { .. }
+                    | StepMode::Approval { .. }
+                    | StepMode::Branch { .. }
+            ) && !step.prompt_template.is_empty()
+                && step.prompt_template != "{{input}}"
+            {
+                errs.push((
+                    step.name.clone(),
+                    format!(
+                        "operator-node step (mode={}) has a non-default \
+                         `prompt_template` but operator nodes ignore the \
+                         field — remove the template or change the step mode",
+                        operator_step_mode_label(&step.mode)
+                    ),
+                ));
+            }
+
+            match &step.mode {
+                StepMode::Transform { code } => {
+                    if code.is_empty() {
+                        errs.push((
+                            step.name.clone(),
+                            "transform.code is empty — likely missing from the manifest"
+                                .to_string(),
+                        ));
+                    } else if let Err(reason) = validate_transform_template(code) {
+                        errs.push((step.name.clone(), reason));
+                    }
+                }
+                StepMode::Wait { duration_secs } => {
+                    // `duration_secs = 0` is the parser's warn-and-default
+                    // for a missing field; a real zero-wait would also be
+                    // a no-op step, so rejecting both is the same fix.
+                    if *duration_secs == 0 {
+                        errs.push((
+                            step.name.clone(),
+                            "wait.duration_secs is 0 — likely missing from the manifest"
+                                .to_string(),
+                        ));
+                    } else if *duration_secs > MAX_WAIT_SECS {
+                        errs.push((
+                            step.name.clone(),
+                            format!(
+                                "wait.duration_secs={duration_secs} exceeds cap {MAX_WAIT_SECS}"
+                            ),
+                        ));
+                    }
+                }
+                // Catch the parser's fail-closed sentinel (Eq=null with no
+                // field) so the operator sees the misconfiguration at register
+                // time rather than a mysterious "gate fails closed" mid-run.
+                StepMode::Gate { condition }
+                    if condition.field.is_none()
+                        && matches!(condition.op, GateOp::Eq)
+                        && matches!(condition.value, serde_json::Value::Null) =>
+                {
+                    errs.push((
+                        step.name.clone(),
+                        "gate.condition matches the parser's fail-closed default \
+                         (op=eq, value=null, no field) — likely missing or malformed"
+                            .to_string(),
+                    ));
+                }
+                StepMode::Branch { arms } if arms.is_empty() => {
+                    errs.push((
+                        step.name.clone(),
+                        "branch.arms is empty — likely missing from the manifest".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        errs
     }
 }
 
@@ -4672,6 +6045,633 @@ mod tests {
         let json = serde_json::to_string(&mode).unwrap();
         let parsed: StepMode = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, StepMode::Loop { max_iterations: 5, until } if until == "done"));
+    }
+
+    // --- Operator-node serde round-trips (#4980) ------------------------------
+    //
+    // The five operator-node variants must serialise / deserialise cleanly
+    // through serde — workflow definitions persist to SQLite via
+    // `workflow_run_to_row` and load back through the same path, so a
+    // round-trip regression silently corrupts every paused workflow on disk.
+
+    #[tokio::test]
+    async fn test_step_mode_wait_serialization() {
+        let mode = StepMode::Wait { duration_secs: 42 };
+        let json = serde_json::to_string(&mode).unwrap();
+        assert!(json.contains("\"wait\""), "snake_case tag missing: {json}");
+        let parsed: StepMode = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, StepMode::Wait { duration_secs: 42 }));
+    }
+
+    #[tokio::test]
+    async fn test_step_mode_gate_serialization() {
+        let mode = StepMode::Gate {
+            condition: GateCondition {
+                field: Some("/score".to_string()),
+                op: GateOp::Gt,
+                value: serde_json::json!(0.8),
+            },
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        let parsed: StepMode = serde_json::from_str(&json).unwrap();
+        match parsed {
+            StepMode::Gate { condition } => {
+                assert_eq!(condition.field.as_deref(), Some("/score"));
+                assert_eq!(condition.op, GateOp::Gt);
+                assert_eq!(condition.value, serde_json::json!(0.8));
+            }
+            other => panic!("expected Gate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_step_mode_gate_malformed_fails_deserialization() {
+        // Missing `op` — the gate cannot default to "passing" silently,
+        // so a malformed comparator MUST surface as a deserialisation
+        // error at manifest load time rather than at run time.
+        let bad = r#"{"gate":{"condition":{"field":"/score","value":0.8}}}"#;
+        let err = serde_json::from_str::<StepMode>(bad).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("op") || msg.contains("missing"),
+            "expected serde to flag missing 'op'; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn evaluate_gate_condition_passes_when_field_satisfies_op() {
+        let cond = GateCondition {
+            field: Some("/score".to_string()),
+            op: GateOp::Gt,
+            value: serde_json::json!(0.8),
+        };
+        assert!(evaluate_gate_condition(&cond, r#"{"score": 0.95}"#).is_ok());
+    }
+
+    #[test]
+    fn evaluate_gate_condition_fails_when_field_does_not_satisfy_op() {
+        let cond = GateCondition {
+            field: Some("/score".to_string()),
+            op: GateOp::Gt,
+            value: serde_json::json!(0.8),
+        };
+        let err = evaluate_gate_condition(&cond, r#"{"score": 0.5}"#).unwrap_err();
+        assert!(err.contains("gate condition failed"), "{err}");
+    }
+
+    #[test]
+    fn evaluate_gate_condition_missing_field_fails_with_reason() {
+        let cond = GateCondition {
+            field: Some("/score".to_string()),
+            op: GateOp::Gt,
+            value: serde_json::json!(0.8),
+        };
+        let err = evaluate_gate_condition(&cond, r#"{"other": 1}"#).unwrap_err();
+        assert!(
+            err.contains("/score"),
+            "missing-field reason should name the field; got {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_gate_condition_string_eq_works_against_raw_output() {
+        let cond = GateCondition {
+            field: None,
+            op: GateOp::Eq,
+            value: serde_json::json!("approved"),
+        };
+        // `"approved"` (a JSON string) compares JSON-equal to the parsed
+        // root when the previous output is the literal JSON `"approved"`.
+        assert!(evaluate_gate_condition(&cond, r#""approved""#).is_ok());
+        // Raw (non-JSON) string output also matches via the string fallback.
+        assert!(evaluate_gate_condition(&cond, "approved").is_ok());
+        assert!(evaluate_gate_condition(&cond, "rejected").is_err());
+    }
+
+    #[test]
+    fn evaluate_gate_condition_contains_substring() {
+        let cond = GateCondition {
+            field: None,
+            op: GateOp::Contains,
+            value: serde_json::json!("urgent"),
+        };
+        assert!(evaluate_gate_condition(&cond, "this is urgent work").is_ok());
+        assert!(evaluate_gate_condition(&cond, "this is fine").is_err());
+    }
+
+    /// A predecessor that emitted bare `null` must fail the gate
+    /// closed, regardless of whether `cond.value` happens to also be
+    /// JSON null. Treating `Null == Null` as a pass is the regression
+    /// this test pins down.
+    #[test]
+    fn evaluate_gate_condition_root_null_fails_closed() {
+        let cond_eq_null = GateCondition {
+            field: None,
+            op: GateOp::Eq,
+            value: serde_json::Value::Null,
+        };
+        let err = evaluate_gate_condition(&cond_eq_null, "null").unwrap_err();
+        assert!(
+            err.contains("null") && err.contains("fails closed"),
+            "root-null reason should be explicit: {err}"
+        );
+
+        let cond_eq_value = GateCondition {
+            field: None,
+            op: GateOp::Eq,
+            value: serde_json::json!("ok"),
+        };
+        let err = evaluate_gate_condition(&cond_eq_value, "null").unwrap_err();
+        assert!(
+            err.contains("fails closed"),
+            "root-null reason should fire before op comparison: {err}"
+        );
+    }
+
+    /// Pointer that resolves to JSON null (field present, value
+    /// explicitly null) is treated the same as the root-null case —
+    /// fail-closed. This pins the distinction between "missing" and
+    /// "present-but-null" without letting present-but-null silently
+    /// pass.
+    #[test]
+    fn evaluate_gate_condition_pointer_to_null_fails_closed() {
+        let cond = GateCondition {
+            field: Some("/score".to_string()),
+            op: GateOp::Eq,
+            value: serde_json::Value::Null,
+        };
+        let err = evaluate_gate_condition(&cond, r#"{"score": null}"#).unwrap_err();
+        assert!(
+            err.contains("/score") && err.contains("fails closed"),
+            "pointer-null reason should name field and fail-closed status: {err}"
+        );
+    }
+
+    // --- Transform / Tera tests (#4980 step 3) -----------------------------
+
+    #[test]
+    fn render_transform_template_renders_prev_string() {
+        let vars = std::collections::BTreeMap::new();
+        let out = render_transform_template("hello {{ prev }}", "world", &vars).unwrap();
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn render_transform_template_indexes_into_prev_json() {
+        let vars = std::collections::BTreeMap::new();
+        let out =
+            render_transform_template("score={{ prev_json.score }}", r#"{"score":0.95}"#, &vars)
+                .unwrap();
+        assert_eq!(out, "score=0.95");
+    }
+
+    #[test]
+    fn render_transform_template_exposes_workflow_vars() {
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("title".to_string(), "Release Notes".to_string());
+        let out = render_transform_template("# {{ vars.title }}", "ignored", &vars).unwrap();
+        assert_eq!(out, "# Release Notes");
+    }
+
+    #[test]
+    fn render_transform_template_missing_variable_returns_error() {
+        // A template that references an undefined variable should
+        // surface as a render error rather than silently producing an
+        // empty placeholder. Tera's default strict mode does this for
+        // us.
+        let vars = std::collections::BTreeMap::new();
+        let err = render_transform_template("hello {{ missing }}", "prev", &vars).unwrap_err();
+        assert!(
+            err.contains("transform render failed"),
+            "expected render-error wrapper, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_transform_template_accepts_clean_template() {
+        assert!(validate_transform_template("hello {{ prev }}").is_ok());
+        assert!(validate_transform_template("{% if x %}y{% endif %}").is_ok());
+    }
+
+    #[test]
+    fn validate_transform_template_rejects_syntax_error() {
+        // Unterminated `{{ prev` — Tera must reject at parse time so
+        // the operator catches it at manifest load, not in production
+        // run history.
+        let err = validate_transform_template("hello {{ prev").unwrap_err();
+        assert!(
+            err.contains("transform template parse failed"),
+            "expected parse-error wrapper, got: {err}"
+        );
+    }
+
+    #[test]
+    fn workflow_validate_surfaces_transform_syntax_errors() {
+        let mut wf = test_workflow();
+        wf.steps.push(WorkflowStep {
+            name: "bad-transform".to_string(),
+            agent: StepAgent::ByName {
+                name: "_op".to_string(),
+            },
+            prompt_template: "{{input}}".to_string(),
+            mode: StepMode::Transform {
+                code: "hello {{ prev".to_string(),
+            },
+            timeout_secs: 30,
+            error_mode: ErrorMode::Fail,
+            output_var: None,
+            inherit_context: None,
+            depends_on: vec![],
+            session_mode: None,
+        });
+        let errs = wf.validate();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].0, "bad-transform");
+        assert!(errs[0].1.contains("transform template parse failed"));
+    }
+
+    /// Build a single-step workflow whose only step uses `mode`.
+    /// Used by the new operator-node `validate()` cases below.
+    fn workflow_with_single_op_step(name: &str, mode: StepMode) -> Workflow {
+        Workflow {
+            id: WorkflowId::new(),
+            name: name.to_string(),
+            description: "validate test".to_string(),
+            steps: vec![WorkflowStep {
+                name: "op".to_string(),
+                agent: StepAgent::ByName {
+                    name: "_op".to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode,
+                timeout_secs: 30,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+                inherit_context: None,
+                depends_on: vec![],
+                session_mode: None,
+            }],
+            created_at: Utc::now(),
+            layout: None,
+            total_timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn workflow_validate_rejects_empty_transform_code() {
+        let wf = workflow_with_single_op_step(
+            "empty-transform",
+            StepMode::Transform {
+                code: String::new(),
+            },
+        );
+        let errs = wf.validate();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].1.contains("transform.code is empty"), "{errs:?}");
+    }
+
+    #[test]
+    fn workflow_validate_rejects_zero_wait_duration() {
+        let wf = workflow_with_single_op_step("zero-wait", StepMode::Wait { duration_secs: 0 });
+        let errs = wf.validate();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].1.contains("wait.duration_secs is 0"), "{errs:?}");
+    }
+
+    #[test]
+    fn workflow_validate_rejects_wait_duration_above_cap() {
+        let wf = workflow_with_single_op_step(
+            "huge-wait",
+            StepMode::Wait {
+                duration_secs: MAX_WAIT_SECS + 1,
+            },
+        );
+        let errs = wf.validate();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].1.contains("exceeds cap"), "{errs:?}");
+    }
+
+    #[test]
+    fn workflow_validate_accepts_wait_duration_at_cap() {
+        let wf = workflow_with_single_op_step(
+            "max-wait",
+            StepMode::Wait {
+                duration_secs: MAX_WAIT_SECS,
+            },
+        );
+        assert!(wf.validate().is_empty(), "MAX_WAIT_SECS itself must pass");
+    }
+
+    #[test]
+    fn workflow_validate_rejects_gate_fail_closed_sentinel() {
+        // Exactly the shape `parse_step_mode` produces when the manifest
+        // is missing or malformed: op=Eq, value=Null, no field.
+        let wf = workflow_with_single_op_step(
+            "default-gate",
+            StepMode::Gate {
+                condition: GateCondition {
+                    field: None,
+                    op: GateOp::Eq,
+                    value: serde_json::Value::Null,
+                },
+            },
+        );
+        let errs = wf.validate();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].1.contains("fail-closed default"), "{errs:?}");
+    }
+
+    #[test]
+    fn workflow_validate_accepts_real_gate_against_null() {
+        // A gate that explicitly checks "/field == null" is a legitimate
+        // configuration — only the no-field sentinel should be rejected.
+        let wf = workflow_with_single_op_step(
+            "field-eq-null",
+            StepMode::Gate {
+                condition: GateCondition {
+                    field: Some("/status".to_string()),
+                    op: GateOp::Eq,
+                    value: serde_json::Value::Null,
+                },
+            },
+        );
+        assert!(wf.validate().is_empty(), "{:?}", wf.validate());
+    }
+
+    #[test]
+    fn workflow_validate_rejects_empty_branch_arms() {
+        let wf = workflow_with_single_op_step("empty-branch", StepMode::Branch { arms: vec![] });
+        let errs = wf.validate();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].1.contains("branch.arms is empty"), "{errs:?}");
+    }
+
+    /// Fail-closed at validate time when a DAG (`depends_on`) edge is
+    /// combined with an operator-node `StepMode`. The DAG executor
+    /// (`execute_run_dag`) calls `agent_resolver` unconditionally and
+    /// does not match on `StepMode` — without this guard an operator
+    /// node in a DAG workflow would silently attempt an agent
+    /// dispatch at run time and surface
+    /// `format_missing_agent_error`, not the operator's wait / gate /
+    /// transform / branch behaviour (#4980 review blocking #1).
+    #[test]
+    fn workflow_validate_rejects_operator_node_combined_with_dag_depends_on() {
+        // One canary step per operator-node variant. Each carries a
+        // `depends_on` edge so the DAG executor would be the run-time
+        // dispatcher; the validator must reject every one of them.
+        let cases: Vec<(&str, StepMode)> = vec![
+            ("wait-dag", StepMode::Wait { duration_secs: 5 }),
+            (
+                "gate-dag",
+                StepMode::Gate {
+                    condition: GateCondition {
+                        field: None,
+                        op: GateOp::Eq,
+                        value: serde_json::json!("ok"),
+                    },
+                },
+            ),
+            (
+                "approval-dag",
+                StepMode::Approval {
+                    recipients: vec!["telegram:@pakman".into()],
+                    timeout_secs: None,
+                },
+            ),
+            (
+                "transform-dag",
+                StepMode::Transform {
+                    code: "{{ prev }}".to_string(),
+                },
+            ),
+            (
+                "branch-dag",
+                StepMode::Branch {
+                    arms: vec![BranchArm {
+                        match_value: serde_json::json!("ok"),
+                        then: "downstream".to_string(),
+                    }],
+                },
+            ),
+        ];
+
+        for (name, mode) in cases {
+            let mut wf = workflow_with_single_op_step(name, mode);
+            // Add a producer step so `depends_on` can name something
+            // real; the operator node depends on it.
+            wf.steps.insert(
+                0,
+                WorkflowStep {
+                    name: "producer".to_string(),
+                    agent: StepAgent::ByName {
+                        name: "_producer".to_string(),
+                    },
+                    prompt_template: "{{input}}".to_string(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 30,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
+                    session_mode: None,
+                },
+            );
+            wf.steps[1].depends_on = vec!["producer".to_string()];
+            // Also append a `downstream` step so the Branch case's
+            // target name resolves (validate doesn't dereference it
+            // today but a future check might).
+            wf.steps.push(WorkflowStep {
+                name: "downstream".to_string(),
+                agent: StepAgent::ByName {
+                    name: "_downstream".to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 30,
+                error_mode: ErrorMode::Fail,
+                output_var: None,
+                inherit_context: None,
+                depends_on: vec![],
+                session_mode: None,
+            });
+
+            let errs = wf.validate();
+            assert!(
+                errs.iter().any(|(s, r)| s == "op" && r.contains("DAG")),
+                "case `{name}` must fail validate with a DAG-related reason; got: {errs:?}"
+            );
+        }
+    }
+
+    /// A non-default `prompt_template` on Wait / Gate / Approval /
+    /// Branch is a silent footgun — the executor never reads the field,
+    /// so a typoed manifest just discards the value. Reject at register
+    /// time so the operator sees the typo immediately (#4980 review nit
+    /// #6). Transform is exempt — `prompt_template` is unused for that
+    /// variant but `code` is what carries the template payload.
+    #[test]
+    fn workflow_validate_rejects_non_default_prompt_template_on_operator_nodes() {
+        let cases: Vec<(&str, StepMode)> = vec![
+            ("wait-with-prompt", StepMode::Wait { duration_secs: 5 }),
+            (
+                "gate-with-prompt",
+                StepMode::Gate {
+                    condition: GateCondition {
+                        field: None,
+                        op: GateOp::Eq,
+                        value: serde_json::json!("ok"),
+                    },
+                },
+            ),
+            (
+                "approval-with-prompt",
+                StepMode::Approval {
+                    recipients: vec!["telegram:@pakman".into()],
+                    timeout_secs: None,
+                },
+            ),
+            (
+                "branch-with-prompt",
+                StepMode::Branch {
+                    arms: vec![BranchArm {
+                        match_value: serde_json::json!("ok"),
+                        then: "x".to_string(),
+                    }],
+                },
+            ),
+        ];
+
+        for (name, mode) in cases {
+            let mut wf = workflow_with_single_op_step(name, mode);
+            wf.steps[0].prompt_template = "Analyze this: {{input}}".to_string();
+            let errs = wf.validate();
+            assert!(
+                errs.iter().any(|(_, r)| r.contains("prompt_template")),
+                "case `{name}` must fail with a prompt_template-related reason; got: {errs:?}"
+            );
+        }
+    }
+
+    /// The accepted "default" set for an operator-node step's
+    /// `prompt_template` is `""` (manifest omission) and `"{{input}}"`
+    /// (the HTTP layer's parse-time fallback). Both must pass
+    /// validate.
+    #[test]
+    fn workflow_validate_accepts_default_prompt_template_on_operator_nodes() {
+        let mode_factory = || StepMode::Wait { duration_secs: 5 };
+        for template in ["", "{{input}}"] {
+            let mut wf = workflow_with_single_op_step("op-default-template", mode_factory());
+            wf.steps[0].prompt_template = template.to_string();
+            let errs = wf.validate();
+            assert!(
+                errs.is_empty(),
+                "template `{template}` must pass; got: {errs:?}"
+            );
+        }
+    }
+
+    /// Transform legitimately uses its own `code` field rather than
+    /// `prompt_template`, so a non-default `prompt_template` on a
+    /// Transform step is not a typo and must NOT be rejected by the
+    /// validator.
+    #[test]
+    fn workflow_validate_accepts_non_default_prompt_template_on_transform() {
+        let mut wf = workflow_with_single_op_step(
+            "transform-with-prompt",
+            StepMode::Transform {
+                code: "hello {{ prev }}".to_string(),
+            },
+        );
+        wf.steps[0].prompt_template = "Analyze this: {{input}}".to_string();
+        let errs = wf.validate();
+        assert!(
+            errs.is_empty(),
+            "transform must accept any template: {errs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_step_mode_approval_serialization() {
+        let mode = StepMode::Approval {
+            recipients: vec!["telegram:@pakman".into(), "email:foo@bar".into()],
+            timeout_secs: Some(86400),
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        let parsed: StepMode = serde_json::from_str(&json).unwrap();
+        match parsed {
+            StepMode::Approval {
+                recipients,
+                timeout_secs,
+            } => {
+                assert_eq!(
+                    recipients,
+                    vec!["telegram:@pakman".to_string(), "email:foo@bar".to_string()]
+                );
+                assert_eq!(timeout_secs, Some(86400));
+            }
+            other => panic!("expected Approval, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_step_mode_approval_timeout_optional() {
+        // `timeout_secs` is `Option<u64>` with `skip_serializing_if = "Option::is_none"`
+        // — verify the absent form round-trips, since the issue's TOML example
+        // does not require the field.
+        let json = r#"{"approval":{"recipients":["telegram:@op"]}}"#;
+        let parsed: StepMode = serde_json::from_str(json).unwrap();
+        match parsed {
+            StepMode::Approval {
+                recipients,
+                timeout_secs,
+            } => {
+                assert_eq!(recipients, vec!["telegram:@op".to_string()]);
+                assert_eq!(timeout_secs, None);
+            }
+            other => panic!("expected Approval, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_step_mode_transform_serialization() {
+        let mode = StepMode::Transform {
+            code: "# {{title}}\n\n{{body}}".to_string(),
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        let parsed: StepMode = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, StepMode::Transform { code } if code.starts_with("# ")));
+    }
+
+    #[tokio::test]
+    async fn test_step_mode_branch_serialization() {
+        let mode = StepMode::Branch {
+            arms: vec![
+                BranchArm {
+                    match_value: serde_json::json!("approved"),
+                    then: "publish".to_string(),
+                },
+                BranchArm {
+                    match_value: serde_json::json!(0.8),
+                    then: "rewrite".to_string(),
+                },
+                BranchArm {
+                    match_value: serde_json::json!({"status": "ok"}),
+                    then: "ship".to_string(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        let parsed: StepMode = serde_json::from_str(&json).unwrap();
+        match parsed {
+            StepMode::Branch { arms } => {
+                assert_eq!(arms.len(), 3);
+                assert_eq!(arms[0].then, "publish");
+                assert_eq!(arms[0].match_value, serde_json::json!("approved"));
+                assert_eq!(arms[1].match_value, serde_json::json!(0.8));
+                assert_eq!(arms[2].match_value, serde_json::json!({"status": "ok"}));
+            }
+            other => panic!("expected Branch, got {other:?}"),
+        }
     }
 
     // ---- load_from_dir_sync tests ----
