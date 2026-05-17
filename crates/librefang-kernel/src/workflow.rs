@@ -295,6 +295,22 @@ fn default_timeout() -> u64 {
     120
 }
 
+/// Upper bound (seconds) for any user-supplied step / total timeout.
+///
+/// `tokio::time::timeout` internally computes `Instant::now() + duration`;
+/// when `duration` is built from a near-`u64::MAX` `timeout_secs` the
+/// `Instant + Duration` add overflows and panics. One year is already far
+/// beyond any legitimate workflow / step timeout, so clamping here removes
+/// the panic vector without truncating any realistic operator config.
+const MAX_TIMEOUT_SECS: u64 = 366 * 24 * 60 * 60;
+
+/// Build a `Duration` from a user-supplied `timeout_secs`, clamped to
+/// [`MAX_TIMEOUT_SECS`] so `tokio::time::timeout` can never panic on an
+/// `Instant + Duration` overflow. See [`MAX_TIMEOUT_SECS`].
+fn clamp_timeout_duration(timeout_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(timeout_secs.min(MAX_TIMEOUT_SECS))
+}
+
 /// How to identify the agent for a step.
 ///
 /// Deserialization accepts THREE on-wire shapes for operator ergonomics
@@ -1996,6 +2012,29 @@ impl WorkflowEngine {
                 continue;
             }
             let age = now.signed_duration_since(run.started_at).num_seconds();
+            // Wall-clock skew guard (#5114): `Utc::now()` is not monotonic.
+            // A backwards NTP step (or a daemon that restarts on a host
+            // whose clock has drifted backwards) makes `age` negative —
+            // pre-fix that always satisfied `age < stale_secs` and silently
+            // masked real stale rows. A forward step at boot, conversely,
+            // makes every Running row look ancient and force-fails them as
+            // "Interrupted by daemon restart". Treat negative ages as
+            // "fresh" (skip the row) and emit a structured warn so
+            // operators see the skew. A monotonic / heartbeat-based reap
+            // is the proper long-term fix and is tracked separately; this
+            // is the minimal correctness change.
+            if age < 0 {
+                warn!(
+                    run_id = %run.id,
+                    state = ?run.state,
+                    now = %now,
+                    started_at = %run.started_at,
+                    age_secs = age,
+                    "Negative workflow run age — wall-clock moved backwards; \
+                     treating run as fresh, not stale"
+                );
+                continue;
+            }
             if age < stale_secs {
                 continue;
             }
@@ -2307,6 +2346,32 @@ impl WorkflowEngine {
         }
     }
 
+    /// Resolve the text that `{{input}}` (the whole-input form) should
+    /// render to at the start of a run.
+    ///
+    /// For object-shaped input we still seed every top-level key as a
+    /// `{{key}}` variable via [`Self::seed_input_vars_from_json`], but a
+    /// caller that *also* wants free-form context for a step prompt's
+    /// `{{input}}` (e.g. the dashboard's "additional context" textarea
+    /// alongside a parameter form) has nowhere to put it: serialising the
+    /// whole object as `{{input}}` would dump JSON into the prompt. So a
+    /// top-level **string** `"input"` key is treated as that free-text and
+    /// becomes the `{{input}}` value; the per-key seeding still binds the
+    /// remaining placeholders. This is purely additive — input that is a
+    /// plain string, or an object with no string `"input"` key, renders
+    /// exactly as before (the raw blob, per the #4982 contract), so the
+    /// agent `workflow_run` tool path is unchanged.
+    fn template_input_text(input: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(input)
+            .ok()
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("input"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| input.to_string())
+    }
+
     /// Execute a single step with error mode handling. Returns (output, input_tokens, output_tokens).
     async fn execute_step_with_error_mode<F, Fut>(
         step: &WorkflowStep,
@@ -2320,7 +2385,7 @@ impl WorkflowEngine {
         F: Fn(AgentId, String, Option<SessionMode>) -> Fut,
         Fut: std::future::Future<Output = Result<(String, u64, u64), String>>,
     {
-        let timeout_dur = std::time::Duration::from_secs(step.timeout_secs);
+        let timeout_dur = clamp_timeout_duration(step.timeout_secs);
         let session_mode = step.session_mode;
 
         match &step.error_mode {
@@ -2903,7 +2968,7 @@ impl WorkflowEngine {
         };
 
         let result = if let Some(secs) = total_timeout {
-            match tokio::time::timeout(std::time::Duration::from_secs(secs), inner_fut).await {
+            match tokio::time::timeout(clamp_timeout_duration(secs), inner_fut).await {
                 Ok(r) => r,
                 Err(_elapsed) => {
                     let msg = format!("workflow exceeded total_timeout of {secs}s");
@@ -2998,16 +3063,17 @@ impl WorkflowEngine {
                 } else {
                     // Fresh start: seed per-key vars from the input JSON so
                     // that `{{cover}}` / `{{topic}}` (etc.) in step prompts
-                    // resolve from object-shaped input. `{{input}}` keeps
-                    // rendering the whole blob (#4982 — gap 3).
+                    // resolve from object-shaped input. `{{input}}` renders
+                    // the object's string `input` key when present, else
+                    // the raw blob (#4982 — gap 3; see template_input_text).
                     let mut vars = HashMap::new();
                     Self::seed_input_vars_from_json(input, &mut vars);
-                    (input.to_string(), vars, 0_usize)
+                    (Self::template_input_text(input), vars, 0_usize)
                 }
             } else {
                 let mut vars = HashMap::new();
                 Self::seed_input_vars_from_json(input, &mut vars);
-                (input.to_string(), vars, 0_usize)
+                (Self::template_input_text(input), vars, 0_usize)
             }
         };
         let mut all_outputs: Vec<String> = Vec::new();
@@ -3230,7 +3296,7 @@ impl WorkflowEngine {
                             &prev_results,
                             agent_inherit,
                         );
-                        let timeout_dur = std::time::Duration::from_secs(fan_step.timeout_secs);
+                        let timeout_dur = clamp_timeout_duration(fan_step.timeout_secs);
 
                         step_infos.push((*idx, fan_step.name.clone(), agent_id, agent_name));
                         step_prompts.push(prompt.clone());
@@ -4352,7 +4418,9 @@ impl WorkflowEngine {
         Self::seed_input_vars_from_json(input, &mut variables);
         // Track which step names have failed so we can skip dependents
         let mut failed_steps: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut last_output = input.to_string();
+        // `{{input}}` mirrors the sequential path: the object's string
+        // `input` key when present, else the raw blob (see template_input_text).
+        let mut last_output = Self::template_input_text(input);
 
         info!(
             run_id = %run_id,
@@ -4506,7 +4574,7 @@ impl WorkflowEngine {
                         let prompt =
                             Self::expand_variables(&step.prompt_template, input, &variables);
                         step_prompts.push(prompt.clone());
-                        let timeout_dur = std::time::Duration::from_secs(step.timeout_secs);
+                        let timeout_dur = clamp_timeout_duration(step.timeout_secs);
                         let err_mode = step.error_mode.clone();
                         let step_name = step.name.clone();
                         let step_session_mode = step.session_mode;
@@ -4645,7 +4713,7 @@ impl WorkflowEngine {
         // dry_run's resolved prompts reflect the real {{var}} substitution
         // an actual run will perform (#4982 — gap 3).
         Self::seed_input_vars_from_json(input, &mut variables);
-        let mut current_input = input.to_string();
+        let mut current_input = Self::template_input_text(input);
 
         for (i, step) in workflow.steps.iter().enumerate() {
             let raw_prompt =
@@ -6564,6 +6632,30 @@ mod tests {
         assert_eq!(vars["fresh"], "v");
     }
 
+    #[test]
+    fn template_input_text_resolves_input_key_else_raw_blob() {
+        // Object with a string `input` key → that key is the {{input}} text.
+        assert_eq!(
+            WorkflowEngine::template_input_text(
+                &serde_json::json!({"challenge": "X", "input": "notes"}).to_string()
+            ),
+            "notes"
+        );
+        // Object WITHOUT an `input` key → raw blob (unchanged #4982 contract).
+        let blob = serde_json::json!({"challenge": "X"}).to_string();
+        assert_eq!(WorkflowEngine::template_input_text(&blob), blob);
+        // Object whose `input` key is non-string → raw blob (no coercion).
+        let non_str = serde_json::json!({"input": {"nested": true}}).to_string();
+        assert_eq!(WorkflowEngine::template_input_text(&non_str), non_str);
+        // Plain (non-JSON) string → returned verbatim.
+        assert_eq!(
+            WorkflowEngine::template_input_text("just text"),
+            "just text"
+        );
+        // A JSON string scalar is not an object → verbatim.
+        assert_eq!(WorkflowEngine::template_input_text("\"x\""), "\"x\"");
+    }
+
     /// End-to-end engine substitution: a workflow with `{{topic}}` and
     /// `{{cover}}` placeholders run with JSON object input must produce a
     /// step prompt where the placeholders are filled with the input values
@@ -8462,6 +8554,101 @@ prompt_template = "do {{x}}"
         }
     }
 
+    /// Regression for #5114: `recover_stale_running_runs` must not
+    /// force-fail a Running row whose `started_at` is in the future.
+    ///
+    /// Pre-fix the function compared wall-clock now to `started_at`
+    /// directly. After a backwards NTP step (or a daemon restart on a
+    /// host whose clock drifted backwards in the interim), `age` is
+    /// negative, `age < stale_secs` is always true, and the row is
+    /// skipped — silently masking real stale rows. With the fix, the
+    /// negative-age branch logs a warn and skips the row explicitly,
+    /// without changing state.
+    #[test]
+    fn recover_stale_skips_run_with_started_at_in_the_future() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = WorkflowEngine::new_with_persistence(tmp.path());
+
+        // Run "started" one hour in the future relative to wall-clock
+        // now — the shape a backwards NTP step at boot produces for an
+        // in-memory Running row reloaded from disk. `make_terminal_run`
+        // bakes in `completed_at: Some(...)` because it's a terminal-row
+        // helper; clear it back to `None` so the row mirrors a real
+        // Running row that hasn't completed yet (and so we can later
+        // assert the skew guard didn't slip a completed_at onto it).
+        let future_started_at = Utc::now() + chrono::Duration::hours(1);
+        let run = WorkflowRun {
+            state: WorkflowRunState::Running,
+            started_at: future_started_at,
+            completed_at: None,
+            ..make_terminal_run(WorkflowRunState::Pending)
+        };
+        let run_id = run.id;
+        engine.runs.insert(run.id, run);
+
+        // 60-second stale cutoff — irrelevant to the negative-age branch
+        // but realistic. The function must return an empty Vec because
+        // the only candidate has a negative age and is treated as fresh.
+        let recovered = engine.recover_stale_running_runs(std::time::Duration::from_secs(60));
+        assert!(
+            recovered.is_empty(),
+            "negative-age row must not be reported as recovered, got: {recovered:?}"
+        );
+
+        // State must still be Running — not force-failed.
+        let r = engine.runs.get(&run_id).expect("run vanished");
+        assert!(
+            matches!(r.state, WorkflowRunState::Running),
+            "negative-age row was force-failed instead of skipped: {:?}",
+            r.state
+        );
+        assert!(
+            r.error.is_none(),
+            "negative-age row gained an error string: {:?}",
+            r.error
+        );
+        assert!(
+            r.completed_at.is_none(),
+            "negative-age row gained a completed_at: {:?}",
+            r.completed_at
+        );
+        assert_eq!(
+            r.started_at, future_started_at,
+            "started_at must not be rewritten by the skew guard"
+        );
+    }
+
+    /// Sanity sibling for #5114: with a clearly-stale `started_at` in
+    /// the past and the same 60-second cutoff, the row IS reaped — so
+    /// the new negative-age branch hasn't accidentally short-circuited
+    /// the normal happy path.
+    #[test]
+    fn recover_stale_still_reaps_normally_aged_running_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = WorkflowEngine::new_with_persistence(tmp.path());
+
+        let stale_started_at = Utc::now() - chrono::Duration::hours(1);
+        let run = WorkflowRun {
+            state: WorkflowRunState::Running,
+            started_at: stale_started_at,
+            completed_at: None,
+            ..make_terminal_run(WorkflowRunState::Pending)
+        };
+        let run_id = run.id;
+        engine.runs.insert(run.id, run);
+
+        let recovered = engine.recover_stale_running_runs(std::time::Duration::from_secs(60));
+        assert_eq!(
+            recovered,
+            vec![run_id],
+            "a one-hour-old Running row must still be force-failed under a 60s cutoff"
+        );
+
+        let r = engine.runs.get(&run_id).expect("run vanished");
+        assert!(matches!(r.state, WorkflowRunState::Failed));
+        assert_eq!(r.error.as_deref(), Some("Interrupted by daemon restart"));
+    }
+
     /// Regression for #3335: graceful shutdown must transition every
     /// in-flight run to `Paused` and persist the change so the dashboard
     /// still surfaces them after a restart.
@@ -10314,5 +10501,37 @@ name = "topic"
             "expected a _operator:operator step result; got: {:?}",
             run.step_results
         );
+    }
+
+    // -- #5136: timeout Duration overflow guard -----------------------------
+
+    #[test]
+    fn clamp_timeout_duration_caps_pathological_u64() {
+        // `tokio::time::timeout(Duration::from_secs(u64::MAX))` panics on the
+        // internal `Instant + Duration` add. A user-supplied near-u64::MAX
+        // `timeout_secs` must be clamped to MAX_TIMEOUT_SECS so the timer
+        // can never overflow.
+        let d = clamp_timeout_duration(u64::MAX);
+        assert_eq!(d, std::time::Duration::from_secs(MAX_TIMEOUT_SECS));
+
+        // A realistic timeout passes through unchanged (no silent truncation
+        // of legitimate operator config).
+        let normal = clamp_timeout_duration(300);
+        assert_eq!(normal, std::time::Duration::from_secs(300));
+
+        // Exactly at the cap is preserved.
+        let at_cap = clamp_timeout_duration(MAX_TIMEOUT_SECS);
+        assert_eq!(at_cap, std::time::Duration::from_secs(MAX_TIMEOUT_SECS));
+    }
+
+    #[tokio::test]
+    async fn clamped_timeout_does_not_panic_in_tokio_timeout() {
+        // Drive the clamped duration through the real tokio timer with a
+        // future that completes immediately — this is the exact call shape
+        // (`tokio::time::timeout(clamp_timeout_duration(secs), fut)`) used by
+        // the workflow executor. Pre-fix, `from_secs(u64::MAX)` panicked here.
+        let dur = clamp_timeout_duration(u64::MAX);
+        let r = tokio::time::timeout(dur, async { 7u8 }).await;
+        assert_eq!(r.expect("inner future completed"), 7);
     }
 }
