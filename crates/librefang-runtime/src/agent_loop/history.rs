@@ -56,10 +56,10 @@ pub(super) fn resolve_max_history(manifest: &AgentManifest, opts: &LoopOptions) 
 fn clamp_max_history(requested: usize, agent_name: &str) -> usize {
     if requested > MAX_HISTORY_MESSAGES {
         warn!(
+            agent = %agent_name,
             requested,
-            max = MAX_HISTORY_MESSAGES,
-            agent_name,
-            "max_history_messages exceeds upper bound, clamping"
+            applied = MAX_HISTORY_MESSAGES,
+            "max_history_messages above hard upper limit; clamping"
         );
         return MAX_HISTORY_MESSAGES;
     }

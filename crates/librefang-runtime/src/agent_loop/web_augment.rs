@@ -144,9 +144,30 @@ async fn generate_search_queries(
             Some(i) => scan + i,
             None => return None,
         };
-        let end = match text[start..].rfind('}') {
-            Some(i) => start + i + 1,
-            None => return None,
+        let end = {
+            let mut depth = 0u32;
+            let mut found = None;
+            for (i, ch) in text[start..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            found = Some(start + i + 1); // +1 for exclusive end
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match found {
+                Some(e) => e,
+                None => {
+                    scan = start + 1;
+                    attempt += 1;
+                    continue;
+                }
+            }
         };
         let candidate = &text[start..end];
         match serde_json::from_str::<serde_json::Value>(candidate) {
