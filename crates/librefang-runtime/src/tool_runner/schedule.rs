@@ -18,6 +18,9 @@ pub(super) fn parse_schedule_to_cron(input: &str) -> Result<String, String> {
             p.chars()
                 .all(|c| c.is_ascii_alphanumeric() || "*/,-?LW#".contains(c))
         })
+        && parts
+            .iter()
+            .any(|p| p.chars().any(|c| !c.is_ascii_alphabetic()))
     {
         return Ok(input);
     }

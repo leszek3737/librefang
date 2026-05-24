@@ -94,8 +94,8 @@ pub fn sanitize_canvas_html(html: &str, max_bytes: usize) -> Result<String, Stri
             regex_lite::Regex::new(r"(?i)(?:javascript\s*:|vbscript\s*:|data\s*:\s*text/html)")
                 .unwrap()
         });
-    if DANGEROUS_SCHEME_RE.is_match(&decoded) {
-        return Err("Forbidden URL scheme detected".to_string());
+    if let Some(m) = DANGEROUS_SCHEME_RE.find(&decoded) {
+        return Err(format!("Forbidden URL scheme detected: {}", m.as_str()));
     }
 
     Ok(html.to_string())
