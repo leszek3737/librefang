@@ -47,8 +47,6 @@ pub(super) fn check_taint_shell_exec(command: &str) -> Option<String> {
 /// tricks such as `api%5Fkey=secret` (the server decodes `%5F` to `_`
 /// and receives the real `api_key=secret`).
 pub(super) fn check_taint_net_fetch(url: &str) -> Option<String> {
-    const SECRET_KEYS: &[&str] = &["api_key", "apikey", "token", "secret", "password"];
-
     // Scan 1: raw URL literal for `<key>=` and the Authorization header prefix.
     let url_lower = url.to_lowercase();
     let mut hit = url_lower.contains("authorization:");

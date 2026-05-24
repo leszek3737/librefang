@@ -21,7 +21,10 @@ pub(super) async fn tool_shell_exec(
         .ok_or("Missing 'command' parameter")?;
     // Use LLM-specified timeout, or fall back to exec policy timeout, or default 30s
     let policy_timeout = exec_policy.map(|p| p.timeout_secs).unwrap_or(30);
-    let timeout_secs = input["timeout_seconds"].as_u64().unwrap_or(policy_timeout);
+    let timeout_secs = input["timeout_seconds"]
+        .as_u64()
+        .filter(|&t| t > 0)
+        .unwrap_or(policy_timeout);
 
     // SECURITY: Determine execution strategy based on exec policy.
     //
@@ -31,6 +34,10 @@ pub(super) async fn tool_shell_exec(
     //
     // In Full mode: User explicitly opted into unrestricted shell access,
     // so we use sh -c / cmd /C as before.
+    if exec_policy.is_some_and(|p| p.mode == librefang_types::config::ExecSecurityMode::Deny) {
+        return Err("Shell execution is denied by security policy".to_string());
+    }
+
     let use_direct_exec = exec_policy
         .map(|p| p.mode == librefang_types::config::ExecSecurityMode::Allowlist)
         .unwrap_or(true); // Default to safe mode
@@ -169,7 +176,9 @@ pub(super) async fn tool_shell_exec(
             let exit_code = output.status.code().unwrap_or(-1);
 
             // Truncate very long outputs to prevent memory issues
-            let max_output = 100_000;
+            let max_output = exec_policy
+                .and_then(|p| (p.max_output_bytes > 0).then_some(p.max_output_bytes))
+                .unwrap_or(100_000);
             let stdout_str = if stdout.len() > max_output {
                 format!(
                     "{}...\n[truncated, {} total bytes]",

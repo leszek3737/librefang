@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 fn parse_entity_type(s: &str) -> librefang_types::memory::EntityType {
     use librefang_types::memory::EntityType;
-    match s.to_lowercase().as_str() {
+    let lower = s.to_lowercase();
+    match lower.as_str() {
         "person" => EntityType::Person,
         "organization" | "org" => EntityType::Organization,
         "project" => EntityType::Project,
@@ -15,13 +16,14 @@ fn parse_entity_type(s: &str) -> librefang_types::memory::EntityType {
         "location" => EntityType::Location,
         "document" | "doc" => EntityType::Document,
         "tool" => EntityType::Tool,
-        other => EntityType::Custom(other.to_string()),
+        _ => EntityType::Custom(s.to_string()),
     }
 }
 
 fn parse_relation_type(s: &str) -> librefang_types::memory::RelationType {
     use librefang_types::memory::RelationType;
-    match s.to_lowercase().as_str() {
+    let lower = s.to_lowercase();
+    match lower.as_str() {
         "works_at" | "worksat" => RelationType::WorksAt,
         "knows_about" | "knowsabout" | "knows" => RelationType::KnowsAbout,
         "related_to" | "relatedto" | "related" => RelationType::RelatedTo,
@@ -32,7 +34,7 @@ fn parse_relation_type(s: &str) -> librefang_types::memory::RelationType {
         "part_of" | "partof" => RelationType::PartOf,
         "uses" => RelationType::Uses,
         "produces" => RelationType::Produces,
-        other => RelationType::Custom(other.to_string()),
+        _ => RelationType::Custom(s.to_string()),
     }
 }
 
@@ -81,7 +83,7 @@ pub(super) async fn tool_knowledge_add_relation(
     let target = input["target"]
         .as_str()
         .ok_or("Missing 'target' parameter")?;
-    let confidence = input["confidence"].as_f64().unwrap_or(1.0) as f32;
+    let confidence = input["confidence"].as_f64().unwrap_or(1.0).clamp(0.0, 1.0) as f32;
     let properties = input
         .get("properties")
         .and_then(|v| v.as_object())

@@ -119,7 +119,8 @@ pub(super) fn extract_image_dimensions(data: &[u8], format: &str) -> Option<(u32
             // BMP: width at bytes 18-21, height at bytes 22-25 (little-endian)
             if data.len() >= 26 {
                 let w = u32::from_le_bytes([data[18], data[19], data[20], data[21]]);
-                let h = u32::from_le_bytes([data[22], data[23], data[24], data[25]]);
+                let h_raw = i32::from_le_bytes([data[22], data[23], data[24], data[25]]);
+                let h = h_raw.unsigned_abs();
                 Some((w, h))
             } else {
                 None
@@ -142,12 +143,22 @@ pub(super) fn extract_jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
             continue;
         }
         let marker = data[i + 1];
-        // SOF0-SOF3 markers contain dimensions
+        // Marker-only types (no length field): stuffing, TEM, RST0-RST7, SOI, EOI
+        if marker == 0x00 || marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
+            i += 2;
+            continue;
+        }
+        // SOF0-SOF3 contain dimensions (must appear before SOS in valid JPEG)
         if (0xC0..=0xC3).contains(&marker) && i + 9 < data.len() {
             let h = u16::from_be_bytes([data[i + 5], data[i + 6]]) as u32;
             let w = u16::from_be_bytes([data[i + 7], data[i + 8]]) as u32;
             return Some((w, h));
         }
+        // SOS — stop scanning (SOF markers must appear before SOS)
+        if marker == 0xDA {
+            break;
+        }
+        // All other markers: read 2-byte length and skip
         if i + 3 < data.len() {
             let seg_len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
             i += 2 + seg_len;

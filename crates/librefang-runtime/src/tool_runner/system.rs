@@ -9,7 +9,7 @@ pub(super) async fn tool_location_get() -> Result<String, String> {
 
     // Use ip-api.com (free, no API key, JSON response)
     let resp = client
-        .get("https://ip-api.com/json/?fields=status,message,country,regionName,city,zip,lat,lon,timezone,isp,query")
+        .get("http://ip-api.com/json/?fields=status,message,country,regionName,city,zip,lat,lon,timezone,isp,query")
         .header("User-Agent", "LibreFang/0.1")
         .send()
         .await

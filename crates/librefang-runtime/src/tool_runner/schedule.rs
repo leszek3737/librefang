@@ -14,9 +14,10 @@ pub(super) fn parse_schedule_to_cron(input: &str) -> Result<String, String> {
     // If it already looks like a cron expression (5 space-separated fields), pass through
     let parts: Vec<&str> = input.split_whitespace().collect();
     if parts.len() == 5
-        && parts
-            .iter()
-            .all(|p| p.chars().all(|c| c.is_ascii_digit() || "*/,-".contains(c)))
+        && parts.iter().all(|p| {
+            p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "*/,-?LW#".contains(c))
+        })
     {
         return Ok(input);
     }
@@ -59,20 +60,20 @@ pub(super) fn parse_schedule_to_cron(input: &str) -> Result<String, String> {
 
     // "daily at Xam/pm"
     if let Some(time_str) = input.strip_prefix("daily at ") {
-        let hour = parse_time_to_hour(time_str)?;
-        return Ok(format!("0 {hour} * * *"));
+        let (hour, minute) = parse_time_to_hour(time_str)?;
+        return Ok(format!("{minute} {hour} * * *"));
     }
 
     // "weekdays at Xam/pm"
     if let Some(time_str) = input.strip_prefix("weekdays at ") {
-        let hour = parse_time_to_hour(time_str)?;
-        return Ok(format!("0 {hour} * * 1-5"));
+        let (hour, minute) = parse_time_to_hour(time_str)?;
+        return Ok(format!("{minute} {hour} * * 1-5"));
     }
 
     // "weekends at Xam/pm"
     if let Some(time_str) = input.strip_prefix("weekends at ") {
-        let hour = parse_time_to_hour(time_str)?;
-        return Ok(format!("0 {hour} * * 0,6"));
+        let (hour, minute) = parse_time_to_hour(time_str)?;
+        return Ok(format!("{minute} {hour} * * 0,6"));
     }
 
     // "hourly" / "daily" / "weekly" / "monthly"
@@ -89,35 +90,75 @@ pub(super) fn parse_schedule_to_cron(input: &str) -> Result<String, String> {
     ))
 }
 
-/// Parse a time string like "9am", "6pm", "14:00", "9:30am" into an hour (0-23).
-pub(super) fn parse_time_to_hour(s: &str) -> Result<u32, String> {
+/// Parse a time string like "9am", "6pm", "14:00", "9:30am" into (hour, minute).
+pub(super) fn parse_time_to_hour(s: &str) -> Result<(u32, u32), String> {
     let s = s.trim().to_lowercase();
 
-    // Handle "9am", "6pm", "12pm", "12am"
+    // Handle "9am", "9:30am", "6pm", "12pm", "12am"
     if let Some(h) = s.strip_suffix("am") {
+        if let Some((hour_s, min_s)) = h.trim().split_once(':') {
+            let hour: u32 = hour_s
+                .trim()
+                .parse()
+                .map_err(|_| format!("Invalid time: {s}"))?;
+            let min: u32 = min_s
+                .trim()
+                .parse()
+                .map_err(|_| format!("Invalid time: {s}"))?;
+            if hour > 23 {
+                return Err(format!("Hour must be 0-23, got {hour}"));
+            }
+            if min > 59 {
+                return Err(format!("Minute must be 0-59, got {min}"));
+            }
+            let hour = if hour == 12 { 0 } else { hour };
+            return Ok((hour, min));
+        }
         let hour: u32 = h.trim().parse().map_err(|_| format!("Invalid time: {s}"))?;
         return match hour {
-            12 => Ok(0),
-            1..=11 => Ok(hour),
+            12 => Ok((0, 0)),
+            1..=11 => Ok((hour, 0)),
             _ => Err(format!("Invalid hour: {hour}")),
         };
     }
     if let Some(h) = s.strip_suffix("pm") {
+        if let Some((hour_s, min_s)) = h.trim().split_once(':') {
+            let hour: u32 = hour_s
+                .trim()
+                .parse()
+                .map_err(|_| format!("Invalid time: {s}"))?;
+            let min: u32 = min_s
+                .trim()
+                .parse()
+                .map_err(|_| format!("Invalid time: {s}"))?;
+            if hour > 23 {
+                return Err(format!("Hour must be 0-23, got {hour}"));
+            }
+            if min > 59 {
+                return Err(format!("Minute must be 0-59, got {min}"));
+            }
+            let hour = if hour == 12 { 12 } else { hour + 12 };
+            return Ok((hour, min));
+        }
         let hour: u32 = h.trim().parse().map_err(|_| format!("Invalid time: {s}"))?;
         return match hour {
-            12 => Ok(12),
-            1..=11 => Ok(hour + 12),
+            12 => Ok((12, 0)),
+            1..=11 => Ok((hour + 12, 0)),
             _ => Err(format!("Invalid hour: {hour}")),
         };
     }
 
     // Handle "14:00" or "9:30"
-    if let Some((h, _m)) = s.split_once(':') {
+    if let Some((h, m)) = s.split_once(':') {
         let hour: u32 = h.trim().parse().map_err(|_| format!("Invalid time: {s}"))?;
+        let min: u32 = m.trim().parse().map_err(|_| format!("Invalid time: {s}"))?;
         if hour > 23 {
             return Err(format!("Hour must be 0-23, got {hour}"));
         }
-        return Ok(hour);
+        if min > 59 {
+            return Err(format!("Minute must be 0-59, got {min}"));
+        }
+        return Ok((hour, min));
     }
 
     // Plain number
@@ -125,7 +166,7 @@ pub(super) fn parse_time_to_hour(s: &str) -> Result<u32, String> {
     if hour > 23 {
         return Err(format!("Hour must be 0-23, got {hour}"));
     }
-    Ok(hour)
+    Ok((hour, 0))
 }
 
 pub(super) async fn tool_schedule_create(

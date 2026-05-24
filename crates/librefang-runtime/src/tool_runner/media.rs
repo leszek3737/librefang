@@ -179,8 +179,8 @@ pub(super) async fn tool_image_generate(
             .map_err(|e| e.to_string())?;
 
         // Save images to workspace and uploads dir
-        let saved_paths = save_media_images_to_workspace(&result.images, workspace_root);
-        let image_urls = save_media_images_to_uploads(&result.images, upload_dir);
+        let saved_paths = save_media_images_to_workspace(&result.images, workspace_root).await;
+        let image_urls = save_media_images_to_uploads(&result.images, upload_dir).await;
 
         let response = serde_json::json!({
             "model": result.model,
@@ -237,13 +237,13 @@ pub(super) async fn tool_image_generate(
     let mut image_urls: Vec<String> = Vec::new();
     {
         use base64::Engine;
-        let _ = std::fs::create_dir_all(upload_dir);
+        let _ = tokio::fs::create_dir_all(upload_dir).await;
         for img in &result.images {
             let file_id = uuid::Uuid::new_v4().to_string();
             if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&img.data_base64)
             {
                 let path = upload_dir.join(&file_id);
-                if std::fs::write(&path, &decoded).is_ok() {
+                if tokio::fs::write(&path, &decoded).await.is_ok() {
                     image_urls.push(format!("/api/uploads/{file_id}"));
                 }
             }
@@ -261,8 +261,31 @@ pub(super) async fn tool_image_generate(
     serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
 }
 
+fn image_extension_from_bytes(data: &[u8]) -> &'static str {
+    if data.len() >= 8 {
+        if data[0..4] == [0x89, 0x50, 0x4E, 0x47] {
+            return "png";
+        }
+        if data[0..3] == [0xFF, 0xD8, 0xFF] {
+            return "jpg";
+        }
+        if data[0..4] == [0x52, 0x49, 0x46, 0x46]
+            && data.len() >= 12
+            && data[8..12] == [0x57, 0x45, 0x42, 0x50]
+        {
+            return "webp";
+        }
+        if data[0..6] == [0x47, 0x49, 0x46, 0x38, 0x37, 0x61]
+            || data[0..6] == [0x47, 0x49, 0x46, 0x38, 0x39, 0x61]
+        {
+            return "gif";
+        }
+    }
+    "png"
+}
+
 /// Save MediaImageResult images to workspace output/ dir.
-fn save_media_images_to_workspace(
+async fn save_media_images_to_workspace(
     images: &[librefang_types::media::GeneratedImage],
     workspace_root: Option<&Path>,
 ) -> Vec<String> {
@@ -271,16 +294,17 @@ fn save_media_images_to_workspace(
     };
     use base64::Engine;
     let output_dir = workspace.join("output");
-    let _ = std::fs::create_dir_all(&output_dir);
+    let _ = tokio::fs::create_dir_all(&output_dir).await;
     let mut paths = Vec::new();
     for (i, img) in images.iter().enumerate() {
         if img.data_base64.is_empty() {
             continue;
         }
         if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&img.data_base64) {
-            let filename = format!("image_{}.png", i);
+            let ext = image_extension_from_bytes(&decoded);
+            let filename = format!("image_{}.{ext}", i);
             let path = output_dir.join(&filename);
-            if std::fs::write(&path, &decoded).is_ok() {
+            if tokio::fs::write(&path, &decoded).await.is_ok() {
                 paths.push(path.display().to_string());
             }
         }
@@ -289,12 +313,12 @@ fn save_media_images_to_workspace(
 }
 
 /// Save MediaImageResult images to uploads temp dir, returning /api/uploads/... URLs.
-fn save_media_images_to_uploads(
+async fn save_media_images_to_uploads(
     images: &[librefang_types::media::GeneratedImage],
     upload_dir: &Path,
 ) -> Vec<String> {
     use base64::Engine;
-    let _ = std::fs::create_dir_all(upload_dir);
+    let _ = tokio::fs::create_dir_all(upload_dir).await;
     let mut urls = Vec::new();
     for img in images {
         // If provider returned a URL directly, use it as-is
@@ -308,7 +332,7 @@ fn save_media_images_to_uploads(
         if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&img.data_base64) {
             if !decoded.is_empty() {
                 let path = upload_dir.join(&file_id);
-                if std::fs::write(&path, &decoded).is_ok() {
+                if tokio::fs::write(&path, &decoded).await.is_ok() {
                     urls.push(format!("/api/uploads/{file_id}"));
                 }
             }
@@ -433,8 +457,14 @@ pub(super) async fn tool_music_generate(
         media_drivers.ok_or("Media drivers not available. Ensure media drivers are configured.")?;
 
     let request = librefang_types::media::MediaMusicRequest {
-        prompt: input["prompt"].as_str().map(String::from),
-        lyrics: input["lyrics"].as_str().map(String::from),
+        prompt: input["prompt"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .map(String::from),
+        lyrics: input["lyrics"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .map(String::from),
         provider: input["provider"].as_str().map(String::from),
         model: input["model"].as_str().map(String::from),
         instrumental: input["instrumental"].as_bool().unwrap_or(false),

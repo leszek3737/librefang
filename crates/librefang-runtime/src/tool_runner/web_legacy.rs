@@ -16,22 +16,28 @@ pub(super) async fn tool_web_fetch_legacy(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
-    let resp = client
+    let mut resp = client
         .get(url)
         .send()
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?;
     let status = resp.status();
-    // Reject responses larger than 10MB to prevent memory exhaustion
-    if let Some(len) = resp.content_length() {
-        if len > 10 * 1024 * 1024 {
-            return Err(format!("Response too large: {len} bytes (max 10MB)"));
+    let max_body_bytes: usize = 10 * 1024 * 1024;
+    let mut body_bytes = Vec::with_capacity(1024);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("Failed to read response body: {e}"))?
+    {
+        body_bytes.extend_from_slice(&chunk);
+        if body_bytes.len() > max_body_bytes {
+            return Err(format!(
+                "Response too large: {} bytes (max {max_body_bytes} bytes)",
+                body_bytes.len()
+            ));
         }
     }
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read response body: {e}"))?;
+    let body = String::from_utf8_lossy(&body_bytes).into_owned();
     // Artifact spill: if the body exceeds the configured threshold, write it
     // to the artifact store and return a compact stub with a handle.  On write
     // failure (including per-artifact size cap exceeded), fall through to the

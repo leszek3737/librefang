@@ -2,7 +2,38 @@
 //! disposable Docker container scoped to the agent's workspace.
 
 use std::path::Path;
+use std::sync::Arc;
 use tracing::warn;
+
+struct ContainerGuard {
+    container: Option<Arc<crate::docker_sandbox::SandboxContainer>>,
+}
+
+impl ContainerGuard {
+    fn new(container: crate::docker_sandbox::SandboxContainer) -> Self {
+        Self {
+            container: Some(Arc::new(container)),
+        }
+    }
+
+    fn inner(&self) -> &crate::docker_sandbox::SandboxContainer {
+        self.container.as_ref().unwrap()
+    }
+
+    fn defuse(mut self) -> Arc<crate::docker_sandbox::SandboxContainer> {
+        self.container.take().unwrap()
+    }
+}
+
+impl Drop for ContainerGuard {
+    fn drop(&mut self) {
+        if let Some(container) = self.container.take() {
+            tokio::spawn(async move {
+                let _ = crate::docker_sandbox::destroy_sandbox(&container).await;
+            });
+        }
+    }
+}
 
 pub(super) async fn tool_docker_exec(
     input: &serde_json::Value,
@@ -30,14 +61,13 @@ pub(super) async fn tool_docker_exec(
         );
     }
 
-    // Create sandbox container
     let container = crate::docker_sandbox::create_sandbox(config, agent_id, workspace).await?;
+    let guard = ContainerGuard::new(container);
 
-    // Execute command with timeout
     let timeout = std::time::Duration::from_secs(config.timeout_secs);
-    let result = crate::docker_sandbox::exec_in_sandbox(&container, command, timeout).await;
+    let result = crate::docker_sandbox::exec_in_sandbox(guard.inner(), command, timeout).await;
 
-    // Always destroy the container after execution
+    let container = guard.defuse();
     if let Err(e) = crate::docker_sandbox::destroy_sandbox(&container).await {
         warn!("Failed to destroy Docker sandbox: {e}");
     }

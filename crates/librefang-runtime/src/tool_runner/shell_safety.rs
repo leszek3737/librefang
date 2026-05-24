@@ -403,12 +403,10 @@ fn classify_shell_exec_ro_safety_segment(command: &str, ro_prefix: &str) -> RoSa
     // --- 4. sed: allow `-n` (no-print), block `-i` (in-place edit) -------------
     if verb_base == "sed" {
         let has_inplace = tokens.iter().any(|t| {
-            // `-i` alone (POSIX) or `-i<suffix>` (GNU sed extension).
-            if *t == "-i" || (t.starts_with("-i") && t.len() > 2) {
+            let t = trim_quotes(t);
+            if t == "-i" || (t.starts_with("-i") && t.len() > 2) {
                 return true;
             }
-            // Combined short flags e.g. `-ni` — only short-option bundles, not
-            // long options (which start with `--`).
             if t.starts_with('-') && !t.starts_with("--") && t.contains('i') {
                 return true;
             }
@@ -428,12 +426,12 @@ fn classify_shell_exec_ro_safety_segment(command: &str, ro_prefix: &str) -> RoSa
         let mut iter = tokens.iter().peekable();
         let mut has_inplace = false;
         while let Some(tok) = iter.next() {
-            if *tok == "-i" && iter.peek().map(|s| **s) == Some("inplace") {
+            let tok_unq = trim_quotes(tok);
+            if tok_unq == "-i" && iter.peek().map(|s| trim_quotes(s)) == Some("inplace") {
                 has_inplace = true;
                 break;
             }
-            // Also catch --inplace long form.
-            if *tok == "--inplace" {
+            if tok_unq == "--inplace" {
                 has_inplace = true;
                 break;
             }
@@ -557,6 +555,10 @@ fn classify_shell_exec_ro_safety_segment(command: &str, ro_prefix: &str) -> RoSa
          Only known read-only verbs are permitted to reference read-only workspace paths.",
         verb_base, ro_prefix
     ))
+}
+
+fn trim_quotes(s: &str) -> &str {
+    s.trim_matches(|c| c == '"' || c == '\'')
 }
 
 /// Returns true if `token` refers to a path that starts with `ro_prefix` at

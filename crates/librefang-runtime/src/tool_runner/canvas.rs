@@ -4,6 +4,21 @@
 use super::CANVAS_MAX_BYTES;
 use std::path::{Path, PathBuf};
 
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+fn strip_html_entities(s: &str) -> String {
+    static ENTITY_RE: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+        regex_lite::Regex::new(r"&(?:#\d+;|#x[0-9a-fA-F]+;|\w+;)").unwrap()
+    });
+    ENTITY_RE.replace_all(s, "").into_owned()
+}
+
 /// Sanitize HTML for canvas presentation.
 ///
 /// SECURITY: Strips dangerous elements and attributes to prevent XSS:
@@ -23,21 +38,14 @@ pub fn sanitize_canvas_html(html: &str, max_bytes: usize) -> Result<String, Stri
         ));
     }
 
-    let lower = html.to_lowercase();
-
-    // Reject dangerous tags
-    let dangerous_tags = [
-        "<script", "</script", "<iframe", "</iframe", "<object", "</object", "<embed", "<applet",
-        "</applet",
-    ];
-    for tag in &dangerous_tags {
-        if lower.contains(tag) {
-            return Err(format!("Forbidden HTML tag detected: {tag}"));
-        }
+    static DANGEROUS_TAG_RE: std::sync::LazyLock<regex_lite::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex_lite::Regex::new(r"(?i)<\s*/?\s*(script|iframe|object|embed|applet)\b").unwrap()
+        });
+    if let Some(m) = DANGEROUS_TAG_RE.find(html) {
+        return Err(format!("Forbidden HTML tag detected: {}", m.as_str()));
     }
 
-    // Reject event handler attributes (on*)
-    // Match patterns like: onclick=, onload=, onerror=, onmouseover=, etc.
     static EVENT_PATTERN: std::sync::LazyLock<regex_lite::Regex> =
         std::sync::LazyLock::new(|| regex_lite::Regex::new(r"(?i)\bon[a-z]+\s*=").unwrap());
     if EVENT_PATTERN.is_match(html) {
@@ -47,12 +55,14 @@ pub fn sanitize_canvas_html(html: &str, max_bytes: usize) -> Result<String, Stri
         );
     }
 
-    // Reject dangerous URL schemes
-    let dangerous_schemes = ["javascript:", "vbscript:", "data:text/html"];
-    for scheme in &dangerous_schemes {
-        if lower.contains(scheme) {
-            return Err(format!("Forbidden URL scheme detected: {scheme}"));
-        }
+    let decoded = strip_html_entities(html);
+    static DANGEROUS_SCHEME_RE: std::sync::LazyLock<regex_lite::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex_lite::Regex::new(r"(?i)(?:javascript\s*:|vbscript\s*:|data\s*:\s*text/html)")
+                .unwrap()
+        });
+    if DANGEROUS_SCHEME_RE.is_match(&decoded) {
+        return Err("Forbidden URL scheme detected".to_string());
     }
 
     Ok(html.to_string())
@@ -88,9 +98,9 @@ pub(super) async fn tool_canvas_present(
     );
     let filepath = output_dir.join(&filename);
 
-    // Write the full HTML document
+    let escaped_title = html_escape(title);
     let full_html = format!(
-        "<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"><title>{title}</title></head>\n<body>\n{sanitized}\n</body>\n</html>"
+        "<!DOCTYPE html>\n<html>\n<head><meta charset=\"utf-8\"><title>{escaped_title}</title></head>\n<body>\n{sanitized}\n</body>\n</html>"
     );
     tokio::fs::write(&filepath, &full_html)
         .await

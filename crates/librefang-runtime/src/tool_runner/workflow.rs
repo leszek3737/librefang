@@ -45,25 +45,19 @@ pub(super) fn resolve_workflow_input_artifacts(
     match value {
         serde_json::Value::Object(map) => {
             // Single-key `_artifact` reference — replace this whole node.
-            if map.len() == 1 {
-                if let Some(serde_json::Value::String(handle)) = map.get("_artifact") {
-                    let handle = handle.clone();
-                    // Validate the handle format via the artifact_store
-                    // parser — same shape (`sha256:<64hex>`) read_artifact
-                    // accepts, so the agent's existing handle vocabulary
-                    // works without translation. The offending handle is
-                    // interpolated so the agent gets enough context in
-                    // its tool-result to self-correct on the next turn
-                    // (`ArtifactHandle::parse` itself only quotes the
-                    // suffix on the "wrong length" path, not the "wrong
-                    // prefix" path — surfacing it unconditionally
-                    // closes that gap).
-                    crate::artifact_store::ArtifactHandle::parse(&handle).map_err(|e| {
-                        format!("Invalid '_artifact' reference in workflow input: '{handle}' ({e})")
-                    })?;
-                    *value = serde_json::Value::String(handle);
-                    return Ok(());
-                }
+            if map.len() == 1 && map.contains_key("_artifact") {
+                let val = map.get("_artifact").unwrap();
+                let serde_json::Value::String(handle) = val else {
+                    return Err(format!(
+                        "'_artifact' value must be a string handle, got {val}"
+                    ));
+                };
+                let handle = handle.clone();
+                crate::artifact_store::ArtifactHandle::parse(&handle).map_err(|e| {
+                    format!("Invalid '_artifact' reference in workflow input: '{handle}' ({e})")
+                })?;
+                *value = serde_json::Value::String(handle);
+                return Ok(());
             }
             for (_k, v) in map.iter_mut() {
                 resolve_workflow_input_artifacts(v)?;
