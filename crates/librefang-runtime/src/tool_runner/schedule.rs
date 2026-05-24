@@ -105,8 +105,8 @@ pub(super) fn parse_time_to_hour(s: &str) -> Result<(u32, u32), String> {
                 .trim()
                 .parse()
                 .map_err(|_| format!("Invalid time: {s}"))?;
-            if hour > 23 {
-                return Err(format!("Hour must be 0-23, got {hour}"));
+            if hour < 1 || hour > 12 {
+                return Err(format!("Hour must be 1-12 for am, got {hour}"));
             }
             if min > 59 {
                 return Err(format!("Minute must be 0-59, got {min}"));
@@ -131,8 +131,8 @@ pub(super) fn parse_time_to_hour(s: &str) -> Result<(u32, u32), String> {
                 .trim()
                 .parse()
                 .map_err(|_| format!("Invalid time: {s}"))?;
-            if hour > 23 {
-                return Err(format!("Hour must be 0-23, got {hour}"));
+            if hour < 1 || hour > 12 {
+                return Err(format!("Hour must be 1-12 for pm, got {hour}"));
             }
             if min > 59 {
                 return Err(format!("Minute must be 0-59, got {min}"));
