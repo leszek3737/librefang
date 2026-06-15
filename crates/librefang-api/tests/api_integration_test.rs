@@ -179,6 +179,7 @@ async fn start_full_router(api_key: &str) -> FullRouterHarness {
         tmp.path(),
         librefang_kernel::registry_sync::DEFAULT_CACHE_TTL_SECS,
         "",
+        None,
     );
 
     let config = KernelConfig {
@@ -2928,6 +2929,7 @@ async fn start_full_router_with_proactive(enabled: bool) -> FullRouterHarness {
         tmp.path(),
         librefang_kernel::registry_sync::DEFAULT_CACHE_TTL_SECS,
         "",
+        None,
     );
 
     let proactive = librefang_types::memory::ProactiveMemoryConfig {
