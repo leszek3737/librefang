@@ -944,6 +944,10 @@ In-crate only; no cross-crate error-shape changes.
 
 ### Fixed
 
+- **fix(prompts): refuse to delete the active (bound) prompt version** (#6195) (@houko).
+  `PromptStore::delete_version` deleted unconditionally, so a direct API/SDK call could delete the version an agent is actively sending, orphaning its live prompt; the dashboard only hid the delete button client-side.
+  The store now rejects deleting an active version with `InvalidState` (surfaced as `400`, no longer flattened to `500` by the kernel handle), unknown ids stay an idempotent no-op, and the dashboard renders the active version's delete button disabled with an explanatory tooltip on both the Prompts page and the per-agent Prompts/Experiments modal.
+  Closes #6195.
 - **fix(cli): bind the macOS launchagent status string to a `let` so the macOS build compiles (E0716)** (#6198) (@houko).
   The macOS-only launchagent-status block passed `&i18n::t(...)` from inside an `if`/`else` expression to `ui::kv`, but each arm returns an owned `String` whose temporary is freed at the end of the `if`-expression, before `ui::kv` borrows it.
   The macOS test lane is main-push-only, so this surfaced as a red `main` after merge rather than failing the originating PR.
