@@ -95,6 +95,10 @@ In-crate only; no cross-crate error-shape changes.
 
 ### Fixed
 
+- **fix(api): scope `GET /api/workflows/{id}/runs` to the workflow named in the path** (@houko).
+  The handler ignored its `{id}` path parameter and called `list_runs(None)`, so it returned every workflow's runs instead of the requested one.
+  Each run carries its initial `input`, so the unscoped list also exposed unrelated workflows' run inputs to any caller of one workflow's runs endpoint.
+  An invalid id now returns `400` instead of being silently treated as a request for all runs.
 - **fix(runtime): close a workspace-sandbox escape via an intermediate-ancestor symlink when writing into a not-yet-existing directory** (@houko).
   `resolve_sandbox_path_ext` — the single resolver behind `file_write`, `apply_patch`, and the network-reachable `web_fetch_to_file` — took a string-rebase shortcut when the target's parent directory did not exist: it stripped the workspace prefix and rejoined the suffix onto the canonical root, so the returned path still contained any *existing* intermediate-ancestor symlink while passing the `starts_with` check at the string level.
   The leaf-symlink guard (#5141) only inspects the final path component, so a path like `link/newdir/file.txt` — where `link` is a symlink to a directory outside the workspace and `newdir` does not exist yet — resolved to `<workspace>/link/newdir/file.txt`, passed the check, and then had the caller's `create_dir_all` + write follow `link` straight out of the jail (overwriting e.g. `~/.ssh/authorized_keys` or `~/.librefang/config.toml`); `web_fetch_to_file` made this reachable from a network-driven turn with no shell access.
