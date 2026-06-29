@@ -97,6 +97,7 @@ _33 PRs from 5 contributors since v2026.6.22-beta.22._
 
 ### Fixed
 
+- Enrich coalesced mixed-media batches on the debounced channel path: audio/voice attachments are transcribed and documents are extracted, not just images, so a photo+voice+pdf burst reaches the agent fully enriched instead of as bare `[Voice message …: url]` / `[File …: url]` placeholders — generalizing the image-only #6321 / #6323 fix via shared `download_media_blocks` + `enrich_media` helpers both inbound paths funnel through (#6348) (@houko)
 - Keep the Telegram dashboard setup form available when its first cold Python `--describe` import exceeds the five-second boot timeout; the catalog now falls back to the adapter's compile-time schema, and the unavailable-form hint no longer claims that channel reload refreshes the boot-only schema cache (@pavver)
 - Allow the Codex CLI provider to run from desktop and daemon processes outside a Git repository, and replace its deprecated `--full-auto` flag (@pavver)
 - Accept the empty-recipient handshake HMAC binding so `bootstrap_peers` connections succeed instead of failing with `403 HMAC authentication failed` (regression from #3920) (#6330) (@houko)
